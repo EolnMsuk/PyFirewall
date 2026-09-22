@@ -100,8 +100,6 @@ Review each prompt carefully because Python or Npcap may also be used by other s
 
 For missing live traffic, verify that Npcap is installed/running and that PyFirewall is running with Administrator privileges.
 
-For other issues, check `firewall_monitor_debug.txt` for diagnostic information.
-
 ## References
 
 - [Python for Windows](https://www.python.org/downloads/windows/)
