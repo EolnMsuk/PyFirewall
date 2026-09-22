@@ -104,4 +104,6 @@ For other issues, check `firewall_monitor_debug.txt` for diagnostic information.
 - [Npcap](https://npcap.com/)
 - [Scapy Documentation](https://scapy.readthedocs.io/)
 
-> **Note:** Alerts and watched-port signals provide context and do not by themselves prove that a connection or process is malicious.
+## Donations
+
+- [Venmo](https://venmo.com/u/rustonrails/)
