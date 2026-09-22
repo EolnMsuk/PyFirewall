@@ -1,4 +1,4 @@
-# PyFirewall
+# PyFirewall ⛨
 
 **Python Personal Firewall & Network Monitor for Windows**
 
