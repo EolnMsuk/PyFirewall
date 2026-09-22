@@ -244,7 +244,9 @@ function Stop-PyFirewallProcesses {
 
 try {
     $desktop = [Environment]::GetFolderPath('Desktop')
-    $shortcut = Join-Path $desktop 'PyFirewall.lnk'
+    $shortcut = Join-Path $desktop 'PyFirewall - Firewall & Network Monitor.lnk'
+    $legacyShortcut = Join-Path $desktop 'PyFirewall.lnk'
+    $shortcutPaths = @($shortcut, $legacyShortcut) | Select-Object -Unique
     $taskName = 'PyFirewall - At Login'
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     $pythonEntry = Get-PythonEntry
@@ -257,7 +259,8 @@ try {
     $hasPython = [bool]$pythonEntry
     $hasPackages = $packages.Count -gt 0
     $hasNpcap = [bool]$npcapEntry
-    $hasShortcut = Test-Path -LiteralPath $shortcut
+    $existingShortcuts = @($shortcutPaths | Where-Object { Test-Path -LiteralPath $_ })
+    $hasShortcut = $existingShortcuts.Count -gt 0
     $hasTask = [bool]$task
     $hasFirewallRules = $firewallRules.Count -gt 0
 
@@ -271,7 +274,9 @@ try {
         Write-Host "  - Scheduled Task: $taskName" -ForegroundColor White
     }
     if ($hasShortcut) {
-        Write-Host '  - Desktop shortcut: PyFirewall.lnk' -ForegroundColor White
+        foreach ($path in $existingShortcuts) {
+            Write-Host ("  - Desktop shortcut: {0}" -f (Split-Path -Leaf $path)) -ForegroundColor White
+        }
     }
     if ($hasPackages) {
         foreach ($package in $packages) {
@@ -312,7 +317,7 @@ try {
     }
 
     if ($hasShortcut) {
-        $removeShortcut = Ask-YesNo 'Remove the PyFirewall desktop shortcut?'
+        $removeShortcut = Ask-YesNo 'Remove the PyFirewall desktop shortcut(s)?'
     }
 
     if ($hasPython) {
@@ -345,7 +350,11 @@ try {
     Write-Host 'Selected removals:' -ForegroundColor White
     if ($removeFirewallRules) { Write-Host "  - PyFirewall-managed firewall rules ($($firewallRules.Count))" }
     if ($removeTask) { Write-Host "  - Scheduled Task: $taskName" }
-    if ($removeShortcut) { Write-Host '  - Desktop shortcut: PyFirewall.lnk' }
+    if ($removeShortcut) {
+        foreach ($path in $existingShortcuts) {
+            Write-Host ("  - Desktop shortcut: {0}" -f (Split-Path -Leaf $path))
+        }
+    }
     if ($removePsutil) { Write-Host '  - Python package: psutil' }
     if ($removeScapy) { Write-Host '  - Python package: scapy' }
     if ($removeNpcap) { Write-Host "  - $($npcapEntry.DisplayName)" }
@@ -367,10 +376,19 @@ try {
         Write-OK "Scheduled Task removed: $taskName"
     }
 
-    if ($removeShortcut -and (Test-Path -LiteralPath $shortcut)) {
-        Write-Step 'Removing desktop shortcut'
-        Remove-Item -LiteralPath $shortcut -Force
-        Write-OK 'PyFirewall desktop shortcut removed.'
+    if ($removeShortcut) {
+        Write-Step 'Removing desktop shortcut(s)'
+        $removedShortcutCount = 0
+        foreach ($path in $shortcutPaths) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force
+                $removedShortcutCount++
+                Write-OK ("Removed desktop shortcut: {0}" -f (Split-Path -Leaf $path))
+            }
+        }
+        if ($removedShortcutCount -eq 0) {
+            Write-WarnMsg 'No PyFirewall desktop shortcut was found at removal time.'
+        }
     }
 
     if ($removePsutil -or $removeScapy) {
@@ -435,14 +453,16 @@ try {
         Write-OK "Scheduled Task '$taskName' was kept."
     }
 
+    $remainingShortcuts = @($shortcutPaths | Where-Object { Test-Path -LiteralPath $_ })
     if ($removeShortcut) {
-        if (Test-Path -LiteralPath $shortcut) {
-            Write-WarnMsg 'The PyFirewall desktop shortcut could not be verified as removed.'
+        if ($remainingShortcuts.Count -gt 0) {
+            $names = ($remainingShortcuts | ForEach-Object { Split-Path -Leaf $_ }) -join ', '
+            Write-WarnMsg ("The following PyFirewall desktop shortcut(s) could not be verified as removed: {0}" -f $names)
         } else {
-            Write-OK 'PyFirewall desktop shortcut selected for removal is gone.'
+            Write-OK 'PyFirewall desktop shortcut(s) selected for removal are gone.'
         }
-    } elseif ($hasShortcut -and (Test-Path -LiteralPath $shortcut)) {
-        Write-OK 'PyFirewall desktop shortcut was kept.'
+    } elseif ($hasShortcut -and $remainingShortcuts.Count -gt 0) {
+        Write-OK 'PyFirewall desktop shortcut(s) were kept.'
     }
 
     if ($removePython) {
@@ -469,7 +489,7 @@ try {
 
     Write-Host ''
     Write-Host 'PyFirewall uninstall selections have been processed.' -ForegroundColor Green
-    Write-Host 'PyFirewall source/project files were not deleted by this script.' -ForegroundColor Green
+    Write-Host 'PyFirewall source/project files, including PyFirewall.ico, were not deleted by this script.' -ForegroundColor Green
     exit 0
 }
 catch {

@@ -33,6 +33,7 @@ GLOBAL_ALLOW_PREFIX = 'PyFirewall_GlobalIPAllow_'
 AUTO_HOLD_PREFIX = 'PyFirewall_AutoHold_'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'firewall_config.json')
+ICON_FILE = os.path.join(SCRIPT_DIR, 'PyFirewall.ico')
 
 
 if os.name != 'nt':
@@ -247,8 +248,12 @@ class PyFirewallSystemTray:
             user32.ShowWindow.restype = wintypes.BOOL
             user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
             user32.LoadIconW.restype = wintypes.HICON
+            user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            user32.LoadImageW.restype = wintypes.HICON
             user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
             user32.LoadCursorW.restype = ctypes.c_void_p
+            user32.DestroyIcon.argtypes = [wintypes.HICON]
+            user32.DestroyIcon.restype = wintypes.BOOL
             user32.GetCursorPos.argtypes = [ctypes.POINTER(self.POINT)]
             user32.GetCursorPos.restype = wintypes.BOOL
             user32.CreatePopupMenu.argtypes = []
@@ -269,9 +274,12 @@ class PyFirewallSystemTray:
             shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(self.NOTIFYICONDATAW)]
             shell32.Shell_NotifyIconW.restype = wintypes.BOOL
             default_icon = ctypes.cast(ctypes.c_void_p(32512), wintypes.LPCWSTR)
-            self._hicon = user32.LoadIconW(None, default_icon)
+            arrow_cursor = user32.LoadCursorW(None, default_icon)
+            self._hicon = user32.LoadImageW(None, ICON_FILE, 1, 0, 0, 16 | 64)
             if not self._hicon:
-                raise OSError('Could not load the default Windows application icon')
+                self._hicon = user32.LoadIconW(None, default_icon)
+            if not self._hicon:
+                raise OSError('Could not load a PyFirewall icon or the default Windows application icon')
             self._wndproc = self.WNDPROC(self._window_proc)
             wnd = self.WNDCLASSEXW()
             wnd.cbSize = ctypes.sizeof(self.WNDCLASSEXW)
@@ -281,7 +289,7 @@ class PyFirewallSystemTray:
             wnd.cbWndExtra = 0
             wnd.hInstance = kernel32.GetModuleHandleW(None)
             wnd.hIcon = self._hicon
-            wnd.hCursor = user32.LoadCursorW(None, default_icon)
+            wnd.hCursor = arrow_cursor
             wnd.hbrBackground = None
             wnd.lpszMenuName = None
             wnd.lpszClassName = self.class_name
@@ -336,6 +344,12 @@ class PyFirewallSystemTray:
                 if self._registered:
                     ctypes.windll.user32.UnregisterClassW(self.class_name, ctypes.windll.kernel32.GetModuleHandleW(None))
                     self._registered = False
+            except Exception:
+                pass
+            try:
+                if self._hicon:
+                    ctypes.windll.user32.DestroyIcon(self._hicon)
+                    self._hicon = None
             except Exception:
                 pass
 
@@ -3097,5 +3111,10 @@ class FirewallMonitorApp:
                 pass
 if __name__ == '__main__':
     root = tk.Tk()
+    if os.path.exists(ICON_FILE):
+        try:
+            root.iconbitmap(default=ICON_FILE)
+        except tk.TclError:
+            pass
     app = FirewallMonitorApp(root)
     root.mainloop()
