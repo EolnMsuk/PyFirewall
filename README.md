@@ -90,7 +90,7 @@ Review this behavior before using PyFirewall on a production system.
 - `requirements.ps1` — automated prerequisite/setup script
 - `Install-PyFirewall.cmd` — administrator installer launcher
 - `Uninstall-PyFirewall.cmd` — interactive uninstaller
-- `UPyFirewall.ico` — icon & system tray image
+- `PyFirewall.ico` — icon & system tray image
 
 PyFirewall stores its configuration in `firewall_config.json` beside the application when needed.
 
