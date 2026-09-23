@@ -44,7 +44,7 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 4. Complete the Npcap installer manually if it appears.
 5. PyFirewall will launch after installation.
 
-The installer can configure Python, Python packages, Npcap, Windows Firewall requirements, a desktop shortcut, and a scheduled task for starting PyFirewall at login.
+The installer offers to install and/or configure Python, Python packages, Npcap, Windows Firewall requirements, a desktop shortcut, and a scheduled task for starting PyFirewall at login.
 
 ### Manual
 
@@ -57,9 +57,7 @@ python firewall_monitor.py
 
 ## Usage
 
-PyFirewall requests Administrator elevation when necessary. The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application.
-
-The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme. When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that do not already have an application rule.
+The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application. The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme. When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that do not already have an application rule.
 
 ### Default Settings
 
@@ -107,15 +105,11 @@ The uninstaller will prompt you to remove:
 - PyFirewall-installed Python and packages
 - Npcap
 
-The installer records which Python components were installed by PyFirewall so shared or pre-existing installations can be kept.
-
-Review each prompt carefully because Python or Npcap may also be used by other software.
+The installer records which Python components were installed by PyFirewall so shared or pre-existing installations can be kept. Review each prompt carefully because Python or Npcap may also be used by other software.
 
 ## Troubleshooting
 
-For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges.
-
-For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule.
+For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule.
 
 ## References
 
