@@ -1287,6 +1287,99 @@ class FirewallMonitorApp:
         appearance = tk.LabelFrame(outer, text='Appearance', padx=18, pady=14)
         appearance.pack(fill=tk.X, pady=18)
         ttk.Checkbutton(appearance, text='Use Dark Theme', variable=self.dark_mode_var, command=self.on_theme_changed).pack(anchor=tk.W)
+
+        support = tk.LabelFrame(outer, text='Support PyFirewall', padx=18, pady=14)
+        support.pack(fill=tk.X, pady=18)
+
+        github_url = 'https://github.com/EolnMsuk/PyFirewall'
+        venmo_url = 'https://venmo.com/u/rustonrails'
+
+        def open_support_link(url):
+            try:
+                os.startfile(url)
+            except OSError:
+                pass
+
+        try:
+            import base64
+            import struct
+
+            if os.path.isfile(ICON_FILE):
+                with open(ICON_FILE, 'rb') as icon_file:
+                    icon_data = icon_file.read()
+
+                icon_png = None
+                if len(icon_data) >= 6:
+                    reserved, icon_type, icon_count = struct.unpack_from('<HHH', icon_data, 0)
+                    if reserved == 0 and icon_type == 1:
+                        for index in range(icon_count):
+                            entry_offset = 6 + (index * 16)
+                            if entry_offset + 16 > len(icon_data):
+                                break
+                            image_size, image_offset = struct.unpack_from('<II', icon_data, entry_offset + 8)
+                            payload = icon_data[image_offset:image_offset + image_size]
+                            if payload.startswith(b'\x89PNG\r\n\x1a\n'):
+                                if icon_png is None or image_size > len(icon_png):
+                                    icon_png = payload
+
+                if icon_png:
+                    icon_image = tk.PhotoImage(data=base64.b64encode(icon_png).decode('ascii'))
+                    if icon_image.width() > 128:
+                        factor = max(2, icon_image.width() // 128)
+                        while factor > 1 and icon_image.width() // factor < 96:
+                            factor -= 1
+                        icon_image = icon_image.subsample(factor, factor)
+                    self.settings_icon_photo = icon_image
+                    icon_button = tk.Button(
+                        support,
+                        image=self.settings_icon_photo,
+                        command=lambda: open_support_link(github_url),
+                        bg=self.colors['frame'],
+                        activebackground=self.colors['frame'],
+                        relief=tk.FLAT,
+                        borderwidth=0,
+                        highlightthickness=0,
+                        cursor='hand2'
+                    )
+                    icon_button.pack(anchor=tk.W, pady=(0, 8))
+                    add_tooltip(icon_button, 'Open the PyFirewall GitHub page.')
+        except (OSError, ValueError, struct.error, tk.TclError):
+            pass
+
+        github_button = tk.Button(
+            support,
+            text='GitHub • github.com/EolnMsuk/PyFirewall',
+            command=lambda: open_support_link(github_url),
+            bg=self.colors['frame'],
+            fg=self.colors['select'],
+            activebackground=self.colors['frame'],
+            activeforeground=self.colors['select'],
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            cursor='hand2',
+            font=('Segoe UI', 9, 'underline')
+        )
+        github_button.pack(anchor=tk.W, pady=2)
+        add_tooltip(github_button, 'Open the PyFirewall GitHub repository.')
+
+        donation_button = tk.Button(
+            support,
+            text='Donate via Venmo • Support the dev (EolnMsuk)',
+            command=lambda: open_support_link(venmo_url),
+            bg=self.colors['frame'],
+            fg=self.colors['select'],
+            activebackground=self.colors['frame'],
+            activeforeground=self.colors['select'],
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            cursor='hand2',
+            font=('Segoe UI', 9, 'underline')
+        )
+        donation_button.pack(anchor=tk.W, pady=2)
+        add_tooltip(donation_button, 'Open venmo.com/u/rustonrails in your default browser.')
+
         danger = tk.LabelFrame(outer, text='Danger Zone', padx=18, pady=14)
         danger.pack(fill=tk.X)
         tk.Label(danger, text='Reset saved settings and remove only PyFirewall_* rules.', fg=self.colors['muted'], wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
