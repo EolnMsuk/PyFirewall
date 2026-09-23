@@ -59,7 +59,7 @@ python firewall_monitor.py
 
 PyFirewall requests Administrator elevation when necessary.
 
-The main window can be minimized to the system tray. Use **Close** from the tray menu to fully exit the application.
+The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application.
 
 The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme.
 
@@ -69,6 +69,7 @@ When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Blo
 
 | Setting | Default |
 |---|---:|
+| Filter All Connections | Enabled |
 | Connection threshold | 50 |
 | Time window | 5 seconds |
 | Upload threshold | 50 MB |
@@ -79,17 +80,11 @@ When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Blo
 
 ## Important Firewall Behavior
 
-On first firewall initialization, PyFirewall saves the existing Windows Firewall profile settings, then enables the firewall and applies its managed rules.
-
-PyFirewall uses **Allow** as the default Windows Firewall profile action while its managed rules are active.
-
-The saved firewall profile settings can be restored during uninstallation.
-
-Review this behavior before using PyFirewall on a production system.
+On first firewall initialization, PyFirewall saves the existing Windows Firewall profile settings. The saved firewall profile settings will be restored during uninstallation.
 
 ## Known Issues
 
-- At first launch or when all managed firewall rules are removed, Windows may display a notification asking the user to enable Windows Defender Firewall even though the firewall is enabled.
+- At first launch or when all managed firewall rules are removed, Windows will display a notification to enable Windows Defender Firewall.
 
 ## Files
 
@@ -107,7 +102,7 @@ PyFirewall stores its configuration in `firewall_config.json` beside the applica
 
 Run **`Uninstall-PyFirewall.cmd`** as administrator and answer each prompt with **Y** or **N**.
 
-The uninstaller can remove:
+The uninstaller will prompt you to remove:
 
 - PyFirewall-managed firewall rules
 - Saved Windows Firewall profile settings
