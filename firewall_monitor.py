@@ -615,7 +615,7 @@ class FirewallMonitorApp:
 
     def apply_theme(self):
         dark = self.dark_mode_var.get()
-        self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#5b2929' if dark else '#fbe3e3', 'blocked_in': '#7a4b11' if dark else '#ffe0b2', 'global_block': '#5f2a7a' if dark else '#d1b3e6', 'global_allow': '#90CAF9', 'allowed': '#294f31' if dark else '#e3f5e7', 'watch': '#5b4a16' if dark else '#fff3cd'}
+        self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#8b1e1e' if dark else '#ffcaca', 'blocked_in': '#7a4b11' if dark else '#ffe0b2', 'global_block': '#5f2a7a' if dark else '#d1b3e6', 'global_allow': '#90CAF9', 'allowed': '#294f31' if dark else '#e3f5e7', 'watch': '#5b4a16' if dark else '#fff3cd'}
         self.root.configure(bg=self.colors['bg'])
         style = ttk.Style(self.root)
         try:

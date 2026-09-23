@@ -299,7 +299,7 @@ try {
     Write-Step 'Creating desktop shortcut and launching PyFirewall'
 
     $desktop = [Environment]::GetFolderPath('Desktop')
-    $shortcutPath = Join-Path $desktop 'PyFirewall - Firewall & Network Monitor.lnk'
+    $shortcutPath = Join-Path $desktop 'PyFirewall.lnk'
     $legacyShortcutPath = Join-Path $desktop 'PyFirewall.lnk'
     $iconPath = Join-Path $ScriptDir 'PyFirewall.ico'
     $pythonw = Join-Path (Split-Path -Parent $python.Path) 'pythonw.exe'
