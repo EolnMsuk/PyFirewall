@@ -9,9 +9,14 @@ $ProgressPreference = 'SilentlyContinue'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Requirements = Join-Path $ScriptDir 'requirements.txt'
 $AppScript = Join-Path $ScriptDir 'firewall_monitor.py'
+$InstallMetadataFile = Join-Path $ScriptDir 'pyfirewall_install.json'
 $TempDir = Join-Path $env:TEMP 'PyFirewallPrerequisites'
 $PythonVersion = [Version]'3.14.7'
 $NpcapUrl = 'https://npcap.com/dist/npcap-1.89.exe'
+$PythonInstalledByPyFirewall = $false
+$PsutilInstalledByPyFirewall = $false
+$ScapyInstalledByPyFirewall = $false
+$NpcapInstalledByPyFirewall = $false
 
 function Write-Step([string]$Message) {
     Write-Host "`n== $Message ==" -ForegroundColor Cyan
@@ -145,6 +150,49 @@ function Install-Python {
     }
 
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+}
+
+function Write-PyFirewallInstallMetadata([object]$PythonInfo, [bool]$PythonInstalledByPyFirewall, [bool]$PsutilInstalledByPyFirewall, [bool]$ScapyInstalledByPyFirewall, [bool]$NpcapInstalledByPyFirewall) {
+    if (-not $PythonInfo -or -not $PythonInfo.Path) {
+        throw 'Cannot record PyFirewall installation ownership without a verified Python interpreter.'
+    }
+
+    if (Test-Path -LiteralPath $InstallMetadataFile) {
+        try {
+            $previous = Get-Content -LiteralPath $InstallMetadataFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            $samePython = $previous.python_path -and [string]::Equals(
+                [System.IO.Path]::GetFullPath([string]$previous.python_path),
+                [System.IO.Path]::GetFullPath([string]$PythonInfo.Path),
+                [StringComparison]::OrdinalIgnoreCase
+            )
+            if ($samePython) {
+                $PythonInstalledByPyFirewall = $PythonInstalledByPyFirewall -or [bool]$previous.python_installed_by_pyfirewall
+                $PsutilInstalledByPyFirewall = $PsutilInstalledByPyFirewall -or [bool]$previous.psutil_installed_by_pyfirewall
+                $ScapyInstalledByPyFirewall = $ScapyInstalledByPyFirewall -or [bool]$previous.scapy_installed_by_pyfirewall
+                $NpcapInstalledByPyFirewall = $NpcapInstalledByPyFirewall -or [bool]$previous.npcap_installed_by_pyfirewall
+            }
+        } catch {
+            Write-WarnMsg 'Previous PyFirewall installation metadata could not be read; new ownership state will be recorded.'
+        }
+    }
+
+    $metadata = [ordered]@{
+        version = 1
+        installed_at = (Get-Date).ToString('o')
+        script_directory = $ScriptDir
+        app_script = $AppScript
+        python_path = $PythonInfo.Path
+        python_version = ([Version]$PythonInfo.Version).ToString()
+        python_installed_by_pyfirewall = $PythonInstalledByPyFirewall
+        psutil_installed_by_pyfirewall = $PsutilInstalledByPyFirewall
+        scapy_installed_by_pyfirewall = $ScapyInstalledByPyFirewall
+        npcap_installed_by_pyfirewall = $NpcapInstalledByPyFirewall
+        firewall_profile_backup_file = 'firewall_profile_backup.json'
+    }
+
+    $temp = $InstallMetadataFile + '.tmp'
+    $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $temp -Encoding UTF8
+    Move-Item -LiteralPath $temp -Destination $InstallMetadataFile -Force
 }
 
 function Get-PythonPackageStatus([string]$PythonExe, [string]$ModuleName, [Version]$MinimumVersion, [Version]$MaximumExclusive) {
@@ -309,6 +357,7 @@ try {
             throw 'Python installation was declined. PyFirewall cannot be installed without Python.'
         }
         Install-Python
+        $PythonInstalledByPyFirewall = $true
         $python = Get-UsablePython
         if (-not $python) { throw 'Python installation completed, but a usable interpreter could not be located.' }
         Write-OK "Python $($python.Version) ready at $($python.Path)."
@@ -322,6 +371,7 @@ try {
         $psutilAction = Read-YesNo 'psutil is required and is not installed in the expected version range. Install/upgrade psutil?'
         if ($psutilAction) {
             Install-PythonPackage $python.Path 'psutil>=5.9.0,<8.0' 'psutil'
+            $PsutilInstalledByPyFirewall = $true
             $psutil = Get-PythonPackageStatus $python.Path 'psutil' ([Version]'5.9.0') ([Version]'8.0.0')
         } else {
             Write-WarnMsg 'psutil installation was declined.'
@@ -335,6 +385,7 @@ try {
         $scapyAction = Read-YesNo 'Scapy is required and is not installed in the expected version range. Install/upgrade Scapy?'
         if ($scapyAction) {
             Install-PythonPackage $python.Path 'scapy>=2.5.0,<3.0' 'Scapy'
+            $ScapyInstalledByPyFirewall = $true
             $scapy = Get-PythonPackageStatus $python.Path 'scapy' ([Version]'2.5.0') ([Version]'3.0.0')
         } else {
             Write-WarnMsg 'Scapy installation was declined.'
@@ -355,6 +406,7 @@ try {
         if ($npcapAction) {
             $npcapInstalled = Install-Npcap
             if ($npcapInstalled) {
+                $NpcapInstalledByPyFirewall = $true
                 $npcap = Get-NpcapInstall
                 Write-OK "Npcap detected at $($npcap.Path)."
             }
@@ -412,6 +464,10 @@ try {
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut)
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
     Write-OK "Desktop shortcut created: $shortcutPath"
+
+    Write-Step 'Recording installation ownership'
+    Write-PyFirewallInstallMetadata $python $PythonInstalledByPyFirewall $PsutilInstalledByPyFirewall $ScapyInstalledByPyFirewall $NpcapInstalledByPyFirewall
+    Write-OK "Installation metadata recorded: $InstallMetadataFile"
 
     Write-Step 'Startup at login'
     if (Read-YesNo 'Would you like PyFirewall to start automatically when you log in to Windows?') {

@@ -34,6 +34,11 @@ AUTO_HOLD_PREFIX = 'PyFirewall_AutoHold_'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'firewall_config.json')
 ICON_FILE = os.path.join(SCRIPT_DIR, 'PyFirewall.ico')
+FIREWALL_PROFILE_BACKUP_FILE = os.path.join(SCRIPT_DIR, 'firewall_profile_backup.json')
+DNS_MAX_WORKERS = 8
+DNS_MAX_PENDING = 256
+DNS_CACHE_MAX_ENTRIES = 2048
+DNS_CACHE_TTL = 900.0
 
 
 if os.name != 'nt':
@@ -486,7 +491,12 @@ class FirewallMonitorApp:
         self.auto_prompt_keys = set()
         self.auto_prompt_active = False
         self.dns_cache = {}
+        self.dns_cache_times = {}
         self.dns_pending = set()
+        self.dns_queue = queue.Queue(maxsize=DNS_MAX_PENDING)
+        self.dns_stop_event = threading.Event()
+        self.dns_workers = []
+        self._start_dns_workers()
         self.port_process_cache = {}
         self.cache_time = 0.0
         self.filter_all_enabled = False
@@ -573,8 +583,21 @@ class FirewallMonitorApp:
                     valid.extend((column for column in default if column not in valid))
                     self.column_orders[key] = valid
             self.allowed_apps = {normalize_path(p) for p in config.get('allowed_apps', []) if normalize_path(p)}
-            self.pending_rules = [{'path': display_path(r.get('path', '')), 'direction': direction_name(r.get('direction', 'Both'))} for r in config.get('managed_rules', []) if isinstance(r, dict) and r.get('path') and (str(r.get('action', 'Block')).casefold() != 'allow')]
-            self.pending_rules = [r for r in self.pending_rules if normalize_path(r['path']) not in self.allowed_apps]
+            self.pending_rules = []
+            self.blocked_paths = {}
+            for rule in config.get('managed_rules', []) or []:
+                if not isinstance(rule, dict) or not rule.get('path'):
+                    continue
+                if str(rule.get('action', 'Block')).casefold() == 'allow':
+                    continue
+                path = display_path(rule.get('path', ''))
+                norm = normalize_path(path)
+                if not norm or norm in self.allowed_apps:
+                    continue
+                direction = direction_name(rule.get('direction', 'Both'))
+                self.pending_rules.append({'path': path, 'direction': direction})
+                wanted = direction_set(direction)
+                self.blocked_paths[norm] = {'in': 'in' in wanted, 'out': 'out' in wanted, 'path': path}
             for entry in config.get('global_ip_blocks', []) or []:
                 target = normalize_target(entry.get('target', '') if isinstance(entry, dict) else entry)
                 if target:
@@ -721,6 +744,57 @@ class FirewallMonitorApp:
             self.refresh_rules(force=True)
             return 'break'
 
+    @staticmethod
+    def _hover_color(color):
+        try:
+            value = str(color).lstrip('#')
+            if len(value) != 6:
+                return str(color)
+            red, green, blue = (int(value[index:index + 2], 16) for index in (0, 2, 4))
+            return '#{:02x}{:02x}{:02x}'.format(max(0, int(red * 0.72)), max(0, int(green * 0.72)), max(0, int(blue * 0.72)))
+        except (TypeError, ValueError):
+            return str(color)
+
+    @classmethod
+    def _bind_button_hover(cls, button, border=None):
+        if getattr(button, '_pyfirewall_hover_bound', False):
+            return button
+        button._pyfirewall_hover_bound = True
+        if border is not None:
+            border._button_border_normal_bg = border.cget('bg')
+
+        def enter(_event=None):
+            try:
+                if str(button.cget('state')) == str(tk.DISABLED):
+                    button.configure(cursor='arrow')
+                    return
+                normal_bg = button.cget('bg')
+                normal_border = border.cget('bg') if border is not None else None
+                button._pyfirewall_hover_normal_bg = normal_bg
+                button._pyfirewall_hover_normal_active_bg = button.cget('activebackground')
+                if border is not None:
+                    border._pyfirewall_hover_normal_bg = normal_border
+                hover = cls._hover_color(normal_bg)
+                button.configure(bg=hover, activebackground=hover, cursor='hand2')
+                if border is not None:
+                    border.configure(bg=hover)
+            except tk.TclError:
+                pass
+
+        def leave(_event=None):
+            try:
+                normal_bg = getattr(button, '_pyfirewall_hover_normal_bg', button.cget('bg'))
+                normal_active_bg = getattr(button, '_pyfirewall_hover_normal_active_bg', normal_bg)
+                button.configure(bg=normal_bg, activebackground=normal_active_bg, cursor='')
+                if border is not None:
+                    border.configure(bg=getattr(border, '_pyfirewall_hover_normal_bg', getattr(border, '_button_border_normal_bg', border.cget('bg'))))
+            except tk.TclError:
+                pass
+
+        button.bind('<Enter>', enter, add='+')
+        button.bind('<Leave>', leave, add='+')
+        return button
+
     def _button(self, parent, text, command, color=None, pack=True, tooltip=None, **options):
         color = color or '#757575'
         border = tk.Frame(parent, bg='#555555', bd=0, highlightthickness=0)
@@ -728,6 +802,7 @@ class FirewallMonitorApp:
         settings = {'text': text, 'command': command, 'bg': color, 'fg': 'white', 'activebackground': color, 'activeforeground': 'white', 'relief': 'flat', 'borderwidth': 0, 'highlightthickness': 0, 'font': ('Segoe UI', 9, 'bold'), 'padx': 9}
         settings.update(options)
         button = tk.Button(border, **settings)
+        self._bind_button_hover(button, border)
         button.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         if pack:
             border.pack(side=tk.LEFT, padx=4)
@@ -1724,17 +1799,26 @@ class FirewallMonitorApp:
     def resolve_global_target(self, target):
         target = normalize_target(target)
         try:
-            ipaddress.ip_address(target)
-            return (target,)
+            if '/' in target:
+                return (str(ipaddress.ip_network(target, strict=False)),)
+            return (str(ipaddress.ip_address(target)),)
         except ValueError:
             pass
         try:
-            return tuple(sorted({result[4][0] for result in socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)}))
+            addresses = {result[4][0] for result in socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)}
+            return tuple(sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, value)))
         except OSError:
             return ()
 
     def add_global_rule_sync(self, target, allow):
         target = normalize_target(target)
+        try:
+            if '/' in target:
+                target = str(ipaddress.ip_network(target, strict=False))
+            else:
+                target = str(ipaddress.ip_address(target))
+        except ValueError:
+            pass
         addresses = self.resolve_global_target(target)
         if not addresses:
             raise ValueError('Enter a valid IP address or a domain that resolves to at least one IP address.')
@@ -1747,10 +1831,44 @@ class FirewallMonitorApp:
             self.run_netsh(['add', 'rule', f'name={base}_{side.title()}', f'dir={side}', f'action={action}', f'remoteip={remote_ips}', 'enable=yes'])
         return (target, addresses)
 
+    def _read_firewall_profile_state(self):
+        command = "Get-NetFirewallProfile -ErrorAction Stop | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction | ConvertTo-Json -Compress"
+        output = self.run_ps(command).stdout.strip() or '[]'
+        raw = json.loads(output)
+        if isinstance(raw, dict):
+            raw = [raw]
+        profiles = []
+        for item in raw if isinstance(raw, list) else []:
+            name = str(item.get('Name', '') or '')
+            if not name:
+                continue
+            profiles.append({
+                'name': name,
+                'enabled': bool(item.get('Enabled', False)),
+                'default_inbound_action': str(item.get('DefaultInboundAction', '') or ''),
+                'default_outbound_action': str(item.get('DefaultOutboundAction', '') or ''),
+            })
+        if not profiles:
+            raise ValueError('No Windows Firewall profiles were returned.')
+        return profiles
+
+    def _backup_firewall_profile_state(self):
+        if os.path.exists(FIREWALL_PROFILE_BACKUP_FILE):
+            return
+        profiles = self._read_firewall_profile_state()
+        backup = {'version': 1, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'profiles': profiles}
+        temp = FIREWALL_PROFILE_BACKUP_FILE + '.tmp'
+        with open(temp, 'w', encoding='utf-8') as f:
+            json.dump(backup, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, FIREWALL_PROFILE_BACKUP_FILE)
+
     def initialize_or_restore_firewall(self):
         try:
             with self.firewall_lock:
                 if not self.firewall_initialized:
+                    self._backup_firewall_profile_state()
                     self.delete_rule_names((r['name'] for r in self.get_firewall_rules()))
                     self.run_ps('Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {Set-NetFirewallProfile -Name $_.Name -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop}')
                     with self.lock:
@@ -1854,7 +1972,23 @@ class FirewallMonitorApp:
         if self.is_globally_blocked(remote_ip, domain) or self.is_globally_allowed(remote_ip, domain):
             return True
         status = self.get_rule_status(exe_path)
-        return status in {'allowed', 'blocked_both', 'blocked_in'} or (status == 'blocked_out' and direction == 'Outgoing')
+        normalized_direction = direction_name(direction)
+        if status in {'allowed', 'blocked_both'}:
+            return True
+        if status == 'blocked_in':
+            return normalized_direction == 'Inbound'
+        if status == 'blocked_out':
+            return normalized_direction == 'Outbound'
+        return False
+
+    def application_has_rule(self, exe_path):
+        """Return True when any application-specific allow/block rule exists.
+
+        Auto-Block prompt eligibility is intentionally independent of traffic
+        direction. Once the user has assigned a rule to the application, future
+        threshold events still generate Alerts but do not prompt again.
+        """
+        return bool(self.get_rule_status(exe_path))
 
     def rules_changed(self):
         self.refresh_rules(force=True)
@@ -2008,9 +2142,12 @@ class FirewallMonitorApp:
 
     def _make_rule_rows(self, blocked, allowed, blocks, allows):
         rows = []
+        allowed_normalized = {normalize_path(path) for path in allowed}
         for path in sorted(allowed):
             rows.append({'iid': f'app:allow:{path}', 'status': 'Allowed', 'rule': os.path.basename(path) or path, 'action': 'Allow', 'direction': 'Both', 'path': path, 'normalized_path': path, 'download': 0, 'upload': 0})
         for path, data in sorted(blocked.items()):
+            if path in allowed_normalized:
+                continue
             direction = self._direction_from_flags(data)
             rows.append({'iid': f'app:block:{path}', 'status': 'Blocked' if direction != 'Inbound' else 'Blocked (In)', 'rule': os.path.basename(data['path']) or data['path'], 'action': 'Block', 'direction': direction, 'path': data['path'], 'normalized_path': path, 'download': 0, 'upload': 0})
         for kind, collection in (('block', blocks), ('allow', allows)):
@@ -2075,13 +2212,16 @@ class FirewallMonitorApp:
             dialog.destroy()
         for text, value, color, tip in (('Block In & Out', 'both', '#f44336', 'Block incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic and leave outgoing traffic allowed.')):
             button = tk.Button(buttons, text=text, command=lambda v=value: choose(v), bg=color, fg='white', relief='flat')
+            self._bind_button_hover(button)
             button.pack(fill=tk.X, pady=3)
             add_tooltip(button, tip)
         if allow:
             button = tk.Button(buttons, text='Allow All', command=lambda: choose('allow'), bg='#4CAF50', fg='white', relief='flat')
+            self._bind_button_hover(button)
             button.pack(fill=tk.X, pady=3)
             add_tooltip(button, 'Allow all traffic for the executable.')
         button = tk.Button(buttons, text='Cancel', command=dialog.destroy, bg=self.colors.get('head', '#757575'), fg=self.colors['fg'], relief='flat')
+        self._bind_button_hover(button)
         button.pack(fill=tk.X, pady=3)
         add_tooltip(button, 'Close without changing the firewall rules.')
         dialog.update_idletasks()
@@ -2253,17 +2393,47 @@ class FirewallMonitorApp:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return (None, None, None)
 
+    def _start_dns_workers(self):
+        for index in range(DNS_MAX_WORKERS):
+            worker = threading.Thread(target=self._dns_worker, daemon=True, name=f'PyFirewall-DNS-{index + 1}')
+            worker.start()
+            self.dns_workers.append(worker)
+
+    def _dns_worker(self):
+        while not self.dns_stop_event.is_set():
+            try:
+                ip = self.dns_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self.resolve_dns(ip)
+            except Exception:
+                with self.dns_lock:
+                    self.dns_pending.discard(ip)
+            finally:
+                self.dns_queue.task_done()
+
     def get_cached_dns(self, ip):
         ip = str(ip or '')
         if not ip:
             return ''
+        now = time.monotonic()
         with self.dns_lock:
-            if ip in self.dns_cache:
-                return self.dns_cache[ip]
-            if ip in self.dns_pending:
+            cached = self.dns_cache.get(ip)
+            cached_at = self.dns_cache_times.get(ip, 0.0)
+            if cached is not None and (now - cached_at) < DNS_CACHE_TTL:
+                return cached
+            if cached is not None:
+                self.dns_cache.pop(ip, None)
+                self.dns_cache_times.pop(ip, None)
+            if ip in self.dns_pending or len(self.dns_pending) >= DNS_MAX_PENDING:
                 return ''
             self.dns_pending.add(ip)
-        threading.Thread(target=self.resolve_dns, args=(ip,), daemon=True, name=f'DNS-{ip}').start()
+        try:
+            self.dns_queue.put_nowait(ip)
+        except queue.Full:
+            with self.dns_lock:
+                self.dns_pending.discard(ip)
         return ''
 
     def resolve_dns(self, ip):
@@ -2275,7 +2445,13 @@ class FirewallMonitorApp:
         except Exception:
             pass
         with self.dns_lock:
+            if len(self.dns_cache) >= DNS_CACHE_MAX_ENTRIES and ip not in self.dns_cache:
+                oldest_ip = min(self.dns_cache_times, key=self.dns_cache_times.get, default=None)
+                if oldest_ip is not None:
+                    self.dns_cache.pop(oldest_ip, None)
+                    self.dns_cache_times.pop(oldest_ip, None)
             self.dns_cache[ip] = host
+            self.dns_cache_times[ip] = time.monotonic()
             self.dns_pending.discard(ip)
         self.ui_queue.put(('dns', ip))
 
@@ -2381,15 +2557,15 @@ class FirewallMonitorApp:
             pass
 
     def handle_threshold(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail):
-        status = self.get_rule_status(exe)
-        if self.is_globally_blocked(remote_ip, domain):
+        app_rule_exists = self.application_has_rule(exe)
+        globally_blocked = self.is_globally_blocked(remote_ip, domain)
+        globally_allowed = self.is_globally_allowed(remote_ip, domain)
+        if globally_blocked:
             text = f'{reason.title()} threshold reached for {remote_ip}; a Global IP Block is already applied.'
-        elif self.is_globally_allowed(remote_ip, domain):
+        elif globally_allowed:
             text = f'{reason.title()} threshold reached for {remote_ip}; a Global IP Allow is already applied.'
-        elif status == 'blocked_in':
-            text = f'{reason.title()} threshold reached for {remote_ip}; Block Incoming is already applied.'
-        elif self.connection_has_rule(exe, remote_ip, domain, direction):
-            text = f'{reason.title()} threshold reached for {remote_ip}; an existing rule suppresses Auto-Block.'
+        elif app_rule_exists:
+            text = f'{reason.title()} threshold reached for {remote_ip}; an application rule is already applied, so Auto-Block will not prompt again.'
         else:
             with self.lock:
                 auto_enabled = self.auto_block_enabled
@@ -2400,7 +2576,7 @@ class FirewallMonitorApp:
         self.queue_alert('High', proc_name, pid, remote_ip, text)
         with self.lock:
             active = self.log_alerts_only and self.auto_block_enabled and (not self.is_paused)
-        if active and (not self.connection_has_rule(exe, remote_ip, domain, direction)):
+        if active and not globally_blocked and not globally_allowed and not app_rule_exists:
             self.start_auto_block(proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail)
 
     def start_sniffing(self):
@@ -2729,6 +2905,7 @@ class FirewallMonitorApp:
         label = tk.Label(body, text=text, justify=tk.LEFT, anchor=tk.NW, bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10), padx=14, pady=12)
         label.pack(fill=tk.X)
         button = tk.Button(body, text='Close', command=dialog.destroy, bg=self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=12, pady=4)
+        self._bind_button_hover(button)
         button.pack(pady=(2, 8))
         add_tooltip(button, tooltip)
         dialog.protocol('WM_DELETE_WINDOW', dialog.destroy)
@@ -3000,8 +3177,9 @@ class FirewallMonitorApp:
             return
         key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail = item
         active = self._auto_block_active()
-        has_rule = self.connection_has_rule(exe, remote_ip, domain, direction)
-        if not active or has_rule:
+        has_app_rule = self.application_has_rule(exe)
+        has_global_rule = self.is_globally_blocked(remote_ip, domain) or self.is_globally_allowed(remote_ip, domain)
+        if not active or has_app_rule or has_global_rule:
             with self.firewall_lock:
                 self.remove_auto_holds_locked(None if not active else normalize_path(exe))
             with self.lock:
@@ -3048,9 +3226,11 @@ class FirewallMonitorApp:
         action_specs = (('Block In & Out', 'both', '#f44336', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
         for column, (label, choice, bg, tip) in enumerate(action_specs):
             button = tk.Button(buttons, text=label, command=lambda value=choice: finish(value), bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
+            self._bind_button_hover(button)
             button.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
             add_tooltip(button, tip)
         cancel = tk.Button(buttons, text='Cancel (Block)', command=lambda: finish('both'), bg=self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
+        self._bind_button_hover(cancel)
         cancel.grid(row=1, column=0, columnspan=3, sticky='ew', padx=3, pady=(0, 0))
         add_tooltip(cancel, 'Dismiss the prompt and keep the executable blocked.')
         dialog.protocol('WM_DELETE_WINDOW', lambda: finish('both'))
@@ -3191,6 +3371,10 @@ class FirewallMonitorApp:
         try:
             self.save_settings()
         finally:
+            try:
+                self.dns_stop_event.set()
+            except Exception:
+                pass
             try:
                 if self.tray is not None:
                     self.tray.stop()
