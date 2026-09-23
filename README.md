@@ -57,13 +57,9 @@ python firewall_monitor.py
 
 ## Usage
 
-PyFirewall requests Administrator elevation when necessary.
+PyFirewall requests Administrator elevation when necessary. The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application.
 
-The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application.
-
-The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme.
-
-When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that do not already have an application rule.
+The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme. When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that do not already have an application rule.
 
 ### Default Settings
 
