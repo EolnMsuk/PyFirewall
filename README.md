@@ -2,7 +2,7 @@
 
 **Python Personal Firewall & Network Monitor for Windows**
 
-PyFirewall is a Windows desktop application for monitoring network connections and managing Windows Defender Firewall rules. **It monitors and blocks both incoming and outgoing connections** using process- and IP-specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
+PyFirewall is a Windows desktop application for monitoring network connections and managing Windows Defender Firewall rules. **It monitors and blocks both incoming and outgoing connections** using process and/or IP-specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
 
 ---
 
