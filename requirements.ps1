@@ -299,12 +299,18 @@ try {
     Write-Step 'Creating desktop shortcut and launching PyFirewall'
 
     $desktop = [Environment]::GetFolderPath('Desktop')
-    $shortcutPath = Join-Path $desktop 'PyFirewall.lnk'
+    $shortcutPath = Join-Path $desktop 'PyFirewall - Firewall & Network Monitor.lnk'
+    $legacyShortcutPath = Join-Path $desktop 'PyFirewall.lnk'
+    $iconPath = Join-Path $ScriptDir 'PyFirewall.ico'
     $pythonw = Join-Path (Split-Path -Parent $python.Path) 'pythonw.exe'
     if (-not (Test-Path -LiteralPath $pythonw)) { $pythonw = $python.Path }
 
     if (-not (Test-Path -LiteralPath $pythonw)) {
-        throw "pythonw.exe was not found beside the verified Python interpreter: $pythonw"
+        throw "Python executable was not found beside the verified Python interpreter: $pythonw"
+    }
+
+    if (Test-Path -LiteralPath $legacyShortcutPath) {
+        Remove-Item -LiteralPath $legacyShortcutPath -Force -ErrorAction SilentlyContinue
     }
 
     $shell = New-Object -ComObject WScript.Shell
@@ -313,7 +319,9 @@ try {
     $shortcut.Arguments = '"' + $AppScript + '"'
     $shortcut.WorkingDirectory = $ScriptDir
     $shortcut.Description = 'PyFirewall - Python Personal Firewall & Network Monitor'
-    $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,77"
+    if (Test-Path -LiteralPath $iconPath) {
+        $shortcut.IconLocation = "$iconPath,0"
+    }
     $shortcut.Save()
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shortcut)
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)

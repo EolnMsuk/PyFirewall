@@ -62,20 +62,6 @@ if not "%EXITCODE%"=="0" (
 )
 
 echo.
-echo Creating PyFirewall desktop shortcut...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $appScript='%APP_SCRIPT%'; $icon='%ICON%'; $scriptDir=Split-Path -Parent $appScript; $desktop=[Environment]::GetFolderPath('Desktop'); $shortcutPath=Join-Path $desktop 'PyFirewall - Firewall & Network Monitor.lnk'; $python=$null; try { $python=(& py -3 -c 'import sys; print(sys.executable)' 2>$null | Select-Object -First 1).Trim() } catch {}; if (-not $python -or -not (Test-Path $python)) { $cmd=Get-Command python.exe -ErrorAction SilentlyContinue; if ($cmd) { $python=$cmd.Source } }; if (-not $python -or -not (Test-Path $python)) { throw 'Python 3 could not be located after prerequisite installation.' }; $pythonw=Join-Path (Split-Path -Parent $python) 'pythonw.exe'; if (-not (Test-Path $pythonw)) { throw ('pythonw.exe was not found beside ' + $python) }; $ws=New-Object -ComObject WScript.Shell; $sc=$ws.CreateShortcut($shortcutPath); $sc.TargetPath=$pythonw; $sc.Arguments='"' + $appScript + '"'; $sc.WorkingDirectory=$scriptDir; $sc.IconLocation=$icon + ',0'; $sc.Description='Python Personal Firewall & Network Monitor'; $sc.Save(); Write-Host ('Desktop shortcut created: ' + $shortcutPath)"
-set "SHORTCUT_EXIT=%ERRORLEVEL%"
-
-if not "%SHORTCUT_EXIT%"=="0" (
-    echo.
-    echo [WARNING] Prerequisites installed, but the desktop shortcut could not be created.
-    echo You can run firewall_monitor.py manually from the install folder.
-    echo.
-    pause
-    exit /b %SHORTCUT_EXIT%
-)
-
-echo.
 echo ================================================================
 echo PyFirewall installation completed successfully.
 echo.
