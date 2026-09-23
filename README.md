@@ -115,3 +115,4 @@ For missing live traffic, verify that Npcap is installed/running and that PyFire
 ## Donations
 
 - [Venmo](https://venmo.com/u/rustonrails/)
+- [Bitcoin](https://www.blockchain.com/explorer/addresses/btc/31uHLpioo1TbxAmo9kM7rrKcLz3wvcoZaL)
