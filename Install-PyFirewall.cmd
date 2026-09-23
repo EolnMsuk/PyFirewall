@@ -48,7 +48,7 @@ if /I not "%ISADMIN%"=="True" (
 )
 
 echo.
-echo Starting PyFirewall prerequisite installer...
+echo Starting PyFirewall installer...
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
 set "EXITCODE=%ERRORLEVEL%"
@@ -66,7 +66,7 @@ echo ================================================================
 echo PyFirewall installation completed successfully.
 echo.
 echo Desktop shortcut created:
-echo PyFirewall - Firewall ^& Network Monitor
+echo PyFirewall
 echo ================================================================
 echo.
 exit /b 0

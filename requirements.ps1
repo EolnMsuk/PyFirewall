@@ -25,6 +25,21 @@ function Write-WarnMsg([string]$Message) {
     Write-Host "[!] $Message" -ForegroundColor Yellow
 }
 
+function Read-YesNo([string]$Prompt, [bool]$DefaultYes = $true) {
+    $suffix = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $answer = (Read-Host "$Prompt $suffix").Trim()
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $DefaultYes }
+        switch ($answer.ToLowerInvariant()) {
+            'y' { return $true }
+            'yes' { return $true }
+            'n' { return $false }
+            'no' { return $false }
+        }
+        Write-Host 'Please type y then press Enter, or n then press Enter.' -ForegroundColor Yellow
+    }
+}
+
 function Assert-Admin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]$identity
@@ -132,6 +147,35 @@ function Install-Python {
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
 }
 
+function Get-PythonPackageStatus([string]$PythonExe, [string]$ModuleName, [Version]$MinimumVersion, [Version]$MaximumExclusive) {
+    try {
+        $result = @(& $PythonExe -c "import importlib.metadata as m; print(m.version('$ModuleName'))" 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $result.Count -lt 1) {
+            return [PSCustomObject]@{ Installed=$false; Version=$null }
+        }
+
+        $versionText = [string]$result[0]
+        if ([string]::IsNullOrWhiteSpace($versionText)) {
+            return [PSCustomObject]@{ Installed=$false; Version=$null }
+        }
+
+        $version = [Version]$versionText.Trim()
+        $valid = ($version -ge $MinimumVersion) -and ($version -lt $MaximumExclusive)
+        return [PSCustomObject]@{ Installed=$valid; Version=$version }
+    } catch {
+        return [PSCustomObject]@{ Installed=$false; Version=$null }
+    }
+}
+
+function Install-PythonPackage([string]$PythonExe, [string]$PackageSpec, [string]$DisplayName) {
+    Write-Host "Installing $DisplayName..." -ForegroundColor Gray
+    & $PythonExe -m pip install --disable-pip-version-check --upgrade $PackageSpec
+    if ($LASTEXITCODE -ne 0) {
+        throw "pip failed while installing $DisplayName (exit code $LASTEXITCODE)."
+    }
+    Write-OK "$DisplayName installed."
+}
+
 function Get-NpcapInstall {
     $candidate = Join-Path ${env:ProgramFiles} 'Npcap\NPFInstall.exe'
     if (Test-Path -LiteralPath $candidate) {
@@ -145,12 +189,6 @@ function Install-Npcap {
     if ($SkipNpcap) {
         Write-WarnMsg 'Npcap installation was skipped by -SkipNpcap.'
         return $false
-    }
-
-    $existing = Get-NpcapInstall
-    if ($existing) {
-        Write-OK "Npcap is already installed ($($existing.Version))."
-        return $true
     }
 
     $installer = Join-Path $TempDir 'npcap-1.89.exe'
@@ -211,8 +249,6 @@ function Register-PyFirewallScheduledTask([string]$PythonExe, [string]$ScriptPat
         -DontStopIfGoingOnBatteries `
         -MultipleInstances IgnoreNew
 
-    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    $state = if ($existing) { 'updated' } else { 'created' }
     Register-ScheduledTask `
         -TaskName $taskName `
         -Action $action `
@@ -226,7 +262,18 @@ function Register-PyFirewallScheduledTask([string]$PythonExe, [string]$ScriptPat
     if (-not $registered) {
         throw 'The PyFirewall scheduled task could not be verified after registration.'
     }
-    Write-OK "Scheduled Task $state`: $taskName (At Login, Highest privileges)."
+    Write-OK "Scheduled Task configured: $taskName (At Login, Highest privileges)."
+}
+
+function Remove-PyFirewallScheduledTask {
+    $taskName = 'PyFirewall - At Login'
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        Write-OK 'PyFirewall will not start automatically at login.'
+    } else {
+        Write-OK 'PyFirewall startup-at-login was not configured.'
+    }
 }
 
 try {
@@ -258,22 +305,66 @@ try {
         Write-OK "Python $($python.Version) found at $($python.Path)."
     } else {
         Write-WarnMsg 'No usable Python 3.8+ installation with Tkinter and pip was found.'
+        if (-not (Read-YesNo 'Python is required for PyFirewall. Install Python 3.14.7?')) {
+            throw 'Python installation was declined. PyFirewall cannot be installed without Python.'
+        }
         Install-Python
         $python = Get-UsablePython
         if (-not $python) { throw 'Python installation completed, but a usable interpreter could not be located.' }
         Write-OK "Python $($python.Version) ready at $($python.Path)."
     }
 
-    Write-Step 'Installing Python dependencies'
-    & $python.Path -m pip install --disable-pip-version-check --upgrade -r $Requirements
-    if ($LASTEXITCODE -ne 0) { throw "pip returned exit code $LASTEXITCODE." }
-    Write-OK 'psutil and Scapy requirements installed.'
+    Write-Step 'Checking Python packages'
+    $psutil = Get-PythonPackageStatus $python.Path 'psutil' ([Version]'5.9.0') ([Version]'8.0.0')
+    if ($psutil.Installed) {
+        Write-OK "psutil $($psutil.Version) is already installed."
+    } else {
+        $psutilAction = Read-YesNo 'psutil is required and is not installed in the expected version range. Install/upgrade psutil?'
+        if ($psutilAction) {
+            Install-PythonPackage $python.Path 'psutil>=5.9.0,<8.0' 'psutil'
+            $psutil = Get-PythonPackageStatus $python.Path 'psutil' ([Version]'5.9.0') ([Version]'8.0.0')
+        } else {
+            Write-WarnMsg 'psutil installation was declined.'
+        }
+    }
+
+    $scapy = Get-PythonPackageStatus $python.Path 'scapy' ([Version]'2.5.0') ([Version]'3.0.0')
+    if ($scapy.Installed) {
+        Write-OK "Scapy $($scapy.Version) is already installed."
+    } else {
+        $scapyAction = Read-YesNo 'Scapy is required and is not installed in the expected version range. Install/upgrade Scapy?'
+        if ($scapyAction) {
+            Install-PythonPackage $python.Path 'scapy>=2.5.0,<3.0' 'Scapy'
+            $scapy = Get-PythonPackageStatus $python.Path 'scapy' ([Version]'2.5.0') ([Version]'3.0.0')
+        } else {
+            Write-WarnMsg 'Scapy installation was declined.'
+        }
+    }
+
+    if (-not $psutil.Installed -or -not $scapy.Installed) {
+        throw 'One or more required Python packages are missing. PyFirewall was not launched. Re-run the installer and allow the missing package(s).'
+    }
 
     Write-Step 'Checking Npcap'
-    $npcapInstalled = Install-Npcap
+    $npcap = Get-NpcapInstall
+    if ($npcap) {
+        Write-OK "Npcap is already installed ($($npcap.Version))."
+        $npcapInstalled = $true
+    } else {
+        $npcapAction = Read-YesNo 'Npcap is needed for Scapy packet capture. Install Npcap?'
+        if ($npcapAction) {
+            $npcapInstalled = Install-Npcap
+            if ($npcapInstalled) {
+                $npcap = Get-NpcapInstall
+                Write-OK "Npcap detected at $($npcap.Path)."
+            }
+        } else {
+            $npcapInstalled = $false
+            Write-WarnMsg 'Npcap installation was declined. Packet-capture features may not function.'
+        }
+    }
+
     if ($npcapInstalled) {
-        $npcap = Get-NpcapInstall
-        Write-OK "Npcap detected at $($npcap.Path)."
         $npcapService = Get-Service -Name npcap -ErrorAction SilentlyContinue
         if ($npcapService -and $npcapService.Status -ne 'Running') {
             Start-Service -Name npcap -ErrorAction Stop
@@ -292,25 +383,20 @@ try {
     }
 
     Write-Step 'Final dependency test'
-    & $python.Path -c "import tkinter, psutil; import scapy.all as scapy; print('Tkinter:', tkinter.TkVersion); print('psutil:', psutil.__version__); print('Scapy:', scapy.conf.version)"
+    & $python.Path -c "import tkinter, psutil, scapy.all as scapy; print('Tkinter:', tkinter.TkVersion); print('psutil:', psutil.__version__); print('Scapy:', scapy.conf.version)"
     if ($LASTEXITCODE -ne 0) { throw 'The final Python import test failed.' }
     Write-OK 'Tkinter, psutil, and Scapy imported successfully.'
 
-    Write-Step 'Creating desktop shortcut and launching PyFirewall'
+    Write-Step 'Creating desktop shortcut'
 
     $desktop = [Environment]::GetFolderPath('Desktop')
     $shortcutPath = Join-Path $desktop 'PyFirewall.lnk'
-    $legacyShortcutPath = Join-Path $desktop 'PyFirewall.lnk'
     $iconPath = Join-Path $ScriptDir 'PyFirewall.ico'
     $pythonw = Join-Path (Split-Path -Parent $python.Path) 'pythonw.exe'
     if (-not (Test-Path -LiteralPath $pythonw)) { $pythonw = $python.Path }
 
     if (-not (Test-Path -LiteralPath $pythonw)) {
         throw "Python executable was not found beside the verified Python interpreter: $pythonw"
-    }
-
-    if (Test-Path -LiteralPath $legacyShortcutPath) {
-        Remove-Item -LiteralPath $legacyShortcutPath -Force -ErrorAction SilentlyContinue
     }
 
     $shell = New-Object -ComObject WScript.Shell
@@ -327,9 +413,14 @@ try {
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
     Write-OK "Desktop shortcut created: $shortcutPath"
 
-    Register-PyFirewallScheduledTask $pythonw $AppScript $ScriptDir
+    Write-Step 'Startup at login'
+    if (Read-YesNo 'Would you like PyFirewall to start automatically when you log in to Windows?') {
+        Register-PyFirewallScheduledTask $pythonw $AppScript $ScriptDir
+    } else {
+        Remove-PyFirewallScheduledTask
+    }
 
-    Write-Host 'PyFirewall prerequisites are installed.' -ForegroundColor Green
+    Write-Step 'Launching PyFirewall'
     Write-Host 'Launching firewall_monitor.py...' -ForegroundColor White
     $process = Start-Process -FilePath $pythonw -ArgumentList @('"' + $AppScript + '"') -WorkingDirectory $ScriptDir -WindowStyle Hidden -PassThru -ErrorAction Stop
     Write-OK "PyFirewall launch requested (PID $($process.Id)). The application will request Administrator privileges if needed."
