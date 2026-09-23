@@ -1288,7 +1288,14 @@ class FirewallMonitorApp:
         appearance.pack(fill=tk.X, pady=18)
         ttk.Checkbutton(appearance, text='Use Dark Theme', variable=self.dark_mode_var, command=self.on_theme_changed).pack(anchor=tk.W)
 
-        support = tk.LabelFrame(outer, text='Support PyFirewall', padx=18, pady=14)
+        support = tk.LabelFrame(
+            outer,
+            text='Support PyFirewall',
+            padx=18,
+            pady=14,
+            bg=self.colors['frame'],
+            fg=self.colors['fg']
+        )
         support.pack(fill=tk.X, pady=18)
 
         github_url = 'https://github.com/EolnMsuk/PyFirewall'
@@ -1329,56 +1336,47 @@ class FirewallMonitorApp:
                         while factor > 1 and icon_image.width() // factor < 96:
                             factor -= 1
                         icon_image = icon_image.subsample(factor, factor)
+
                     self.settings_icon_photo = icon_image
-                    icon_button = tk.Button(
+
+                    icon_label = tk.Label(
                         support,
                         image=self.settings_icon_photo,
-                        command=lambda: open_support_link(github_url),
                         bg=self.colors['frame'],
-                        activebackground=self.colors['frame'],
-                        relief=tk.FLAT,
+                        cursor='hand2',
                         borderwidth=0,
                         highlightthickness=0,
-                        cursor='hand2'
+                        relief=tk.FLAT
                     )
-                    icon_button.pack(anchor=tk.W, pady=(0, 8))
-                    add_tooltip(icon_button, 'Open the PyFirewall GitHub page.')
+                    icon_label.pack(anchor=tk.W, pady=(0, 8))
+                    icon_label.bind('<Button-1>', lambda _event: open_support_link(github_url))
+                    add_tooltip(icon_label, 'Open the PyFirewall GitHub page.')
         except (OSError, ValueError, struct.error, tk.TclError):
             pass
 
-        github_button = tk.Button(
+        github_label = tk.Label(
             support,
             text='GitHub • github.com/EolnMsuk/PyFirewall',
-            command=lambda: open_support_link(github_url),
             bg=self.colors['frame'],
             fg=self.colors['select'],
-            activebackground=self.colors['frame'],
-            activeforeground=self.colors['select'],
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
             cursor='hand2',
             font=('Segoe UI', 9, 'underline')
         )
-        github_button.pack(anchor=tk.W, pady=2)
-        add_tooltip(github_button, 'Open the PyFirewall GitHub repository.')
+        github_label.pack(anchor=tk.W, pady=2)
+        github_label.bind('<Button-1>', lambda _event: open_support_link(github_url))
+        add_tooltip(github_label, 'Open the PyFirewall GitHub repository.')
 
-        donation_button = tk.Button(
+        donation_label = tk.Label(
             support,
             text='Donate via Venmo • Support the dev (EolnMsuk)',
-            command=lambda: open_support_link(venmo_url),
             bg=self.colors['frame'],
             fg=self.colors['select'],
-            activebackground=self.colors['frame'],
-            activeforeground=self.colors['select'],
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
             cursor='hand2',
             font=('Segoe UI', 9, 'underline')
         )
-        donation_button.pack(anchor=tk.W, pady=2)
-        add_tooltip(donation_button, 'Open venmo.com/u/rustonrails in your default browser.')
+        donation_label.pack(anchor=tk.W, pady=2)
+        donation_label.bind('<Button-1>', lambda _event: open_support_link(venmo_url))
+        add_tooltip(donation_label, 'Open venmo.com/u/rustonrails in your default browser.')
 
         danger = tk.LabelFrame(outer, text='Danger Zone', padx=18, pady=14)
         danger.pack(fill=tk.X)
