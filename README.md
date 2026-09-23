@@ -2,7 +2,7 @@
 
 **Python Personal Firewall & Network Monitor for Windows**
 
-PyFirewall is a Windows desktop application for monitoring network connections and managing Windows Defender Firewall rules. **This firewall is process and IP specific, meaning it monitors and blocks both incoming and outgoing connections.** It uses Tkinter for the interface, Scapy for packet capture, psutil for process/network information, and supports application and global IP/domain rules.
+PyFirewall is a Windows desktop application for monitoring network connections and managing Windows Defender Firewall rules. **It monitors and blocks both incoming and outgoing connections** using process- and IP-specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
 
 ---
 
@@ -14,11 +14,13 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 - Live network connection monitoring
 - Active connection view
-- Auto-Block Protection/Filtering
+- Auto-Block Protection
+- Filter All Connections
 - Per-application allow/block rules
 - Global IP/domain allow and block rules
+- IPv4 and IPv6 address and CIDR support
 - Connection-rate and upload-threshold alerts
-- Configurable connection/alert history limit
+- Configurable connection and alert history limit
 - CSV export for connection data
 - JSON export/import for managed firewall rules
 - System-tray support and automatic start at Windows login
@@ -38,11 +40,11 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 1. Keep the project files in the same directory.
 2. Right-click **`Install-PyFirewall.cmd`** and select **Run as administrator**.
-3. Follow the prompts to install any missing dependencies and allow it to start at login.
+3. Follow the prompts for any required components and startup options.
 4. Complete the Npcap installer manually if it appears.
-5. PyFirewall will launch automatically after installation is complete.
+5. PyFirewall will launch after installation.
 
-The installer can install/configure Python, Python dependencies, Npcap, Windows Firewall requirements, a desktop shortcut, and a scheduled task for starting PyFirewall at login.
+The installer can configure Python, Python packages, Npcap, Windows Firewall requirements, a desktop shortcut, and a scheduled task for starting PyFirewall at login.
 
 ### Manual
 
@@ -59,9 +61,11 @@ PyFirewall requests Administrator elevation when necessary.
 
 The main window can be minimized to the system tray. Use **Close** from the tray menu to fully exit the application.
 
-The **Settings** tab controls alert thresholds, Auto-Block Protection, the maximum number of retained Live Monitor/Alerts rows, and the UI theme.
+The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme.
 
-Default settings include:
+When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that do not already have an application rule.
+
+### Default Settings
 
 | Setting | Default |
 |---|---:|
@@ -75,13 +79,17 @@ Default settings include:
 
 ## Important Firewall Behavior
 
-On first firewall initialization, the application intentionally sets the Windows Firewall profile defaults to **Allow**, then restores/applies the PyFirewall-managed rules saved in `firewall_config.json`.
+On first firewall initialization, PyFirewall saves the existing Windows Firewall profile settings, then enables the firewall and applies its managed rules.
+
+PyFirewall uses **Allow** as the default Windows Firewall profile action while its managed rules are active.
+
+The saved firewall profile settings can be restored during uninstallation.
 
 Review this behavior before using PyFirewall on a production system.
 
 ## Known Issues
 
-- At first launch OR when all rules are removed, a Windows Security notification will prompt the user to enable Windows Defender Firewall even though its enabled. This is caused by the lack of any firewall rules currently assigned.
+- At first launch or when all managed firewall rules are removed, Windows may display a notification asking the user to enable Windows Defender Firewall even though the firewall is enabled.
 
 ## Files
 
@@ -90,7 +98,8 @@ Review this behavior before using PyFirewall on a production system.
 - `requirements.ps1` — automated prerequisite/setup script
 - `Install-PyFirewall.cmd` — administrator installer launcher
 - `Uninstall-PyFirewall.cmd` — interactive uninstaller
-- `PyFirewall.ico` — icon & system tray image
+- `PyFirewall.ico` — application and system-tray icon
+- `tests/` — regression tests
 
 PyFirewall stores its configuration in `firewall_config.json` beside the application when needed.
 
@@ -98,13 +107,24 @@ PyFirewall stores its configuration in `firewall_config.json` beside the applica
 
 Run **`Uninstall-PyFirewall.cmd`** as administrator and answer each prompt with **Y** or **N**.
 
-The uninstaller can remove PyFirewall-managed firewall rules, the scheduled task, desktop shortcut, Npcap, and the detected Python 3.14.7 installation/dependencies. Python and Npcap are presented as separate choices.
+The uninstaller can remove:
+
+- PyFirewall-managed firewall rules
+- Saved Windows Firewall profile settings
+- The scheduled task
+- Desktop shortcuts
+- PyFirewall-installed Python and packages
+- Npcap
+
+The installer records which Python components were installed by PyFirewall so shared or pre-existing installations can be kept.
 
 Review each prompt carefully because Python or Npcap may also be used by other software.
 
 ## Troubleshooting
 
-For missing live traffic, verify that Npcap is installed/running and that PyFirewall is running with Administrator privileges.
+For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges.
+
+For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule.
 
 ## References
 
