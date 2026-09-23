@@ -88,7 +88,6 @@ On first firewall initialization, PyFirewall saves the existing Windows Firewall
 - `Install-PyFirewall.cmd` — administrator installer launcher
 - `Uninstall-PyFirewall.cmd` — interactive uninstaller
 - `PyFirewall.ico` — application and system-tray icon
-- `tests/` — regression tests
 
 PyFirewall stores its configuration in `firewall_config.json` beside the application when needed.
 
