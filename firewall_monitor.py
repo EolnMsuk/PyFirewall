@@ -219,7 +219,7 @@ class PyFirewallSystemTray:
         _fields_ = [('cbSize', wintypes.DWORD), ('hWnd', wintypes.HWND), ('uID', wintypes.UINT), ('uFlags', wintypes.UINT), ('uCallbackMessage', wintypes.UINT), ('hIcon', wintypes.HICON), ('szTip', wintypes.WCHAR * 128), ('dwState', wintypes.DWORD), ('dwStateMask', wintypes.DWORD), ('szInfo', wintypes.WCHAR * 256), ('uVersion_or_Timeout', wintypes.UINT), ('szInfoTitle', wintypes.WCHAR * 64), ('dwInfoFlags', wintypes.DWORD), ('guidItem', ctypes.c_byte * 16), ('hBalloonIcon', wintypes.HICON)]
     WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
-    def __init__(self, command_queue, filter_all_enabled=False, is_paused=False):
+    def __init__(self, command_queue, filter_all_enabled=True, is_paused=False):
         self.command_queue = command_queue
         self.state_lock = threading.Lock()
         self.filter_all_enabled = bool(filter_all_enabled)
@@ -499,11 +499,11 @@ class FirewallMonitorApp:
         self._start_dns_workers()
         self.port_process_cache = {}
         self.cache_time = 0.0
-        self.filter_all_enabled = False
+        self.filter_all_enabled = True
         self.filter_all_saved_alerts = None
         self.filter_all_saved_auto_block = None
         self.saved_rate_threshold = DEFAULT_RATE_THRESHOLD
-        self.rate_threshold = DEFAULT_RATE_THRESHOLD
+        self.rate_threshold = 1 if self.filter_all_enabled else DEFAULT_RATE_THRESHOLD
         self.rate_window = DEFAULT_RATE_WINDOW
         self.upload_threshold_mb = DEFAULT_UPLOAD_THRESHOLD_MB
         self.max_connections_alerts = DEFAULT_MAX_CONNECTIONS_ALERTS
@@ -511,7 +511,7 @@ class FirewallMonitorApp:
         self.auto_block_enabled = True
         self.dark_mode = DEFAULT_DARK_MODE
         self.firewall_initialized = False
-        self.rate_threshold_var = tk.StringVar(value=str(DEFAULT_RATE_THRESHOLD))
+        self.rate_threshold_var = tk.StringVar(value=str(self.rate_threshold))
         self.rate_window_var = tk.StringVar(value=str(DEFAULT_RATE_WINDOW))
         self.upload_threshold_var = tk.StringVar(value=str(DEFAULT_UPLOAD_THRESHOLD_MB))
         self.max_connections_alerts_var = tk.StringVar(value=str(DEFAULT_MAX_CONNECTIONS_ALERTS))
@@ -546,7 +546,7 @@ class FirewallMonitorApp:
         except Exception:
             return
         with self.lock:
-            self.filter_all_enabled = bool(config.get('filter_all_enabled', False))
+            self.filter_all_enabled = bool(config.get('filter_all_enabled', True))
             self.saved_rate_threshold = max(1, int(config.get('saved_rate_threshold', config.get('rate_threshold', DEFAULT_RATE_THRESHOLD))))
             self.rate_threshold = 1 if self.filter_all_enabled else max(1, int(config.get('rate_threshold', self.saved_rate_threshold)))
             self.rate_window = max(0.1, float(config.get('rate_window', DEFAULT_RATE_WINDOW)))
@@ -714,7 +714,7 @@ class FirewallMonitorApp:
         self.setup_active_tab()
         self.setup_alerts_tab()
         self.setup_settings_tab()
-        self.filter_border = self._button(self.top_controls, 'Filter All Connections OFF', self.toggle_filter_all, '#FFC107', pack=False, font=('Segoe UI', 10, 'bold'), padx=10, pady=2, tooltip=lambda: 'Filter All Connections is locked while monitoring is paused.' if self.is_paused else 'Force the Max Connections Threshold to 1 and inspect every new connection. Filter All Connections also enables and locks Alerts + Auto-Block Protection.')
+        self.filter_border = self._button(self.top_controls, 'Filter All Connections OFF', self.toggle_filter_all, '#9E9E9E', pack=False, font=('Segoe UI', 10, 'bold'), padx=10, pady=2, tooltip=lambda: 'Filter All Connections is locked while monitoring is paused.' if self.is_paused else 'Force the Max Connections Threshold to 1 and inspect every new connection. Filter All Connections also enables and locks Alerts + Auto-Block Protection.')
         self.btn_filter = self.filter_border.winfo_children()[0]
         self.filter_border.pack(side=tk.LEFT, padx=(0, 4))
         self.pause_border = self._button(self.top_controls, '⏸  Pause Monitoring', self.toggle_pause, '#2196F3', pack=False, font=('Segoe UI', 10, 'bold'), padx=10, pady=2, tooltip=lambda: 'Resume live packet capture and monitoring' if self.is_paused else 'Pause live packet capture and monitoring')
@@ -760,20 +760,28 @@ class FirewallMonitorApp:
         if getattr(button, '_pyfirewall_hover_bound', False):
             return button
         button._pyfirewall_hover_bound = True
-        if border is not None:
-            border._button_border_normal_bg = border.cget('bg')
+
+        def set_normal_state(bg=None, activebackground=None):
+            try:
+                if bg is not None:
+                    button._pyfirewall_base_bg = bg
+                if activebackground is not None:
+                    button._pyfirewall_base_active_bg = activebackground
+                else:
+                    button._pyfirewall_base_active_bg = getattr(button, '_pyfirewall_base_bg', button.cget('bg'))
+                if border is not None:
+                    border._pyfirewall_base_bg = getattr(button, '_pyfirewall_base_bg', border.cget('bg'))
+            except tk.TclError:
+                pass
+
+        set_normal_state(button.cget('bg'), button.cget('activebackground'))
 
         def enter(_event=None):
             try:
                 if str(button.cget('state')) == str(tk.DISABLED):
                     button.configure(cursor='arrow')
                     return
-                normal_bg = button.cget('bg')
-                normal_border = border.cget('bg') if border is not None else None
-                button._pyfirewall_hover_normal_bg = normal_bg
-                button._pyfirewall_hover_normal_active_bg = button.cget('activebackground')
-                if border is not None:
-                    border._pyfirewall_hover_normal_bg = normal_border
+                normal_bg = getattr(button, '_pyfirewall_base_bg', button.cget('bg'))
                 hover = cls._hover_color(normal_bg)
                 button.configure(bg=hover, activebackground=hover, cursor='hand2')
                 if border is not None:
@@ -783,21 +791,39 @@ class FirewallMonitorApp:
 
         def leave(_event=None):
             try:
-                normal_bg = getattr(button, '_pyfirewall_hover_normal_bg', button.cget('bg'))
-                normal_active_bg = getattr(button, '_pyfirewall_hover_normal_active_bg', normal_bg)
+                normal_bg = getattr(button, '_pyfirewall_base_bg', button.cget('bg'))
+                normal_active_bg = getattr(button, '_pyfirewall_base_active_bg', normal_bg)
                 button.configure(bg=normal_bg, activebackground=normal_active_bg, cursor='')
                 if border is not None:
-                    border.configure(bg=getattr(border, '_pyfirewall_hover_normal_bg', getattr(border, '_button_border_normal_bg', border.cget('bg'))))
+                    border.configure(bg=normal_bg)
             except tk.TclError:
                 pass
 
         button.bind('<Enter>', enter, add='+')
         button.bind('<Leave>', leave, add='+')
+        button._pyfirewall_set_normal_state = set_normal_state
         return button
+
+    def _set_button_colors(self, button, border, color, fg='white', state=tk.NORMAL):
+        if button is None:
+            return
+        try:
+            button.configure(bg=color, activebackground=color, fg=fg, activeforeground=fg, state=state)
+            setter = getattr(button, '_pyfirewall_set_normal_state', None)
+            if callable(setter):
+                setter(color, color)
+            else:
+                button._pyfirewall_base_bg = color
+                button._pyfirewall_base_active_bg = color
+            if border is not None:
+                border.configure(bg=color)
+                border._pyfirewall_base_bg = color
+        except tk.TclError:
+            pass
 
     def _button(self, parent, text, command, color=None, pack=True, tooltip=None, **options):
         color = color or '#757575'
-        border = tk.Frame(parent, bg='#555555', bd=0, highlightthickness=0)
+        border = tk.Frame(parent, bg=color, bd=0, highlightthickness=0)
         border._button_border_frame = True
         settings = {'text': text, 'command': command, 'bg': color, 'fg': 'white', 'activebackground': color, 'activeforeground': 'white', 'relief': 'flat', 'borderwidth': 0, 'highlightthickness': 0, 'font': ('Segoe UI', 9, 'bold'), 'padx': 9}
         settings.update(options)
@@ -1485,9 +1511,10 @@ class FirewallMonitorApp:
         elif self.filter_all_enabled:
             text, color, state, fg = ('🔒  Filter All Connections ON', '#f44336', tk.NORMAL, '#ffffff')
         else:
-            text, color, state, fg = ('🔓  Filter All Connections OFF', '#FFC107', tk.NORMAL, '#000000')
+            text, color, state, fg = ('🔓  Filter All Connections OFF', '#9E9E9E', tk.NORMAL, '#ffffff')
         if hasattr(self, 'btn_filter'):
-            self.btn_filter.config(text=text, bg=color, activebackground=color, fg=fg, activeforeground=fg, state=state)
+            self._set_button_colors(self.btn_filter, getattr(self, 'filter_border', None), color, fg, state)
+            self.btn_filter.configure(text=text)
         if self.tray is not None:
             self.tray.update_state(filter_all_enabled=self.filter_all_enabled, is_paused=self.is_paused)
         self._update_threshold_entries()
@@ -1535,7 +1562,11 @@ class FirewallMonitorApp:
         with self.lock:
             self.is_paused = not self.is_paused
             paused = self.is_paused
-        self.btn_pause.config(text='▶  Resume Monitoring' if paused else '⏸  Pause Monitoring', bg='#4CAF50' if paused else '#2196F3')
+        pause_text = '▶  Resume Monitoring' if paused else '⏸  Pause Monitoring'
+        pause_color = '#9E9E9E' if paused else '#2196F3'
+        if hasattr(self, 'btn_pause'):
+            self._set_button_colors(self.btn_pause, getattr(self, 'pause_border', None), pause_color, '#ffffff', tk.NORMAL)
+            self.btn_pause.configure(text=pause_text)
         self.update_auto_block_controls()
         self.update_filter_ui()
         if paused:
@@ -1697,12 +1728,12 @@ class FirewallMonitorApp:
                 records = self.get_firewall_rules()
                 self.delete_rule_names((r['name'] for r in records))
             with self.lock:
-                self.filter_all_enabled = False
+                self.filter_all_enabled = True
                 self.is_paused = False
                 self.filter_all_saved_alerts = None
                 self.filter_all_saved_auto_block = None
                 self.saved_rate_threshold = DEFAULT_RATE_THRESHOLD
-                self.rate_threshold = DEFAULT_RATE_THRESHOLD
+                self.rate_threshold = 1 if self.filter_all_enabled else DEFAULT_RATE_THRESHOLD
                 self.rate_window = DEFAULT_RATE_WINDOW
                 self.upload_threshold_mb = DEFAULT_UPLOAD_THRESHOLD_MB
                 self.max_connections_alerts = DEFAULT_MAX_CONNECTIONS_ALERTS
@@ -1726,7 +1757,7 @@ class FirewallMonitorApp:
                 tree = getattr(self, tree_name, None)
                 if tree is not None:
                     tree['displaycolumns'] = tuple(self.column_orders[order_key])
-            self.rate_threshold_var.set(str(DEFAULT_RATE_THRESHOLD))
+            self.rate_threshold_var.set(str(self.rate_threshold))
             self.rate_window_var.set(str(DEFAULT_RATE_WINDOW))
             self.upload_threshold_var.set(str(DEFAULT_UPLOAD_THRESHOLD_MB))
             self.max_connections_alerts_var.set(str(DEFAULT_MAX_CONNECTIONS_ALERTS))
@@ -1734,7 +1765,8 @@ class FirewallMonitorApp:
             self.auto_block_var.set(True)
             self.clear_alerts()
             self.clear_list()
-            self.btn_pause.config(text='⏸  Pause Monitoring', bg='#2196F3', activebackground='#2196F3')
+            self._set_button_colors(self.btn_pause, getattr(self, 'pause_border', None), '#2196F3', '#ffffff', tk.NORMAL)
+            self.btn_pause.config(text='⏸  Pause Monitoring')
             self.update_auto_block_controls()
             self.update_filter_ui()
             if self.startup_complete:

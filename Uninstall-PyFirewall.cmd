@@ -16,7 +16,7 @@ exit /b %PYFW_EXITCODE%
 # POWERSHELL START
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$ScriptDir = Split-Path -Parent $PYFW_UNINSTALL_FILE
+$ScriptDir = Split-Path -Parent $env:PYFW_UNINSTALL_FILE
 $InstallMetadataFile = Join-Path $ScriptDir 'pyfirewall_install.json'
 $FirewallProfileBackupFile = Join-Path $ScriptDir 'firewall_profile_backup.json'
 
@@ -297,6 +297,51 @@ function Get-CurrentPyFirewallFirewallProfiles {
     return @(Get-NetFirewallProfile -ErrorAction Stop | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction)
 }
 
+function ConvertTo-PyFirewallGpoBoolean([object]$Value) {
+    if ($Value -is [bool]) {
+        if ([bool]$Value) { return 'True' }
+        return 'False'
+    }
+
+    $text = ([string]$Value).Trim()
+    switch -Regex ($text) {
+        '^(?i:true|1)$'        { return 'True' }
+        '^(?i:false|0)$'       { return 'False' }
+        '^(?i:notconfigured|2)$' { return 'NotConfigured' }
+        default {
+            throw "Invalid saved firewall profile Enabled value: '$text'. Expected True, False, or NotConfigured."
+        }
+    }
+}
+
+function ConvertTo-PyFirewallAction([object]$Value) {
+    if ($null -eq $Value) {
+        throw 'Firewall profile action value was empty.'
+    }
+
+    # Get-NetFirewallProfile exposes these properties as Action values such as
+    # Allow/Block, while older backups can contain the underlying numeric WMI
+    # values.  Microsoft documents the profile Action representation as:
+    # NotConfigured=0, Allow=2, Block=4.
+    if ($Value -is [System.Enum]) {
+        $text = $Value.ToString().Trim()
+    } else {
+        $text = ([string]$Value).Trim()
+    }
+
+    switch -Regex ($text) {
+        '^(?i:notconfigured)$' { return 'NotConfigured' }
+        '^(?i:allow)$'         { return 'Allow' }
+        '^(?i:block)$'         { return 'Block' }
+        '^0$'                  { return 'NotConfigured' }
+        '^2$'                  { return 'Allow' }
+        '^4$'                  { return 'Block' }
+        default {
+            throw "Invalid saved firewall profile action value: '$text'. Expected NotConfigured, Allow, Block, or the corresponding numeric value 0, 2, or 4."
+        }
+    }
+}
+
 function Restore-PyFirewallFirewallProfileState([object]$Backup) {
     if (-not $Backup) {
         Write-WarnMsg 'No valid PyFirewall firewall-profile backup was found; profile defaults were not changed.'
@@ -317,7 +362,8 @@ function Restore-PyFirewallFirewallProfileState([object]$Backup) {
             continue
         }
 
-        $stillPyFirewallState = ([bool]$currentProfile.Enabled) -and
+        $currentEnabled = ConvertTo-PyFirewallGpoBoolean $currentProfile.Enabled
+        $stillPyFirewallState = ($currentEnabled -eq 'True') -and
             ([string]$currentProfile.DefaultInboundAction -eq 'Allow') -and
             ([string]$currentProfile.DefaultOutboundAction -eq 'Allow')
         if (-not $stillPyFirewallState) {
@@ -326,11 +372,15 @@ function Restore-PyFirewallFirewallProfileState([object]$Backup) {
             continue
         }
 
+        $enabledValue = ConvertTo-PyFirewallGpoBoolean $saved.enabled
+        $inboundAction = ConvertTo-PyFirewallAction $saved.default_inbound_action
+        $outboundAction = ConvertTo-PyFirewallAction $saved.default_outbound_action
+
         Set-NetFirewallProfile `
             -Name $name `
-            -Enabled ([bool]$saved.enabled) `
-            -DefaultInboundAction ([string]$saved.default_inbound_action) `
-            -DefaultOutboundAction ([string]$saved.default_outbound_action) `
+            -Enabled $enabledValue `
+            -DefaultInboundAction $inboundAction `
+            -DefaultOutboundAction $outboundAction `
             -ErrorAction Stop
         $restoredNames += $name
         Write-OK "Restored firewall profile '$name'."
@@ -340,11 +390,34 @@ function Restore-PyFirewallFirewallProfileState([object]$Backup) {
     foreach ($name in $restoredNames) {
         $saved = @($Backup.profiles | Where-Object { [string]$_.name -eq $name }) | Select-Object -First 1
         $actual = $verified | Where-Object { [string]$_.Name -eq $name } | Select-Object -First 1
-        if (-not $actual -or
-            ([bool]$actual.Enabled -ne [bool]$saved.enabled) -or
-            ([string]$actual.DefaultInboundAction -ne [string]$saved.default_inbound_action) -or
-            ([string]$actual.DefaultOutboundAction -ne [string]$saved.default_outbound_action)) {
-            throw "Firewall profile '$name' could not be verified after restoration."
+
+        if (-not $actual) {
+            throw "Firewall profile '$name' could not be found during post-restoration verification."
+        }
+
+        # Enabled can be represented as a GpoBoolean/enum on the live profile
+        # and as a Boolean, string, or numeric value in the JSON backup. Compare
+        # normalized textual values instead of relying on PowerShell's loose casts.
+        $expectedEnabled = ConvertTo-PyFirewallGpoBoolean $saved.enabled
+        $actualEnabled = ConvertTo-PyFirewallGpoBoolean $actual.Enabled
+        $expectedInbound = ConvertTo-PyFirewallAction $saved.default_inbound_action
+        $actualInbound = ConvertTo-PyFirewallAction $actual.DefaultInboundAction
+        $expectedOutbound = ConvertTo-PyFirewallAction $saved.default_outbound_action
+        $actualOutbound = ConvertTo-PyFirewallAction $actual.DefaultOutboundAction
+
+        $mismatches = New-Object System.Collections.Generic.List[string]
+        if ($actualEnabled -ne $expectedEnabled) {
+            $mismatches.Add("Enabled expected '$expectedEnabled' but found '$actualEnabled'")
+        }
+        if ($actualInbound -ne $expectedInbound) {
+            $mismatches.Add("DefaultInboundAction expected '$expectedInbound' but found '$actualInbound'")
+        }
+        if ($actualOutbound -ne $expectedOutbound) {
+            $mismatches.Add("DefaultOutboundAction expected '$expectedOutbound' but found '$actualOutbound'")
+        }
+
+        if ($mismatches.Count -gt 0) {
+            throw ("Firewall profile '$name' could not be verified after restoration: " + ($mismatches -join '; '))
         }
     }
 
