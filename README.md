@@ -106,7 +106,7 @@ The installer records which Python components were installed by PyFirewall so sh
 
 ## Troubleshooting
 
-For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule.
+For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule. For unexpected errors, check `firewall_monitor_errors.log` beside the application for diagnostic details.
 
 ## References
 
