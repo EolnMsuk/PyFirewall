@@ -196,12 +196,6 @@ def add_tooltip(widget, text, delay=400):
 BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add Custom Rule': 'Create an inbound or outbound application rule.', 'Allow Global IP': 'Allow an IP address or domain globally.', 'Block Global IP': 'Block an IP address or domain globally.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
 
 class PyFirewallSystemTray:
-    """Small dependency-free Windows notification-area icon for PyFirewall.
-
-    The tray icon owns its own Win32 message loop so it does not interfere with
-    Tkinter's event loop.  Tray actions are passed back to Tk through a
-    thread-safe queue and executed by the main UI thread.
-    """
     WM_TRAYICON = 1024 + 1
     WM_CLOSE = 16
     WM_DESTROY = 2
@@ -1067,11 +1061,6 @@ class FirewallMonitorApp:
         return 'break'
 
     def _on_global_delete_key(self, _event=None):
-        """Fallback Delete handler for the Managed Rules Treeview.
-
-        This only acts when the Rules Treeview itself owns keyboard focus, so
-        Delete in search boxes, dialogs, and other controls is unaffected.
-        """
         if not hasattr(self, 'rules_tree'):
             return
         try:
@@ -1082,15 +1071,6 @@ class FirewallMonitorApp:
             return self._on_rules_delete(_event)
 
     def _bind_tree_selection(self, tree):
-        """Install deterministic mouse/keyboard selection for a Treeview.
-
-        Supports standard single-click selection, Ctrl-click, Shift-click, and
-        left-button click-and-drag range selection.  A drag may begin on blank
-        space above or below the rows; the nearest endpoint row is used as the
-        drag anchor so the behavior matches applications such as Windows File
-        Explorer.  A lightweight dotted rubber-band rectangle is shown while
-        dragging.
-        """
         tree.bind('<Button-1>', self._tree_selection_press, add='+')
         tree.bind('<B1-Motion>', self._tree_selection_drag, add='+')
         tree.bind('<ButtonRelease-1>', self._tree_selection_release, add='+')
@@ -1629,11 +1609,6 @@ class FirewallMonitorApp:
         self._update_threshold_entries()
 
     def _queue_settings_change(self, release_auto_holds=False):
-        """Queue a checkbox setting update for background persistence/work.
-
-        Requests are coalesced into one worker so rapid toggles cannot spawn
-        unbounded threads or leave older requests overwriting newer state.
-        """
         with self.settings_change_lock:
             self.settings_change_generation += 1
             self.settings_change_pending = True
@@ -2133,8 +2108,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     self._backup_firewall_profile_state()
                     with self.lock:
                         self.firewall_profile_modified = True
-                    # Do not delete persistent PyFirewall rules here. restore_saved_rules_locked()
-                    # reconciles stale/mismatched managed rules after the profile is ready.
                     try:
                         self.run_ps('Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {Set-NetFirewallProfile -Name $_.Name -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop}')
                     except Exception:
@@ -2288,12 +2261,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         return False
 
     def application_has_rule(self, exe_path):
-        """Return True when any application-specific allow/block rule exists.
-
-        Auto-Block prompt eligibility is intentionally independent of traffic
-        direction. Once the user has assigned a rule to the application, future
-        threshold events still generate Alerts but do not prompt again.
-        """
         return bool(self.get_rule_status(exe_path))
 
     def rules_changed(self):
