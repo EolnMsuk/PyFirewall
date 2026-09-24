@@ -12,12 +12,13 @@ from ctypes import wintypes
 import queue
 import subprocess
 import threading
+import traceback
 from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 try:
     import psutil
-    from scapy.all import sniff, IP, TCP, UDP
+    from scapy.all import sniff, IP, IPv6, TCP, UDP
 except ImportError as exc:
     raise SystemExit(f'Missing dependency: {exc}. Install psutil, scapy, and Npcap first.')
 DEFAULT_RATE_THRESHOLD = 50
@@ -39,11 +40,27 @@ DNS_MAX_WORKERS = 8
 DNS_MAX_PENDING = 256
 DNS_CACHE_MAX_ENTRIES = 2048
 DNS_CACHE_TTL = 900.0
+FIREWALL_COMMAND_TIMEOUT = 30.0
+TRAFFIC_MAX_IP_ENTRIES = 8192
+TRAFFIC_MAX_PROC_IP_ENTRIES = 16384
+TRAFFIC_PRUNE_INTERVAL = 30.0
+INTERNAL_ERROR_LOG_FILE = os.path.join(SCRIPT_DIR, 'firewall_monitor_errors.log')
+INTERNAL_ERROR_LOG_LOCK = threading.Lock()
 
 
 if os.name != 'nt':
     raise SystemExit('This application requires Windows.')
 _MUTEX_HANDLE = None
+
+def log_internal_error(context, exc):
+    try:
+        with INTERNAL_ERROR_LOG_LOCK:
+            with open(INTERNAL_ERROR_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {type(exc).__name__}: {exc}\n")
+                traceback.print_exc(file=f)
+                f.write('\n')
+    except Exception:
+        pass
 
 def hide_console():
     try:
@@ -433,10 +450,11 @@ class PyFirewallSystemTray:
                 pass
 
 class FirewallMonitorApp:
-    MONITOR_COLUMNS = ('#', 'Process Name', 'PID', 'Direction', 'Protocol', 'Local Port', 'Remote IP', 'Remote Host', 'Remote Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'Exe Path')
+    MONITOR_COLUMNS = ('#', 'Process Name', 'Status', 'PID', 'Direction', 'Protocol', 'Local Port', 'Remote IP', 'Remote Host', 'Remote Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'Exe Path')
+    ACTIVE_COLUMNS = ('#', 'Process Name', 'PID', 'Direction', 'Protocol', 'Local Port', 'Remote IP', 'Remote Host', 'Remote Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'Exe Path')
     RULE_COLUMNS = ('Status', 'Rule / Application', 'Direction', 'Download (MB)', 'Upload (MB)', 'Program Path')
     ALERT_COLUMNS = ('Time', 'Severity', 'Process', 'PID', 'Remote IP', 'Remote Host', 'Reason')
-    DEFAULT_COLUMN_ORDERS = {'monitor': ('#', 'Process Name', 'PID', 'Direction', 'Protocol', 'Local Port', 'Remote IP', 'Remote Host', 'Remote Port', 'Download (MB)', 'Upload (MB)', 'Exe Path', 'Signal'), 'active': ('#', 'Process Name', 'PID', 'Direction', 'Protocol', 'Local Port', 'Remote IP', 'Remote Host', 'Remote Port', 'Download (MB)', 'Upload (MB)', 'Exe Path', 'Signal'), 'rules': RULE_COLUMNS, 'alerts': ALERT_COLUMNS}
+    DEFAULT_COLUMN_ORDERS = {'monitor': ('#', 'Process Name', 'Status', 'PID', 'Direction', 'Protocol', 'Local Port', 'Remote IP', 'Remote Host', 'Remote Port', 'Download (MB)', 'Upload (MB)', 'Exe Path', 'Signal'), 'active': ACTIVE_COLUMNS, 'rules': RULE_COLUMNS, 'alerts': ALERT_COLUMNS}
 
     def __init__(self, root):
         self.root = root
@@ -472,6 +490,9 @@ class FirewallMonitorApp:
         self.proc_traffic = {}
         self.ip_traffic = {}
         self.proc_ip_upload = {}
+        self.ip_traffic_last_seen = {}
+        self.proc_ip_upload_last_seen = {}
+        self.last_traffic_prune = time.monotonic()
         self.upload_alerted = set()
         self.total_download = self.total_upload = 0
         self.captured_packets = self.captured_bytes = 0
@@ -485,11 +506,18 @@ class FirewallMonitorApp:
         self.rule_rows = []
         self.rules_loading = False
         self.rules_generation = 0
+        self.rules_refresh_worker_running = False
+        self.rules_refresh_pending = False
         self.pending_rules = []
         self.alerts = deque(maxlen=DEFAULT_MAX_CONNECTIONS_ALERTS)
         self.next_alert_id = 1
         self.auto_prompt_keys = set()
         self.auto_prompt_active = False
+        self.auto_prompt_dialog = None
+        self.auto_prompt_key = None
+        self.auto_prompt_generation = 0
+        self.firewall_profile_modified = False
+        self.settings_save_error = None
         self.dns_cache = {}
         self.dns_cache_times = {}
         self.dns_pending = set()
@@ -497,7 +525,8 @@ class FirewallMonitorApp:
         self.dns_stop_event = threading.Event()
         self.dns_workers = []
         self._start_dns_workers()
-        self.port_process_cache = {}
+        self.socket_process_cache = {}
+        self.listener_process_cache = {}
         self.cache_time = 0.0
         self.filter_all_enabled = True
         self.filter_all_saved_alerts = None
@@ -580,6 +609,11 @@ class FirewallMonitorApp:
                     if not isinstance(saved, (list, tuple)):
                         continue
                     valid = [column for column in saved if column in default]
+                    if key == 'monitor' and 'Status' not in valid:
+                        if 'Process Name' in valid:
+                            valid.insert(valid.index('Process Name') + 1, 'Status')
+                        else:
+                            valid.append('Status')
                     valid.extend((column for column in default if column not in valid))
                     self.column_orders[key] = valid
             self.allowed_apps = {normalize_path(p) for p in config.get('allowed_apps', []) if normalize_path(p)}
@@ -621,20 +655,28 @@ class FirewallMonitorApp:
         return 'Both' if data['in'] and data['out'] else 'Inbound' if data['in'] else 'Outbound'
 
     def save_settings(self):
+        temp = CONFIG_FILE + '.tmp'
         try:
             with self.settings_io_lock:
                 with self.lock:
                     managed = [{'action': 'Allow', 'direction': 'Both', 'path': path} for path in sorted(self.allowed_apps)]
                     managed += [{'action': 'Block', 'direction': self._direction_from_flags(data), 'path': data.get('path', normalized)} for normalized, data in sorted(self.blocked_paths.items())]
                     config = {'filter_all_enabled': self.filter_all_enabled, 'filter_all_saved_alerts': self.filter_all_saved_alerts, 'filter_all_saved_auto_block': self.filter_all_saved_auto_block, 'saved_rate_threshold': self.saved_rate_threshold, 'rate_threshold': self.rate_threshold, 'rate_window': self.rate_window, 'upload_threshold_mb': self.upload_threshold_mb, 'max_connections_alerts': self.max_connections_alerts, 'log_alerts_only_enabled': self.log_alerts_only, 'auto_block_enabled': self.auto_block_enabled, 'allowed_apps': sorted(self.allowed_apps), 'managed_rules': managed, 'global_ip_blocks': [{'target': target, 'addresses': list(data.get('addresses', ()))} for target, data in sorted(self.global_blocks.items())], 'global_ip_allows': [{'target': target, 'addresses': list(data.get('addresses', ()))} for target, data in sorted(self.global_allows.items())], 'dark_mode': bool(self.dark_mode), 'firewall_initialized': self.firewall_initialized, 'column_orders': {key: list(order) for key, order in self.column_orders.items()}}
-                temp = CONFIG_FILE + '.tmp'
                 with open(temp, 'w', encoding='utf-8') as f:
                     json.dump(config, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(temp, CONFIG_FILE)
-        except Exception:
-            pass
+            self.settings_save_error = None
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            self.settings_save_error = str(exc)
+            try:
+                if os.path.exists(temp):
+                    os.remove(temp)
+            except OSError:
+                pass
+            return False
 
     def apply_theme(self):
         dark = self.dark_mode_var.get()
@@ -856,13 +898,14 @@ class FirewallMonitorApp:
     def _normalized_column_order(self, order_key, columns=None):
         default = tuple(self.default_column_orders[order_key])
         available = set(columns or default)
-        saved = self.column_orders.get(order_key, list(default))
-        result = [c for c in saved if c in available]
-        result.extend((c for c in default if c in available and c not in result))
-        if columns:
-            result.extend((c for c in columns if c not in result))
-        self.column_orders[order_key] = result
-        return result
+        with self.lock:
+            saved = list(self.column_orders.get(order_key, list(default)))
+            result = [c for c in saved if c in available]
+            result.extend((c for c in default if c in available and c not in result))
+            if columns:
+                result.extend((c for c in columns if c not in result))
+            self.column_orders[order_key] = result
+            return list(result)
 
     def _position_top_controls(self, _event=None):
         if not hasattr(self, 'notebook') or not hasattr(self, 'top_controls'):
@@ -1008,7 +1051,8 @@ class FirewallMonitorApp:
             insert_at = target_index + 1 if target_index > source_index else target_index
             order.insert(insert_at, source)
             tree['displaycolumns'] = tuple(order)
-            self.column_orders[tree._column_order_key] = order
+            with self.lock:
+                self.column_orders[tree._column_order_key] = list(order)
             self.save_settings()
         return 'break'
 
@@ -1306,7 +1350,7 @@ class FirewallMonitorApp:
             self.selection_anchors[str(tree)] = iid
 
     def _monitor_widths(self):
-        return {'#': (55, tk.CENTER, False), 'PID': (70, tk.CENTER, False), 'Protocol': (70, tk.CENTER, False), 'Local Port': (85, tk.CENTER, False), 'Remote Port': (85, tk.CENTER, False), 'Direction': (85, tk.CENTER, False), 'Process Name': (150, tk.W, True), 'Remote IP': (125, tk.CENTER, True), 'Remote Host': (190, tk.W, True), 'Download (MB)': (110, tk.CENTER, False), 'Upload (MB)': (110, tk.CENTER, False), 'Signal': (210, tk.W, True), 'Exe Path': (300, tk.W, True)}
+        return {'#': (55, tk.CENTER, False), 'Status': (105, tk.CENTER, False), 'PID': (70, tk.CENTER, False), 'Protocol': (70, tk.CENTER, False), 'Local Port': (85, tk.CENTER, False), 'Remote Port': (85, tk.CENTER, False), 'Direction': (85, tk.CENTER, False), 'Process Name': (150, tk.W, True), 'Remote IP': (125, tk.CENTER, True), 'Remote Host': (190, tk.W, True), 'Download (MB)': (110, tk.CENTER, False), 'Upload (MB)': (110, tk.CENTER, False), 'Signal': (210, tk.W, True), 'Exe Path': (300, tk.W, True)}
 
     def setup_monitor_tab(self):
         bar = tk.Frame(self.tab_monitor, pady=8)
@@ -1330,7 +1374,7 @@ class FirewallMonitorApp:
         self.active_search_var.trace_add('write', lambda *_: self.render_active())
         ttk.Entry(bar, textvariable=self.active_search_var, width=25).pack(side=tk.RIGHT, padx=5)
         tk.Label(bar, text='Search:').pack(side=tk.RIGHT)
-        self.active_tree = self._make_tree(self.tab_active, self.MONITOR_COLUMNS, self._monitor_widths(), 'active')
+        self.active_tree = self._make_tree(self.tab_active, self.ACTIVE_COLUMNS, self._monitor_widths(), 'active')
         self.active_tree.bind('<Double-1>', lambda e: self.tree_details_from_event(e, self.active_tree))
 
     def setup_rules_tab(self):
@@ -1562,6 +1606,8 @@ class FirewallMonitorApp:
         with self.lock:
             self.is_paused = not self.is_paused
             paused = self.is_paused
+        if paused:
+            self._invalidate_auto_prompts(close_dialog=True)
         pause_text = '▶  Resume Monitoring' if paused else '⏸  Pause Monitoring'
         pause_color = '#9E9E9E' if paused else '#2196F3'
         if hasattr(self, 'btn_pause'):
@@ -1604,22 +1650,15 @@ class FirewallMonitorApp:
                     if generation != self.settings_change_generation:
                         return False
                 with self.lock:
-                    if self.closed:
-                        return False
-                    if self.log_alerts_only and self.auto_block_enabled:
+                    if self.closed or (self.log_alerts_only and self.auto_block_enabled):
                         return False
                 self.remove_auto_holds_locked()
                 with self.settings_change_lock:
                     generation_is_current = generation == self.settings_change_generation
                 with self.lock:
                     still_current = generation_is_current and (not self.closed) and (not self.log_alerts_only) and (not self.auto_block_enabled)
-                    if still_current:
-                        self.auto_prompt_keys.clear()
-                        while True:
-                            try:
-                                self.prompt_queue.get_nowait()
-                            except queue.Empty:
-                                break
+                if still_current:
+                    self._invalidate_auto_prompts(close_dialog=False)
                 return still_current
         except Exception:
             return False
@@ -1651,6 +1690,7 @@ class FirewallMonitorApp:
             if not enabled:
                 self.auto_block_enabled = False
         if not enabled:
+            self._invalidate_auto_prompts(close_dialog=True)
             self.auto_block_var.set(False)
         self.update_auto_block_controls()
         self.root.update_idletasks()
@@ -1661,6 +1701,8 @@ class FirewallMonitorApp:
         with self.lock:
             self.auto_block_enabled = self.log_alerts_only and enabled
             actual_enabled = self.auto_block_enabled
+        if not actual_enabled:
+            self._invalidate_auto_prompts(close_dialog=True)
         self.auto_block_var.set(actual_enabled)
         self.update_auto_block_controls()
         self.root.update_idletasks()
@@ -1703,6 +1745,7 @@ class FirewallMonitorApp:
             self._prune_connection_and_alert_history_locked()
             self.connection_rates.clear()
             self.proc_ip_upload.clear()
+            self.proc_ip_upload_last_seen.clear()
             self.upload_alerted.clear()
         self.rate_threshold_var.set(str(threshold))
         self.rate_window_var.set(str(window))
@@ -1719,6 +1762,7 @@ class FirewallMonitorApp:
     def reset_to_defaults(self):
         if not messagebox.askyesno('Reset to Defaults', 'Remove all PyFirewall_* firewall rules and reset application settings?\n\nOther Windows Firewall rules will not be changed.', icon='warning'):
             return
+        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 with self.settings_change_lock:
@@ -1747,7 +1791,9 @@ class FirewallMonitorApp:
                 self.active_connections.clear()
                 self.connection_rates.clear()
                 self.proc_ip_upload.clear()
+                self.proc_ip_upload_last_seen.clear()
                 self.upload_alerted.clear()
+                self.ip_traffic_last_seen.clear()
                 self.proc_traffic.clear()
                 self.ip_traffic.clear()
                 self.total_download = self.total_upload = 0
@@ -1779,7 +1825,15 @@ class FirewallMonitorApp:
             messagebox.showerror('Reset Failed', str(exc))
 
     def _run(self, args, check=True):
-        return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check, creationflags=CREATE_NO_WINDOW)
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=check,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=FIREWALL_COMMAND_TIMEOUT,
+        )
 
     def run_ps(self, command, check=True):
         return self._run(('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command), check)
@@ -1787,27 +1841,56 @@ class FirewallMonitorApp:
     def run_netsh(self, args, check=True):
         return self._run(('netsh', 'advfirewall', 'firewall', *args), check)
 
-    def delete_rule_names(self, names):
+    def delete_rule_names(self, names, strict=False):
         deleted = False
+        failures = []
         for name in dict.fromkeys((n for n in names if n)):
             try:
                 self.run_netsh(['delete', 'rule', f'name={name}'])
                 deleted = True
-            except (subprocess.CalledProcessError, OSError):
-                pass
+            except (subprocess.CalledProcessError, OSError) as exc:
+                failures.append((name, exc))
+        if strict and failures:
+            details = '; '.join(f"{name}: {str(exc)}" for name, exc in failures)
+            raise RuntimeError(f'Failed to delete Windows Firewall rule(s): {details}')
         return deleted
 
     def get_firewall_rules(self):
-        command = '\n$rules = Get-NetFirewallRule -ErrorAction SilentlyContinue |\n  Where-Object {$_.DisplayName -like "PyFirewall_*"} |\n  ForEach-Object {\n    $r = $_\n    $a = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction SilentlyContinue |\n      Select-Object -First 1\n    [PSCustomObject]@{\n      DisplayName=[string]$r.DisplayName\n      Action=[string]$r.Action\n      Direction=[string]$r.Direction\n      Program=if($null -ne $a){[string]$a.Program}else{""}\n    }\n  }\nif($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}\n'
-        output = self.run_ps(command).stdout.strip() or '[]'
+        command = '''
+$rules = Get-NetFirewallRule -ErrorAction Stop |
+  Where-Object {$_.DisplayName -like "PyFirewall_*"} |
+  ForEach-Object {
+    $r = $_
+    $a = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop |
+      Select-Object -First 1
+    [PSCustomObject]@{
+      DisplayName=[string]$r.DisplayName
+      Action=[string]$r.Action
+      Direction=[string]$r.Direction
+      Program=if($null -ne $a){[string]$a.Program}else{""}
+    }
+  }
+if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
+'''
+        output = self.run_ps(command).stdout.strip()
+        if not output:
+            return []
         try:
             raw = json.loads(output)
-        except json.JSONDecodeError:
-            return []
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(f'Windows Firewall returned invalid rule data: {exc}') from exc
         if isinstance(raw, dict):
             raw = [raw]
+        if not isinstance(raw, list):
+            raise RuntimeError('Windows Firewall returned an unexpected rule-data format.')
         records = []
-        for item in raw if isinstance(raw, list) else []:
+        for item in raw:
+            if not isinstance(item, dict):
+                raise RuntimeError('Windows Firewall returned an invalid rule record.')
+            if not str(item.get('DisplayName', '') or '').strip():
+                raise RuntimeError('Windows Firewall returned a rule without a display name.')
+            if 'Action' not in item or 'Direction' not in item:
+                raise RuntimeError('Windows Firewall returned incomplete rule metadata.')
             name = str(item.get('DisplayName', '') or '')
             global_rule = name.startswith((GLOBAL_BLOCK_PREFIX, GLOBAL_ALLOW_PREFIX))
             records.append({'name': name, 'action': str(item.get('Action', '') or ''), 'direction': str(item.get('Direction', '') or ''), 'path': '' if global_rule else display_path(item.get('Program', '')), 'normalized_path': '' if global_rule else normalize_path(item.get('Program', '')), 'is_global': global_rule, 'is_hold': name.startswith(AUTO_HOLD_PREFIX)})
@@ -1822,11 +1905,120 @@ class FirewallMonitorApp:
         digest = hashlib.sha1(normalize_target(target).encode('utf-8')).hexdigest()[:12]
         return f'{(GLOBAL_ALLOW_PREFIX if allow else GLOBAL_BLOCK_PREFIX)}{digest}'
 
+    @staticmethod
+    def _ps_quote(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _add_app_firewall_rule(self, name, exe_path, side, action='block'):
+        """Create one verified Windows Firewall application rule with rollback."""
+        direction = 'Inbound' if side == 'in' else 'Outbound'
+        action_name = 'Block' if str(action).casefold() == 'block' else 'Allow'
+        created = False
+        used_netsh = False
+
+        ps_command = (
+            f"New-NetFirewallRule -Name {self._ps_quote(name)} -DisplayName {self._ps_quote(name)} "
+            f"-Direction {direction} -Program {self._ps_quote(exe_path)} "
+            f"-Action {action_name} -Enabled True -Profile Any -ErrorAction Stop | Out-Null"
+        )
+
+        try:
+            self.run_ps(ps_command)
+            created = True
+        except Exception as first_error:
+            first_detail = getattr(first_error, 'stderr', '') or ''
+            try:
+                self.run_netsh([
+                    'add', 'rule',
+                    f'name={name}',
+                    f'dir={side}',
+                    f'action={action_name.casefold()}',
+                    f'program={exe_path}',
+                    'enable=yes',
+                    'profile=any',
+                ])
+                created = True
+                used_netsh = True
+            except Exception as second_error:
+                second_detail = getattr(second_error, 'stderr', '') or ''
+                try:
+                    self.delete_rule_names((name,))
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"Could not create application firewall rule '{name}' for '{exe_path}'. "
+                    f"PowerShell: {str(first_detail).strip() or str(first_error)}; "
+                    f"netsh: {str(second_detail).strip() or str(second_error)}"
+                ) from second_error
+
+        verify = (
+            f"$r=Get-NetFirewallRule -Name {self._ps_quote(name)} -ErrorAction Stop; "
+            f"$a=Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop | Select-Object -First 1; "
+            f"if(-not $a){{throw 'Application filter is missing.'}}; "
+            f"if(-not $r.Enabled){{throw 'Firewall rule is disabled.'}}; "
+            f"if([string]$r.Direction -ne {self._ps_quote(direction)}){{throw ('Wrong direction: ' + [string]$r.Direction)}}; "
+            f"if([string]$r.Action -ne {self._ps_quote(action_name)}){{throw ('Wrong action: ' + [string]$r.Action)}}; "
+            f"if(-not [string]::Equals([string]$a.Program,{self._ps_quote(exe_path)},[System.StringComparison]::OrdinalIgnoreCase)){{throw ('Wrong program: ' + [string]$a.Program)}}"
+        )
+        try:
+            self.run_ps(verify)
+            return
+        except Exception as exc:
+            if used_netsh:
+                try:
+                    self.run_netsh(['show', 'rule', f'name={name}', 'verbose'])
+                    return
+                except Exception:
+                    pass
+            detail = getattr(exc, 'stderr', '') or ''
+            if created:
+                try:
+                    self.delete_rule_names((name,))
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"Windows Firewall created rule '{name}', but verification failed for '{exe_path}': "
+                f"{str(detail).strip() or str(exc)}"
+            ) from exc
+
     def add_app_rules(self, proc_name, exe_path, direction, kind='Block'):
         base = self.app_rule_base(proc_name, exe_path, kind)
-        for side in direction_set(direction):
-            self.run_netsh(['add', 'rule', f"name={base}_{('In' if side == 'in' else 'Out')}", f'dir={side}', 'action=block', f'program={exe_path}', 'enable=yes'])
-        return base
+        created_names = []
+        try:
+            for side in direction_set(direction):
+                name = f"{base}_{('In' if side == 'in' else 'Out')}"
+                self._add_app_firewall_rule(name, exe_path, side, 'block')
+                created_names.append(name)
+            return base
+        except Exception:
+            if created_names:
+                try:
+                    self.delete_rule_names(created_names)
+                except Exception:
+                    pass
+            raise
+
+    def _restore_app_rule_records(self, records):
+        created = []
+        try:
+            for record in records:
+                path = display_path(record.get('path', ''))
+                name = str(record.get('name', '') or '').strip()
+                if not path or not name or record.get('is_global') or record.get('is_hold'):
+                    continue
+                action = 'Allow' if str(record.get('action', '')).casefold() == 'allow' else 'Block'
+                suffixes = {'in': 'In', 'out': 'Out'}
+                for side in direction_set(record.get('direction', 'Both')):
+                    rule_name = name if name.endswith(f"_{suffixes[side]}") else f"{name}_{suffixes[side]}"
+                    self._add_app_firewall_rule(rule_name, path, side, action)
+                    created.append(rule_name)
+        except Exception:
+            if created:
+                try:
+                    self.delete_rule_names(created)
+                except Exception:
+                    pass
+            raise
 
     def resolve_global_target(self, target):
         target = normalize_target(target)
@@ -1856,11 +2048,49 @@ class FirewallMonitorApp:
             raise ValueError('Enter a valid IP address or a domain that resolves to at least one IP address.')
         base = self.global_rule_base(target, allow)
         other = self.global_rule_base(target, not allow)
-        self.delete_rule_names((f'{base}_In', f'{base}_Out', f'{other}_In', f'{other}_Out'))
+        previous_allow = None
+        previous_addresses = ()
+        with self.lock:
+            current = self.global_allows if allow else self.global_blocks
+            other_store = self.global_blocks if allow else self.global_allows
+            if target in current:
+                previous_allow = allow
+                previous_addresses = tuple(current[target].get('addresses', ()))
+            elif target in other_store:
+                previous_allow = not allow
+                previous_addresses = tuple(other_store[target].get('addresses', ()))
+        old_names = (f'{base}_In', f'{base}_Out', f'{other}_In', f'{other}_Out')
+        self.delete_rule_names(old_names, strict=True)
         action = 'allow' if allow else 'block'
         remote_ips = ','.join(addresses)
-        for side in ('in', 'out'):
-            self.run_netsh(['add', 'rule', f'name={base}_{side.title()}', f'dir={side}', f'action={action}', f'remoteip={remote_ips}', 'enable=yes'])
+        created = []
+        try:
+            for side in ('in', 'out'):
+                name = f'{base}_{side.title()}'
+                self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}', f'action={action}', f'remoteip={remote_ips}', 'enable=yes'])
+                created.append(name)
+        except Exception as exc:
+            try:
+                self.delete_rule_names(created)
+            except Exception:
+                pass
+            if previous_allow is not None and previous_addresses:
+                restore_base = self.global_rule_base(target, previous_allow)
+                restore_action = 'allow' if previous_allow else 'block'
+                restore_ips = ','.join(previous_addresses)
+                restored = []
+                try:
+                    for side in ('in', 'out'):
+                        name = f'{restore_base}_{side.title()}'
+                        self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}', f'action={restore_action}', f'remoteip={restore_ips}', 'enable=yes'])
+                        restored.append(name)
+                except Exception as restore_exc:
+                    try:
+                        self.delete_rule_names(restored)
+                    except Exception:
+                        pass
+                    raise RuntimeError(f'Global rule update failed and rollback also failed: {restore_exc}') from restore_exc
+            raise exc
         return (target, addresses)
 
     def _read_firewall_profile_state(self):
@@ -1901,8 +2131,17 @@ class FirewallMonitorApp:
             with self.firewall_lock:
                 if not self.firewall_initialized:
                     self._backup_firewall_profile_state()
-                    self.delete_rule_names((r['name'] for r in self.get_firewall_rules()))
-                    self.run_ps('Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {Set-NetFirewallProfile -Name $_.Name -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop}')
+                    with self.lock:
+                        self.firewall_profile_modified = True
+                    # Do not delete persistent PyFirewall rules here. restore_saved_rules_locked()
+                    # reconciles stale/mismatched managed rules after the profile is ready.
+                    try:
+                        self.run_ps('Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {Set-NetFirewallProfile -Name $_.Name -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop}')
+                    except Exception:
+                        try:
+                            self._restore_firewall_profile_state_locked()
+                        finally:
+                            raise
                     with self.lock:
                         self.firewall_initialized = True
                 self.restore_saved_rules_locked()
@@ -1910,6 +2149,37 @@ class FirewallMonitorApp:
             return (True, '')
         except Exception as exc:
             return (False, str(exc))
+
+    def _restore_firewall_profile_state_locked(self):
+        if not os.path.exists(FIREWALL_PROFILE_BACKUP_FILE):
+            return False
+        with open(FIREWALL_PROFILE_BACKUP_FILE, 'r', encoding='utf-8') as f:
+            backup = json.load(f)
+        profiles = backup.get('profiles') if isinstance(backup, dict) else None
+        if not isinstance(profiles, list) or not profiles:
+            raise ValueError('Firewall profile backup is missing or invalid.')
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            name = str(profile.get('name', '') or '').strip()
+            if not name:
+                continue
+            enabled = bool(profile.get('enabled', False))
+            inbound = str(profile.get('default_inbound_action', '') or '').strip()
+            outbound = str(profile.get('default_outbound_action', '') or '').strip()
+            if inbound not in {'Allow', 'Block', 'NotConfigured'} or outbound not in {'Allow', 'Block', 'NotConfigured'}:
+                raise ValueError(f"Invalid firewall profile actions for '{name}'.")
+            command = (
+                f"Set-NetFirewallProfile -Name {self._ps_quote(name)} "
+                f"-Enabled ${'true' if enabled else 'false'} "
+                f"-DefaultInboundAction {self._ps_quote(inbound)} "
+                f"-DefaultOutboundAction {self._ps_quote(outbound)} -ErrorAction Stop"
+            )
+            self.run_ps(command)
+        os.remove(FIREWALL_PROFILE_BACKUP_FILE)
+        with self.lock:
+            self.firewall_profile_modified = False
+        return True
 
     def _start_background_initialization(self):
         if self.closed or self.startup_running or self.startup_complete:
@@ -1988,6 +2258,10 @@ class FirewallMonitorApp:
                 return 'blocked_out'
             return ''
 
+    def get_rule_status_display(self, exe_path):
+        status = self.get_rule_status(exe_path)
+        return {'allowed': 'Allowed', 'blocked_both': 'Blocked', 'blocked_in': 'Blocked (In)', 'blocked_out': 'Blocked'}.get(status, '—')
+
     def _global_match(self, collection, remote_ip, domain):
         candidates = {normalize_target(remote_ip), normalize_target(domain)}
         return any((target in candidates or remote_ip in data.get('addresses', ()) for target, data in collection.items()))
@@ -2030,13 +2304,23 @@ class FirewallMonitorApp:
         norm = normalize_path(path)
         if not norm:
             return False
+        self._invalidate_auto_prompts(close_dialog=True)
         proc_name = proc_name or os.path.splitext(os.path.basename(path))[0] or 'Process'
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
-                self.delete_rule_names((r['name'] for r in records if r['normalized_path'] == norm))
-                self.remove_auto_holds_locked(norm)
-                self.add_app_rules(proc_name, path, direction, kind='Block')
+                previous = [r for r in records if r['normalized_path'] == norm and not r['is_hold']]
+                self.delete_rule_names((r['name'] for r in previous), strict=True)
+                try:
+                    self.remove_auto_holds_locked(norm)
+                    self.add_app_rules(proc_name, path, direction, kind='Block')
+                except Exception:
+                    try:
+                        self.delete_rule_names((r['name'] for r in self.get_firewall_rules() if r['normalized_path'] == norm))
+                    except Exception:
+                        pass
+                    self._restore_app_rule_records(previous)
+                    raise
                 with self.lock:
                     wanted = direction_set(direction)
                     self.allowed_apps.discard(norm)
@@ -2056,11 +2340,17 @@ class FirewallMonitorApp:
         norm = normalize_path(path)
         if not norm:
             return False
+        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
-                self.delete_rule_names((r['name'] for r in records if r['normalized_path'] == norm))
-                self.remove_auto_holds_locked(norm)
+                previous = [r for r in records if r['normalized_path'] == norm and not r['is_hold']]
+                self.delete_rule_names((r['name'] for r in previous), strict=True)
+                try:
+                    self.remove_auto_holds_locked(norm)
+                except Exception:
+                    self._restore_app_rule_records(previous)
+                    raise
                 with self.lock:
                     changed = norm not in self.allowed_apps
                     self.allowed_apps.add(norm)
@@ -2080,6 +2370,7 @@ class FirewallMonitorApp:
         target = normalize_target(target)
         if not target:
             return False
+        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 target, addresses = self.add_global_rule_sync(target, allow)
@@ -2099,6 +2390,7 @@ class FirewallMonitorApp:
 
     def remove_rule(self, status, path, refresh=True):
         status = str(status).casefold()
+        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
@@ -2139,38 +2431,58 @@ class FirewallMonitorApp:
         return blocked
 
     def sync_rule_cache(self):
-        try:
-            with self.firewall_lock:
-                records = self.get_firewall_rules()
-            blocked = self._blocked_from_records(records)
-            with self.lock:
-                allowed = set(self.allowed_apps)
-                self.blocked_paths = {path: data for path, data in blocked.items() if path not in allowed}
-        except Exception:
-            pass
+        with self.firewall_lock:
+            records = self.get_firewall_rules()
+        blocked = self._blocked_from_records(records)
+        with self.lock:
+            allowed = set(self.allowed_apps)
+            self.blocked_paths = {path: data for path, data in blocked.items() if path not in allowed}
 
     def refresh_rules(self, force=False):
         with self.lock:
-            if not self.firewall_initialized or (self.rules_loading and (not force)):
+            if not self.firewall_initialized:
+                return
+            self.rules_generation += 1
+            self.rules_refresh_pending = True
+            if self.rules_refresh_worker_running:
                 return
             self.rules_loading = True
-            self.rules_generation += 1
-            generation = self.rules_generation
+            self.rules_refresh_worker_running = True
         self.rules_tree.delete(*self.rules_tree.get_children())
         self.rules_tree.insert('', tk.END, iid='__loading__', values=('Loading', 'Reading Windows Firewall...', '', '', '', ''), tags=('even',))
-        threading.Thread(target=self._refresh_rules_worker, args=(generation,), daemon=True, name='RuleRefresh').start()
+        threading.Thread(target=self._refresh_rules_worker, daemon=True, name='RuleRefresh').start()
 
-    def _refresh_rules_worker(self, generation):
-        try:
-            with self.firewall_lock:
-                records = self.get_firewall_rules()
-                with self.lock:
-                    allowed = set(self.allowed_apps)
-                    blocks = {k: dict(v) for k, v in self.global_blocks.items()}
-                    allows = {k: dict(v) for k, v in self.global_allows.items()}
-            self.ui_queue.put(('rules', generation, self._blocked_from_records(records), allowed, blocks, allows))
-        except Exception as exc:
-            self.ui_queue.put(('rules_error', generation, str(exc)))
+    def _refresh_rules_worker(self):
+        while True:
+            with self.lock:
+                if self.closed:
+                    self.rules_refresh_pending = False
+                    self.rules_refresh_worker_running = False
+                    return
+                if not self.rules_refresh_pending:
+                    self.rules_refresh_worker_running = False
+                    return
+                self.rules_refresh_pending = False
+                generation = self.rules_generation
+            try:
+                with self.firewall_lock:
+                    records = self.get_firewall_rules()
+                    with self.lock:
+                        allowed = set(self.allowed_apps)
+                        blocks = {k: dict(v) for k, v in self.global_blocks.items()}
+                        allows = {k: dict(v) for k, v in self.global_allows.items()}
+                self.ui_queue.put(('rules', generation, self._blocked_from_records(records), allowed, blocks, allows))
+            except Exception as exc:
+                self.ui_queue.put(('rules_error', generation, str(exc)))
+            with self.lock:
+                if self.closed:
+                    self.rules_refresh_pending = False
+                    self.rules_refresh_worker_running = False
+                    return
+                if self.rules_refresh_pending:
+                    continue
+                self.rules_refresh_worker_running = False
+                return
 
     def _make_rule_rows(self, blocked, allowed, blocks, allows):
         rows = []
@@ -2209,6 +2521,8 @@ class FirewallMonitorApp:
         self.rule_rows = rows
         self.rules_loading = False
         self.render_rules()
+        self.render_monitor()
+        self.render_active()
 
     def add_custom_rule(self):
         path = filedialog.askopenfilename(title='Select Executable', filetypes=[('Executable Files', '*.exe'), ('All files', '*.*')])
@@ -2283,7 +2597,7 @@ class FirewallMonitorApp:
 
     def sort_monitor_rows(self, rows, state):
         column, reverse = state
-        fields = {'#': lambda r: r['number'], 'Process Name': lambda r: r['name'].casefold(), 'PID': lambda r: r['pid'], 'Direction': lambda r: r['direction'].casefold(), 'Protocol': lambda r: r['protocol'].casefold(), 'Local Port': lambda r: r['lport'], 'Remote IP': lambda r: r['dst_ip'].casefold(), 'Remote Host': lambda r: r.get('domain', '').casefold(), 'Remote Port': lambda r: r['dport'], 'Download (MB)': lambda r: r.get('_down', 0), 'Upload (MB)': lambda r: r.get('_up', 0), 'Signal': lambda r: r.get('signal', '').casefold(), 'Exe Path': lambda r: r['exe'].casefold()}
+        fields = {'#': lambda r: r['number'], 'Process Name': lambda r: r['name'].casefold(), 'Status': lambda r: self.get_rule_status_display(r.get('exe', '')).casefold(), 'PID': lambda r: r['pid'], 'Direction': lambda r: r['direction'].casefold(), 'Protocol': lambda r: r['protocol'].casefold(), 'Local Port': lambda r: r['lport'], 'Remote IP': lambda r: r['dst_ip'].casefold(), 'Remote Host': lambda r: r.get('domain', '').casefold(), 'Remote Port': lambda r: r['dport'], 'Download (MB)': lambda r: r.get('_down', 0), 'Upload (MB)': lambda r: r.get('_up', 0), 'Signal': lambda r: r.get('signal', '').casefold(), 'Exe Path': lambda r: r['exe'].casefold()}
         rows.sort(key=fields.get(column, lambda r: ''), reverse=reverse)
 
     def _render_connections(self, tree, search_var, sort_state, active_only=False):
@@ -2304,7 +2618,7 @@ class FirewallMonitorApp:
         selected = set(tree.selection())
         tree.delete(*tree.get_children())
         for index, row in enumerate(rows):
-            tree.insert('', tk.END, iid=row['key'], values=self.connection_values(row), tags=(self.connection_tag(row, index),))
+            tree.insert('', tk.END, iid=row['key'], values=self.connection_values(row, include_status=(tree is self.tree)), tags=(self.connection_tag(row, index),))
         if selected:
             tree.selection_set([iid for iid in selected if tree.exists(iid)])
 
@@ -2314,8 +2628,11 @@ class FirewallMonitorApp:
     def render_active(self):
         self._render_connections(self.active_tree, self.active_search_var, self.active_sort, active_only=True)
 
-    def connection_values(self, row):
-        return (row['number'], row['name'], row['pid'], row['direction'], row['protocol'], row['lport'], row['dst_ip'], row.get('domain') or '—', row['dport'], mb(row.get('_down', 0)), mb(row.get('_up', 0)), row.get('signal') or '—', row['exe'])
+    def connection_values(self, row, include_status=False):
+        values = (row['number'], row['name'], row['pid'], row['direction'], row['protocol'], row['lport'], row['dst_ip'], row.get('domain') or '—', row['dport'], mb(row.get('_down', 0)), mb(row.get('_up', 0)), row.get('signal') or '—', row['exe'])
+        if include_status:
+            return (values[0], values[1], self.get_rule_status_display(row.get('exe', '')), *values[2:])
+        return values
 
     def connection_tag(self, row, index=0):
         remote = row.get('dst_ip', '')
@@ -2402,21 +2719,43 @@ class FirewallMonitorApp:
         now = time.monotonic()
         if now - self.cache_time < 2:
             return
-        self.cache_time = now
-        cache = {}
+        socket_cache = {}
+        listener_cache = {}
         try:
             for conn in psutil.net_connections(kind='inet'):
-                if conn.laddr and conn.pid:
-                    cache[conn.laddr.port] = conn.pid
+                if not conn.laddr or not conn.pid:
+                    continue
+                family = getattr(conn, 'family', None)
+                family_key = int(family.value) if hasattr(family, 'value') else str(family)
+                conn_type = int(getattr(conn, 'type', 0))
+                proto = 'TCP' if conn_type == int(socket.SOCK_STREAM) else 'UDP' if conn_type == int(socket.SOCK_DGRAM) else str(conn_type)
+                local_ip = normalize_target(getattr(conn.laddr, 'ip', conn.laddr[0]))
+                local_port = int(getattr(conn.laddr, 'port', conn.laddr[1]))
+                remote = getattr(conn, 'raddr', None)
+                if remote:
+                    remote_ip = normalize_target(getattr(remote, 'ip', remote[0]))
+                    remote_port = int(getattr(remote, 'port', remote[1]))
+                    socket_cache[(family_key, proto, local_ip, local_port, remote_ip, remote_port)] = conn.pid
+                listener_cache[(family_key, proto, local_ip, local_port)] = conn.pid
+            self.socket_process_cache = socket_cache
+            self.listener_process_cache = listener_cache
+            self.cache_time = now
         except (psutil.AccessDenied, OSError):
             return
         except Exception:
             return
-        self.port_process_cache = cache
 
-    def get_process_info(self, port):
+    def get_process_info(self, local_ip, local_port, remote_ip, remote_port, proto, family_key):
         self.refresh_process_cache()
-        pid = self.port_process_cache.get(port)
+        local_ip_n = normalize_target(local_ip)
+        remote_ip_n = normalize_target(remote_ip)
+        pid = self.socket_process_cache.get((family_key, proto, local_ip_n, int(local_port), remote_ip_n, int(remote_port)))
+        if pid is None:
+            pid = self.listener_process_cache.get((family_key, proto, local_ip_n, int(local_port)))
+        if pid is None:
+            wildcard = '0.0.0.0' if family_key in (2, '2') else '::' if family_key in (23, '23') else None
+            if wildcard:
+                pid = self.listener_process_cache.get((family_key, proto, wildcard, int(local_port)))
         if not pid:
             return (None, None, None)
         try:
@@ -2487,6 +2826,20 @@ class FirewallMonitorApp:
             self.dns_pending.discard(ip)
         self.ui_queue.put(('dns', ip))
 
+    def _prune_traffic_state_locked(self):
+        self.last_traffic_prune = time.monotonic()
+        if len(self.ip_traffic) > TRAFFIC_MAX_IP_ENTRIES:
+            excess = len(self.ip_traffic) - TRAFFIC_MAX_IP_ENTRIES
+            for key, _ in sorted(self.ip_traffic_last_seen.items(), key=lambda item: item[1])[:excess]:
+                self.ip_traffic.pop(key, None)
+                self.ip_traffic_last_seen.pop(key, None)
+        if len(self.proc_ip_upload) > TRAFFIC_MAX_PROC_IP_ENTRIES:
+            excess = len(self.proc_ip_upload) - TRAFFIC_MAX_PROC_IP_ENTRIES
+            for key, _ in sorted(self.proc_ip_upload_last_seen.items(), key=lambda item: item[1])[:excess]:
+                self.proc_ip_upload.pop(key, None)
+                self.proc_ip_upload_last_seen.pop(key, None)
+                self.upload_alerted.discard(key)
+
     @staticmethod
     def port_watch_signal(local_port, remote_port):
         parts = []
@@ -2507,11 +2860,16 @@ class FirewallMonitorApp:
             rate_threshold = self.rate_threshold
             rate_window = self.rate_window
             upload_threshold = self.upload_threshold_mb
-        if IP not in packet:
-            return
         try:
             packet_size = max(0, len(packet))
-            src, dst = (packet[IP].src, packet[IP].dst)
+            if IP in packet:
+                family_key = 2
+                src, dst = (packet[IP].src, packet[IP].dst)
+            elif IPv6 in packet:
+                family_key = 23
+                src, dst = (packet[IPv6].src, packet[IPv6].dst)
+            else:
+                return
             if TCP in packet:
                 proto = 'TCP'
                 sport, dport = (int(packet[TCP].sport), int(packet[TCP].dport))
@@ -2522,12 +2880,15 @@ class FirewallMonitorApp:
                 return
             if not sport:
                 return
-            proc_name, exe, pid = self.get_process_info(sport)
-            direction = 'Outgoing'
-            if not proc_name:
-                proc_name, exe, pid = self.get_process_info(dport)
+            outgoing = self.get_process_info(src, sport, dst, dport, proto, family_key)
+            incoming = self.get_process_info(dst, dport, src, sport, proto, family_key)
+            if outgoing[0] and outgoing[1]:
+                proc_name, exe, pid = outgoing
+                direction = 'Outgoing'
+            elif incoming[0] and incoming[1]:
+                proc_name, exe, pid = incoming
                 direction = 'Incoming'
-            if not proc_name or not exe:
+            else:
                 return
             local_port, remote_ip, remote_port = (sport, dst, dport) if direction == 'Outgoing' else (dport, src, sport)
             key = f'{pid}-{proto}-{local_port}-{remote_ip}-{remote_port}'
@@ -2564,6 +2925,10 @@ class FirewallMonitorApp:
                     upload_key = (norm_exe, norm_ip)
                     upload_total = self.proc_ip_upload.get(upload_key, 0) + packet_size
                     self.proc_ip_upload[upload_key] = upload_total
+                    self.proc_ip_upload_last_seen[upload_key] = now
+                self.ip_traffic_last_seen[norm_ip] = now
+                if now - self.last_traffic_prune >= TRAFFIC_PRUNE_INTERVAL:
+                    self._prune_traffic_state_locked()
                 rate_hit = False
                 if is_new and log_alerts:
                     rate_key = (norm_exe, norm_ip)
@@ -2585,8 +2950,8 @@ class FirewallMonitorApp:
                     self.handle_threshold(proc_name, exe, pid, remote_ip, domain, direction, key, 'upload', mb(upload_total))
             if rate_hit:
                 self.handle_threshold(proc_name, exe, pid, remote_ip, domain, direction, key, 'connection', '')
-        except Exception:
-            pass
+        except Exception as exc:
+            log_internal_error('packet_handler', exc)
 
     def handle_threshold(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail):
         app_rule_exists = self.application_has_rule(exe)
@@ -2621,11 +2986,11 @@ class FirewallMonitorApp:
                 time.sleep(0.25)
                 continue
             try:
-                sniff(filter='ip', prn=self.packet_handler, store=False, timeout=1)
+                sniff(filter='ip or ip6', prn=self.packet_handler, store=False, timeout=1)
             except Exception:
                 time.sleep(1)
 
-    def install_auto_hold(self, proc_name, exe):
+    def install_auto_hold(self, proc_name, exe, remote_ip='', domain='', prompt_generation=None):
         norm = normalize_path(exe)
         if not norm:
             return False
@@ -2634,40 +2999,80 @@ class FirewallMonitorApp:
                 with self.lock:
                     if not self.log_alerts_only or not self.auto_block_enabled or self.is_paused or self.closed:
                         return False
+                    if prompt_generation is not None and prompt_generation != self.auto_prompt_generation:
+                        return False
+                    if self._global_match(self.global_blocks, remote_ip, domain) or self._global_match(self.global_allows, remote_ip, domain):
+                        return False
                 records = self.get_firewall_rules()
+                if any((not r['is_global']) and (not r['is_hold']) and r['normalized_path'] == norm for r in records):
+                    return False
                 self.delete_rule_names((r['name'] for r in records if r['is_hold'] and r['normalized_path'] == norm))
                 self.add_app_rules(proc_name, exe, 'both', kind='AutoHold')
             return True
         except Exception:
             return False
 
+    def _invalidate_auto_prompts(self, close_dialog=False):
+        dialog = None
+        with self.lock:
+            self.auto_prompt_generation += 1
+            self.auto_prompt_keys.clear()
+            if close_dialog:
+                dialog = self.auto_prompt_dialog
+                self.auto_prompt_dialog = None
+                self.auto_prompt_key = None
+                self.auto_prompt_active = False
+        while True:
+            try:
+                self.prompt_queue.get_nowait()
+            except queue.Empty:
+                break
+        if close_dialog and dialog is not None:
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
     def start_auto_block(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail):
         prompt_key = normalize_path(exe) or key
         with self.lock:
+            if not self.log_alerts_only or not self.auto_block_enabled or self.is_paused or self.closed:
+                return
             if prompt_key in self.auto_prompt_keys:
                 return
+            generation = self.auto_prompt_generation
             self.auto_prompt_keys.add(prompt_key)
-        if not self.install_auto_hold(proc_name, exe):
+        if not self.install_auto_hold(proc_name, exe, remote_ip, domain, generation):
+            with self.lock:
+                current = generation == self.auto_prompt_generation
+                self.auto_prompt_keys.discard(prompt_key)
+                active_now = self.log_alerts_only and self.auto_block_enabled and (not self.is_paused) and (not self.closed)
+            if current and active_now and (not self.application_has_rule(exe)) and (not self.is_globally_blocked(remote_ip, domain)) and (not self.is_globally_allowed(remote_ip, domain)):
+                self.queue_alert('High', proc_name, pid, remote_ip, 'Threshold reached, but the temporary Auto-Block hold could not be installed.')
+            return
+        with self.lock:
+            if generation != self.auto_prompt_generation or self.closed or self.is_paused or not self.log_alerts_only or not self.auto_block_enabled:
+                stale = True
+            else:
+                stale = False
+        if stale:
+            try:
+                with self.firewall_lock:
+                    self.remove_auto_holds_locked(normalize_path(exe))
+            except Exception:
+                pass
             with self.lock:
                 self.auto_prompt_keys.discard(prompt_key)
-            self.queue_alert('High', proc_name, pid, remote_ip, 'Threshold reached, but the temporary Auto-Block hold could not be installed.')
             return
-        self.prompt_queue.put((prompt_key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail))
+        self.prompt_queue.put((generation, prompt_key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail))
 
     def release_auto_holds(self):
+        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 self.remove_auto_holds_locked()
         except Exception:
             pass
-        finally:
-            with self.lock:
-                self.auto_prompt_keys.clear()
-            while True:
-                try:
-                    self.prompt_queue.get_nowait()
-                except queue.Empty:
-                    break
 
     def queue_alert(self, severity, process, pid, remote, reason):
         self.alert_queue.put((time.time(), severity, process, pid, remote, '', reason))
@@ -2707,6 +3112,54 @@ class FirewallMonitorApp:
     def selected_rows(self, tree):
         return [(iid, tree.item(iid, 'values')) for iid in tree.selection() if tree.item(iid, 'values')]
 
+    def open_file_location_from_tree(self, tree, iid):
+        if not iid or not tree.exists(iid):
+            return
+        values = tree.item(iid, 'values')
+        path = ''
+        if tree is self.tree or tree is self.active_tree:
+            with self.lock:
+                row = self.active_connections.get(iid)
+            if row:
+                path = row.get('exe', '')
+            else:
+                columns = tuple(tree['columns'])
+                mapping = dict(zip(columns, values))
+                path = mapping.get('Exe Path', '')
+        elif tree is self.rules_tree:
+            columns = tuple(tree['columns'])
+            mapping = dict(zip(columns, values))
+            status = str(mapping.get('Status', '')).casefold()
+            if status not in {'global block', 'global allow'}:
+                path = mapping.get('Program Path', '')
+        elif tree is self.alerts_tree:
+            row, _ = self.alert_context(values)
+            path = (row or {}).get('exe', '')
+            if not path:
+                pid_value = values[3] if len(values) > 3 else ''
+                if str(pid_value).isdigit():
+                    try:
+                        path = psutil.Process(int(pid_value)).exe()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                        path = ''
+        self.open_file_location(path)
+
+    def open_file_location(self, exe_path):
+        path = display_path(exe_path)
+        if not path:
+            messagebox.showinfo('Open File Location', 'The executable path for this process is not available.')
+            return
+        if not os.path.isfile(path):
+            messagebox.showinfo('Open File Location', f'The executable could not be found:\n\n{path}')
+            return
+        try:
+            result = ctypes.windll.shell32.ShellExecuteW(None, 'open', 'explorer.exe', f'/select,"{path}"', None, 1)
+            if result <= 32:
+                raise OSError(f'ShellExecuteW returned {result}')
+        except Exception as exc:
+            log_internal_error('Open File Location', exc)
+            messagebox.showerror('Open File Location', f'Could not open File Explorer for:\n\n{path}\n\n{exc}')
+
     def _focus_menu_row(self, tree, event):
         iid = tree.identify_row(event.y)
         if not iid:
@@ -2722,7 +3175,8 @@ class FirewallMonitorApp:
         return iid
 
     def show_connection_menu(self, event, tree):
-        if not self._focus_menu_row(tree, event):
+        iid = self._focus_menu_row(tree, event)
+        if not iid:
             return
         menu = self._context_menu()
         actions = (('Allow Process', lambda: self.allow_process(tree), 'allowed'), ('Block Process (In & Out)', lambda: self.block_process(tree, 'both'), 'blocked'), ('Block Incoming Only', lambda: self.block_process(tree, 'in'), 'blocked_in'), ('Allow IP (Global)', lambda: self.bulk_global(tree, True, domain=False), 'global_allow'), ('Block IP (Global)', lambda: self.bulk_global(tree, False, domain=False), 'global_block'), ('Allow Domain (Global)', lambda: self.bulk_global(tree, True, domain=True), 'global_allow'), ('Block Domain (Global)', lambda: self.bulk_global(tree, False, domain=True), 'global_block'))
@@ -2732,6 +3186,7 @@ class FirewallMonitorApp:
         for label, command, tag in actions[3:]:
             self._menu_rule_command(menu, label, command, tag)
         menu.add_separator()
+        menu.add_command(label='Open File Location', command=lambda iid=iid: self.open_file_location_from_tree(tree, iid))
         menu.add_command(label='Connection Details', command=lambda: self.show_connection_details(tree))
         menu.add_command(label='Copy Row', command=lambda: self.copy_rows(tree))
         menu.add_command(label='Remove App Rule', command=lambda: self.remove_selected_connection_rules(tree))
@@ -2747,6 +3202,8 @@ class FirewallMonitorApp:
         actions = (('Allow Global', lambda: self.bulk_rule_global(True), 'global_allow'), ('Block Global', lambda: self.bulk_rule_global(False), 'global_block')) if status in {'global block', 'global allow'} else (('Allow Process', self.rules_menu_allow, 'allowed'), ('Block Process', lambda: self.rules_menu_block('both'), 'blocked'), ('Block Incoming', lambda: self.rules_menu_block('in'), 'blocked_in'))
         for label, command, tag in actions:
             self._menu_rule_command(menu, label, command, tag)
+        if status not in {'global block', 'global allow'}:
+            menu.add_command(label='Open File Location', command=lambda iid=iid: self.open_file_location_from_tree(self.rules_tree, iid))
         menu.add_command(label='Rule Details', command=lambda: self.show_rule_details(self.rules_tree))
         menu.add_command(label='Copy Row', command=lambda: self.copy_rows(self.rules_tree))
         menu.add_command(label='Remove Rule', command=self.remove_selected_rule)
@@ -2764,6 +3221,7 @@ class FirewallMonitorApp:
         actions = (('Allow IP (Global)', lambda: self.alert_action(True, True), 'global_allow'), ('Block IP (Global)', lambda: self.alert_action(False, True), 'global_block'), ('Allow Domain (Global)', lambda: self.alert_global_domain(True), 'global_allow'), ('Block Domain (Global)', lambda: self.alert_global_domain(False), 'global_block'))
         for label, command, tag in actions:
             self._menu_rule_command(menu, label, command, tag)
+        menu.add_command(label='Open File Location', command=lambda iid=iid: self.open_file_location_from_tree(self.alerts_tree, iid))
         menu.add_command(label='Alert Details', command=lambda iid=iid: self.alert_details(iid))
         menu.add_command(label='Copy Row', command=lambda: self.copy_rows(self.alerts_tree))
         menu.add_command(label='Remove App Rule', command=self.remove_selected_alert_rules)
@@ -2812,8 +3270,11 @@ class FirewallMonitorApp:
                 row = self.active_connections.get(iid)
                 if row:
                     result.append(dict(row))
-                elif len(values) >= 13:
-                    result.append({'key': iid, 'number': values[0], 'name': values[1], 'pid': int(values[2]) if str(values[2]).isdigit() else 0, 'direction': values[3], 'protocol': values[4], 'lport': values[5], 'dst_ip': values[6], 'domain': '' if values[7] == '—' else values[7], 'dport': values[8], 'signal': '' if values[11] == '—' else values[11], 'exe': values[12]})
+                elif values:
+                    columns = tuple(tree['columns'])
+                    mapping = dict(zip(columns, values))
+                    pid_value = mapping.get('PID', 0)
+                    result.append({'key': iid, 'number': mapping.get('#', 0), 'name': mapping.get('Process Name', 'Process'), 'pid': int(pid_value) if str(pid_value).isdigit() else 0, 'direction': mapping.get('Direction', 'Both'), 'protocol': mapping.get('Protocol', ''), 'lport': mapping.get('Local Port', ''), 'dst_ip': mapping.get('Remote IP', ''), 'domain': '' if mapping.get('Remote Host', '—') == '—' else mapping.get('Remote Host', ''), 'dport': mapping.get('Remote Port', ''), 'signal': '' if mapping.get('Signal', '—') == '—' else mapping.get('Signal', ''), 'exe': mapping.get('Exe Path', '')})
         return result
 
     def block_process(self, tree=None, direction=None):
@@ -3201,31 +3662,39 @@ class FirewallMonitorApp:
                     self.rules_tree.insert('', tk.END, values=('Error', 'Firewall rule refresh failed', '', '', '', error), tags=('blocked',))
 
     def drain_prompt_queue(self):
-        if self.auto_prompt_active:
-            return
+        with self.lock:
+            if self.auto_prompt_active:
+                return
         try:
             item = self.prompt_queue.get_nowait()
         except queue.Empty:
             return
-        key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail = item
+        generation, key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail = item
+        with self.lock:
+            current_generation = generation == self.auto_prompt_generation
         active = self._auto_block_active()
         has_app_rule = self.application_has_rule(exe)
         has_global_rule = self.is_globally_blocked(remote_ip, domain) or self.is_globally_allowed(remote_ip, domain)
-        if not active or has_app_rule or has_global_rule:
+        if not current_generation or not active or has_app_rule or has_global_rule:
             with self.firewall_lock:
                 self.remove_auto_holds_locked(None if not active else normalize_path(exe))
             with self.lock:
                 self.auto_prompt_keys.discard(key)
             return
-        self.auto_prompt_active = True
-        self.show_auto_prompt(key, proc_name, exe, pid, remote_ip, reason, detail)
+        with self.lock:
+            self.auto_prompt_active = True
+            self.auto_prompt_key = key
+        self.show_auto_prompt(generation, key, proc_name, exe, pid, remote_ip, reason, detail)
 
     def _auto_block_active(self):
         with self.lock:
             return self.log_alerts_only and self.auto_block_enabled and (not self.is_paused) and (not self.closed)
 
-    def show_auto_prompt(self, key, proc_name, exe, pid, remote_ip, reason, detail):
+    def show_auto_prompt(self, generation, key, proc_name, exe, pid, remote_ip, reason, detail):
         dialog = tk.Toplevel(self.root)
+        with self.lock:
+            self.auto_prompt_dialog = dialog
+            self.auto_prompt_key = key
         dialog.title('Auto-Block Protection')
         dialog.resizable(False, False)
         dialog.withdraw()
@@ -3238,23 +3707,37 @@ class FirewallMonitorApp:
         buttons.pack(fill=tk.X, padx=16, pady=(0, 14))
         buttons.grid_columnconfigure((0, 1, 2), weight=1)
 
+        finished = False
+
         def finish(choice):
+            nonlocal finished
+            if finished:
+                return
+            finished = True
+            with self.lock:
+                current = generation == self.auto_prompt_generation and (not self.closed)
             try:
                 dialog.destroy()
             except tk.TclError:
                 pass
             try:
-                if choice == 'allow':
-                    self.allow_executable(exe, refresh=False, quiet=True)
-                elif choice == 'in':
-                    self.block_executable(exe, proc_name, 'in', refresh=False, quiet=True)
-                else:
-                    self.block_executable(exe, proc_name, 'both', refresh=False, quiet=True)
+                if current:
+                    if choice == 'allow':
+                        self.allow_executable(exe, refresh=False, quiet=True)
+                    elif choice == 'in':
+                        self.block_executable(exe, proc_name, 'in', refresh=False, quiet=True)
+                    else:
+                        self.block_executable(exe, proc_name, 'both', refresh=False, quiet=True)
             finally:
                 with self.lock:
                     self.auto_prompt_keys.discard(key)
-                self.auto_prompt_active = False
-                self.rules_changed()
+                    if self.auto_prompt_dialog is dialog:
+                        self.auto_prompt_dialog = None
+                    if self.auto_prompt_key == key:
+                        self.auto_prompt_key = None
+                    self.auto_prompt_active = False
+                if current:
+                    self.rules_changed()
         action_specs = (('Block In & Out', 'both', '#f44336', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
         for column, (label, choice, bg, tip) in enumerate(action_specs):
             button = tk.Button(buttons, text=label, command=lambda value=choice: finish(value), bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
@@ -3341,8 +3824,8 @@ class FirewallMonitorApp:
                 self.render_rule_traffic()
                 self.render_rules()
             self.update_status()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_internal_error('update_loop', exc)
         finally:
             if not self.closed:
                 self.root.after(500, self.update_loop)
@@ -3396,8 +3879,15 @@ class FirewallMonitorApp:
             self.closed = True
             self.sniffing = False
         try:
-            if self.startup_complete:
-                self.release_auto_holds()
+            self.release_auto_holds()
+        except Exception:
+            pass
+        try:
+            with self.firewall_lock:
+                with self.lock:
+                    profile_modified = self.firewall_profile_modified
+                if profile_modified:
+                    self._restore_firewall_profile_state_locked()
         except Exception:
             pass
         try:
