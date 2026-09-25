@@ -1838,7 +1838,6 @@ class FirewallMonitorApp:
         return self._run(('netsh', 'advfirewall', 'firewall', *args), check)
 
     def delete_rule_names(self, names, strict=True):
-        # Query first: deleting an already absent rule is a successful no-op.
         names = set(n for n in names if n)
         if not names:
             return False
@@ -1847,7 +1846,6 @@ class FirewallMonitorApp:
             try:
                 self.run_netsh(['delete', 'rule', f'name={name}'])
             except (subprocess.SubprocessError, OSError):
-                # A timeout can happen after deletion; the following query is authoritative.
                 pass
         remaining = names & {r['name'] for r in self.get_firewall_rules()}
         if remaining:
@@ -2137,7 +2135,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 with self.lock:
                     if self.closed:
                         return False, 'Application is closing.'
-                # A surviving backup is a recovery journal from an interrupted session.
                 if os.path.exists(FIREWALL_PROFILE_BACKUP_FILE):
                     self._restore_firewall_profile_state_locked()
                 self._backup_firewall_profile_state()
@@ -2197,7 +2194,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         if {p[0] for p in validated} != {'Domain', 'Private', 'Public'} or len(validated) != 3:
             raise ValueError('Backup must contain each firewall profile exactly once.')
         for name, enabled, inbound, outbound in validated:
-            # NetSecurity expects GpoBoolean enum names, not PowerShell Boolean values.
             self.run_ps(f"Set-NetFirewallProfile -Name {self._ps_quote(name)} "
                         f"-Enabled {'True' if enabled else 'False'} "
                         f"-DefaultInboundAction {inbound} -DefaultOutboundAction {outbound} -ErrorAction Stop")
@@ -2315,7 +2311,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                         return True
                 except ValueError:
                     continue
-        # Reverse DNS is a display hint, not proof of a domain's allowed addresses.
         return False
 
     def is_globally_blocked(self, remote_ip, domain=''):
@@ -2787,7 +2782,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             self.listener_process_cache = listener_cache
             self.cache_time = now
         except (psutil.Error, OSError) as exc:
-            # Never attribute traffic using a stale ownership snapshot after a failed refresh.
             self.socket_process_cache = {}
             self.listener_process_cache = {}
             log_internal_error('refresh_process_cache', exc)
@@ -2931,7 +2925,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             outgoing = self.get_process_info(src, sport, dst, dport, proto, family_key)
             incoming = self.get_process_info(dst, dport, src, sport, proto, family_key)
             if outgoing[0] and incoming[0]:
-                # Loopback/shared endpoint ownership is ambiguous for auto-blocking.
                 return
             if outgoing[0] and outgoing[1]:
                 proc_name, exe, pid = outgoing
@@ -3126,7 +3119,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 pass
 
     def start_auto_block(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail):
-        # Hold installation, generation validation, and prompt publication are one operation.
         with self.firewall_lock:
             self._start_auto_block_locked(proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail)
 
