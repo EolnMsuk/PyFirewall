@@ -52,12 +52,22 @@ if os.name != 'nt':
     raise SystemExit('This application requires Windows.')
 _MUTEX_HANDLE = None
 
+def error_details(exc):
+    details = [str(exc)]
+    for field in ('stderr', 'stdout'):
+        output = getattr(exc, field, None)
+        if isinstance(output, bytes):
+            output = output.decode('utf-8', errors='replace')
+        if output and str(output).strip():
+            details.append(f'{field}: {str(output).strip()}')
+    return '\n'.join(details)
+
 def log_internal_error(context, exc):
     try:
         with INTERNAL_ERROR_LOG_LOCK:
             with open(INTERNAL_ERROR_LOG_FILE, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {type(exc).__name__}: {exc}\n")
-                traceback.print_exc(file=f)
+                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {type(exc).__name__}: {error_details(exc)}\n")
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
                 f.write('\n')
     except Exception:
         pass
@@ -118,7 +128,11 @@ def display_path(path):
     return os.path.normpath(str(path).replace('/', '\\')) if path else ''
 
 def normalize_target(target):
-    return str(target or '').strip().strip('[]').casefold().rstrip('.')
+    value = str(target or '').strip().strip('[]').casefold().rstrip('.')
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return value
 
 def is_ip(target):
     try:
@@ -522,6 +536,9 @@ class FirewallMonitorApp:
         self.socket_process_cache = {}
         self.listener_process_cache = {}
         self.cache_time = 0.0
+        self.local_addresses = set()
+        self.capture_error = None
+        self.capture_healthy = False
         self.filter_all_enabled = True
         self.filter_all_saved_alerts = None
         self.filter_all_saved_auto_block = None
@@ -1596,7 +1613,10 @@ class FirewallMonitorApp:
         self.update_auto_block_controls()
         self.update_filter_ui()
         if paused:
-            self.release_auto_holds()
+            try:
+                self.release_auto_holds()
+            except Exception as exc:
+                messagebox.showerror('Temporary Block Cleanup Failed', str(exc), parent=self.root)
         else:
             self.render_all()
         self.update_status()
@@ -1635,7 +1655,8 @@ class FirewallMonitorApp:
                 if still_current:
                     self._invalidate_auto_prompts(close_dialog=False)
                 return still_current
-        except Exception:
+        except Exception as exc:
+            self.queue_alert('High', 'Temporary blocks', '', '', f'Could not release temporary blocks: {exc}')
             return False
 
     def _settings_change_worker(self):
@@ -1737,7 +1758,6 @@ class FirewallMonitorApp:
     def reset_to_defaults(self):
         if not messagebox.askyesno('Reset to Defaults', 'Remove all PyFirewall_* firewall rules and reset application settings?\n\nOther Windows Firewall rules will not be changed.', icon='warning'):
             return
-        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 with self.settings_change_lock:
@@ -1745,7 +1765,8 @@ class FirewallMonitorApp:
                     self.settings_change_pending = False
                     self.settings_change_release_holds = False
                 records = self.get_firewall_rules()
-                self.delete_rule_names((r['name'] for r in records))
+                self._replace_rule_records(records, (), lambda: None)
+                self._invalidate_auto_prompts(close_dialog=True)
             with self.lock:
                 self.filter_all_enabled = True
                 self.is_paused = False
@@ -1816,19 +1837,47 @@ class FirewallMonitorApp:
     def run_netsh(self, args, check=True):
         return self._run(('netsh', 'advfirewall', 'firewall', *args), check)
 
-    def delete_rule_names(self, names, strict=False):
-        deleted = False
-        failures = []
-        for name in dict.fromkeys((n for n in names if n)):
+    def delete_rule_names(self, names, strict=True):
+        # Query first: deleting an already absent rule is a successful no-op.
+        names = set(n for n in names if n)
+        if not names:
+            return False
+        existing = {r['name'] for r in self.get_firewall_rules()}
+        for name in names & existing:
             try:
                 self.run_netsh(['delete', 'rule', f'name={name}'])
-                deleted = True
-            except (subprocess.CalledProcessError, OSError) as exc:
-                failures.append((name, exc))
-        if strict and failures:
-            details = '; '.join(f"{name}: {str(exc)}" for name, exc in failures)
-            raise RuntimeError(f'Failed to delete Windows Firewall rule(s): {details}')
-        return deleted
+            except (subprocess.SubprocessError, OSError):
+                # A timeout can happen after deletion; the following query is authoritative.
+                pass
+        remaining = names & {r['name'] for r in self.get_firewall_rules()}
+        if remaining:
+            raise RuntimeError('Firewall rules could not be removed: ' + ', '.join(sorted(remaining)))
+        return bool(names & existing)
+
+    def _replace_rule_records(self, previous, desired_names, apply):
+        names = {r['name'] for r in previous} | set(desired_names)
+        try:
+            self.delete_rule_names(r['name'] for r in previous)
+            apply()
+        except Exception as error:
+            cleanup_error = None
+            try:
+                self.delete_rule_names(names)
+            except Exception as exc:
+                cleanup_error = exc
+            try:
+                remaining = {r['name'] for r in self.get_firewall_rules()}
+                self._restore_app_rule_records([r for r in previous if r['name'] not in remaining])
+                if cleanup_error:
+                    raise cleanup_error
+            except Exception as rollback_error:
+                try:
+                    self.sync_rule_cache()
+                    self.save_settings()
+                except Exception as reconcile_error:
+                    log_internal_error('rule_reconciliation', reconcile_error)
+                raise RuntimeError(f'Rule update failed: {error}; rollback failed: {rollback_error}') from rollback_error
+            raise
 
     def get_firewall_rules(self):
         command = '''
@@ -1842,6 +1891,7 @@ $rules = Get-NetFirewallRule -ErrorAction Stop |
       DisplayName=[string]$r.DisplayName
       Action=[string]$r.Action
       Direction=[string]$r.Direction
+      Addresses=@((Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $r -ErrorAction Stop).RemoteAddress)
       Program=if($null -ne $a){[string]$a.Program}else{""}
     }
   }
@@ -1868,7 +1918,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 raise RuntimeError('Windows Firewall returned incomplete rule metadata.')
             name = str(item.get('DisplayName', '') or '')
             global_rule = name.startswith((GLOBAL_BLOCK_PREFIX, GLOBAL_ALLOW_PREFIX))
-            records.append({'name': name, 'action': str(item.get('Action', '') or ''), 'direction': str(item.get('Direction', '') or ''), 'path': '' if global_rule else display_path(item.get('Program', '')), 'normalized_path': '' if global_rule else normalize_path(item.get('Program', '')), 'is_global': global_rule, 'is_hold': name.startswith(AUTO_HOLD_PREFIX)})
+            records.append({'name': name, 'action': str(item.get('Action', '') or ''), 'direction': str(item.get('Direction', '') or ''), 'path': '' if global_rule else display_path(item.get('Program', '')), 'normalized_path': '' if global_rule else normalize_path(item.get('Program', '')), 'is_global': global_rule, 'is_hold': name.startswith(AUTO_HOLD_PREFIX), 'addresses': item.get('Addresses', [])})
         return records
 
     def app_rule_base(self, proc_name, exe_path, kind='Block'):
@@ -1979,8 +2029,20 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             for record in records:
                 path = display_path(record.get('path', ''))
                 name = str(record.get('name', '') or '').strip()
-                if not path or not name or record.get('is_global') or record.get('is_hold'):
+                if not name:
                     continue
+                if record.get('is_global'):
+                    addresses = record.get('addresses', [])
+                    if isinstance(addresses, str):
+                        addresses = [addresses]
+                    side = 'in' if direction_name(record['direction']) == 'Inbound' else 'out'
+                    self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}',
+                                    'action=' + record['action'].lower(),
+                                    'remoteip=' + ','.join(addresses), 'enable=yes'])
+                    created.append(name)
+                    continue
+                if not path:
+                    raise ValueError(f'Missing program for rule {name}')
                 action = 'Allow' if str(record.get('action', '')).casefold() == 'allow' else 'Block'
                 suffixes = {'in': 'In', 'out': 'Out'}
                 for side in direction_set(record.get('direction', 'Both')):
@@ -2012,10 +2074,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def add_global_rule_sync(self, target, allow):
         target = normalize_target(target)
         try:
-            if '/' in target:
-                target = str(ipaddress.ip_network(target, strict=False))
-            else:
-                target = str(ipaddress.ip_address(target))
+            target = str(ipaddress.ip_network(target, strict=False)) if '/' in target else str(ipaddress.ip_address(target))
         except ValueError:
             pass
         addresses = self.resolve_global_target(target)
@@ -2023,53 +2082,24 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             raise ValueError('Enter a valid IP address or a domain that resolves to at least one IP address.')
         base = self.global_rule_base(target, allow)
         other = self.global_rule_base(target, not allow)
-        previous_allow = None
-        previous_addresses = ()
-        with self.lock:
-            current = self.global_allows if allow else self.global_blocks
-            other_store = self.global_blocks if allow else self.global_allows
-            if target in current:
-                previous_allow = allow
-                previous_addresses = tuple(current[target].get('addresses', ()))
-            elif target in other_store:
-                previous_allow = not allow
-                previous_addresses = tuple(other_store[target].get('addresses', ()))
-        old_names = (f'{base}_In', f'{base}_Out', f'{other}_In', f'{other}_Out')
-        self.delete_rule_names(old_names, strict=True)
-        action = 'allow' if allow else 'block'
-        remote_ips = ','.join(addresses)
-        created = []
-        try:
+        names = {f'{prefix}_{side}' for prefix in (base, other) for side in ('In', 'Out')}
+        previous = [r for r in self.get_firewall_rules() if r['name'] in names]
+        def create():
             for side in ('in', 'out'):
                 name = f'{base}_{side.title()}'
-                self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}', f'action={action}', f'remoteip={remote_ips}', 'enable=yes'])
-                created.append(name)
-        except Exception as exc:
-            try:
-                self.delete_rule_names(created)
-            except Exception:
-                pass
-            if previous_allow is not None and previous_addresses:
-                restore_base = self.global_rule_base(target, previous_allow)
-                restore_action = 'allow' if previous_allow else 'block'
-                restore_ips = ','.join(previous_addresses)
-                restored = []
-                try:
-                    for side in ('in', 'out'):
-                        name = f'{restore_base}_{side.title()}'
-                        self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}', f'action={restore_action}', f'remoteip={restore_ips}', 'enable=yes'])
-                        restored.append(name)
-                except Exception as restore_exc:
-                    try:
-                        self.delete_rule_names(restored)
-                    except Exception:
-                        pass
-                    raise RuntimeError(f'Global rule update failed and rollback also failed: {restore_exc}') from restore_exc
-            raise exc
-        return (target, addresses)
+                self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}',
+                                'action=' + ('allow' if allow else 'block'),
+                                'remoteip=' + ','.join(addresses), 'enable=yes'])
+            records = {r['name']: r for r in self.get_firewall_rules()}
+            for side, direction in (('In', 'Inbound'), ('Out', 'Outbound')):
+                record = records.get(f'{base}_{side}')
+                if not record or record['action'].casefold() != ('allow' if allow else 'block') or direction_name(record['direction']) != direction:
+                    raise RuntimeError(f'Global firewall rule verification failed: {base}_{side}')
+        self._replace_rule_records(previous, names, create)
+        return target, addresses
 
     def _read_firewall_profile_state(self):
-        command = "Get-NetFirewallProfile -ErrorAction Stop | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction | ConvertTo-Json -Compress"
+        command = "Get-NetFirewallProfile -ErrorAction Stop | Select-Object Name,@{n='Enabled';e={[string]$_.Enabled}},@{n='DefaultInboundAction';e={[string]$_.DefaultInboundAction}},@{n='DefaultOutboundAction';e={[string]$_.DefaultOutboundAction}} | ConvertTo-Json -Compress"
         output = self.run_ps(command).stdout.strip() or '[]'
         raw = json.loads(output)
         if isinstance(raw, dict):
@@ -2081,9 +2111,9 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 continue
             profiles.append({
                 'name': name,
-                'enabled': bool(item.get('Enabled', False)),
-                'default_inbound_action': str(item.get('DefaultInboundAction', '') or ''),
-                'default_outbound_action': str(item.get('DefaultOutboundAction', '') or ''),
+                'enabled': self._profile_enabled(item.get('Enabled', False)),
+                'default_inbound_action': self._profile_action(item.get('DefaultInboundAction')), 
+                'default_outbound_action': self._profile_action(item.get('DefaultOutboundAction')), 
             })
         if not profiles:
             raise ValueError('No Windows Firewall profiles were returned.')
@@ -2104,24 +2134,50 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def initialize_or_restore_firewall(self):
         try:
             with self.firewall_lock:
-                if not self.firewall_initialized:
-                    self._backup_firewall_profile_state()
-                    with self.lock:
-                        self.firewall_profile_modified = True
+                with self.lock:
+                    if self.closed:
+                        return False, 'Application is closing.'
+                # A surviving backup is a recovery journal from an interrupted session.
+                if os.path.exists(FIREWALL_PROFILE_BACKUP_FILE):
+                    self._restore_firewall_profile_state_locked()
+                self._backup_firewall_profile_state()
+                with self.lock:
+                    self.firewall_profile_modified = True
+                try:
+                    self.run_ps('Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {Set-NetFirewallProfile -Name $_.Name -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop}')
+                    self.restore_saved_rules_locked()
+                    self.remove_auto_holds_locked()
+                except Exception as setup_error:
+                    log_internal_error('firewall_setup', setup_error)
                     try:
-                        self.run_ps('Get-NetFirewallProfile -ErrorAction Stop | ForEach-Object {Set-NetFirewallProfile -Name $_.Name -Enabled True -DefaultInboundAction Allow -DefaultOutboundAction Allow -ErrorAction Stop}')
-                    except Exception:
-                        try:
-                            self._restore_firewall_profile_state_locked()
-                        finally:
-                            raise
-                    with self.lock:
-                        self.firewall_initialized = True
-                self.restore_saved_rules_locked()
-                self.remove_auto_holds_locked()
-            return (True, '')
+                        self._restore_firewall_profile_state_locked()
+                    except Exception as restore_error:
+                        raise RuntimeError(f'Firewall setup failed: {error_details(setup_error)}\n'
+                                           f'Profile restoration also failed: {error_details(restore_error)}') from restore_error
+                    raise
+                with self.lock:
+                    self.firewall_initialized = True
+            return True, ''
         except Exception as exc:
-            return (False, str(exc))
+            log_internal_error('initialize_or_restore_firewall', exc)
+            return False, error_details(exc)
+
+    @staticmethod
+    def _profile_action(value):
+        actions = {'0': 'NotConfigured', '2': 'Allow', '4': 'Block',
+                   'notconfigured': 'NotConfigured', 'allow': 'Allow', 'block': 'Block'}
+        result = actions.get(str(value).strip().casefold())
+        if result is None:
+            raise ValueError(f'Invalid firewall profile action: {value!r}')
+        return result
+
+    @staticmethod
+    def _profile_enabled(value):
+        if value is True or str(value).casefold() in {'true', '1'}:
+            return True
+        if value is False or str(value).casefold() in {'false', '0'}:
+            return False
+        raise ValueError(f'Invalid firewall enabled state: {value!r}')
 
     def _restore_firewall_profile_state_locked(self):
         if not os.path.exists(FIREWALL_PROFILE_BACKUP_FILE):
@@ -2131,27 +2187,24 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         profiles = backup.get('profiles') if isinstance(backup, dict) else None
         if not isinstance(profiles, list) or not profiles:
             raise ValueError('Firewall profile backup is missing or invalid.')
+        validated = []
         for profile in profiles:
-            if not isinstance(profile, dict):
-                continue
-            name = str(profile.get('name', '') or '').strip()
-            if not name:
-                continue
-            enabled = bool(profile.get('enabled', False))
-            inbound = str(profile.get('default_inbound_action', '') or '').strip()
-            outbound = str(profile.get('default_outbound_action', '') or '').strip()
-            if inbound not in {'Allow', 'Block', 'NotConfigured'} or outbound not in {'Allow', 'Block', 'NotConfigured'}:
-                raise ValueError(f"Invalid firewall profile actions for '{name}'.")
-            command = (
-                f"Set-NetFirewallProfile -Name {self._ps_quote(name)} "
-                f"-Enabled ${'true' if enabled else 'false'} "
-                f"-DefaultInboundAction {self._ps_quote(inbound)} "
-                f"-DefaultOutboundAction {self._ps_quote(outbound)} -ErrorAction Stop"
-            )
-            self.run_ps(command)
+            if not isinstance(profile, dict) or profile.get('name') not in {'Domain', 'Private', 'Public'}:
+                raise ValueError('Invalid firewall profile in backup.')
+            validated.append((profile['name'], self._profile_enabled(profile.get('enabled')),
+                              self._profile_action(profile.get('default_inbound_action')),
+                              self._profile_action(profile.get('default_outbound_action'))))
+        if {p[0] for p in validated} != {'Domain', 'Private', 'Public'} or len(validated) != 3:
+            raise ValueError('Backup must contain each firewall profile exactly once.')
+        for name, enabled, inbound, outbound in validated:
+            # NetSecurity expects GpoBoolean enum names, not PowerShell Boolean values.
+            self.run_ps(f"Set-NetFirewallProfile -Name {self._ps_quote(name)} "
+                        f"-Enabled {'True' if enabled else 'False'} "
+                        f"-DefaultInboundAction {inbound} -DefaultOutboundAction {outbound} -ErrorAction Stop")
         os.remove(FIREWALL_PROFILE_BACKUP_FILE)
         with self.lock:
             self.firewall_profile_modified = False
+            self.firewall_initialized = False
         return True
 
     def _start_background_initialization(self):
@@ -2169,13 +2222,24 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             self.status_state.config(text='● Starting', fg='#ff9800')
 
     def _background_initialization_worker(self):
-        ok, error = self.initialize_or_restore_firewall()
+        try:
+            ok, error = self.initialize_or_restore_firewall()
+        except Exception as exc:
+            log_internal_error('background_initialization', exc)
+            ok, error = False, error_details(exc)
         if ok:
             try:
                 self.sync_rule_cache()
             except Exception as exc:
+                log_internal_error('startup_rule_cache', exc)
                 ok = False
-                error = str(exc)
+                error = error_details(exc)
+                try:
+                    with self.firewall_lock:
+                        self._restore_firewall_profile_state_locked()
+                except Exception as restore_error:
+                    log_internal_error('startup_profile_restoration', restore_error)
+                    error += f'; profile restoration failed: {error_details(restore_error)}'
         self.ui_queue.put(('startup_complete', ok, error))
 
     def restore_saved_rules_locked(self):
@@ -2193,15 +2257,18 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             wanted = direction_set(rule['direction'])
             actual = set()
             for record in records:
-                if record['normalized_path'] == norm and record['action'].casefold() == 'block':
+                if record['normalized_path'] == norm and not record['is_hold'] and record['action'].casefold() == 'block':
                     d = record['direction'].casefold()
                     if 'in' in d:
                         actual.add('in')
                     if 'out' in d:
                         actual.add('out')
             if actual != wanted:
-                self.delete_rule_names((r['name'] for r in records if r['normalized_path'] == norm))
-                self.add_app_rules(os.path.splitext(os.path.basename(path))[0], path, rule['direction'])
+                proc_name = os.path.splitext(os.path.basename(path))[0]
+                base = self.app_rule_base(proc_name, path)
+                self._replace_rule_records([r for r in records if r['normalized_path'] == norm],
+                                           (base + '_In', base + '_Out'),
+                                           lambda: self.add_app_rules(proc_name, path, rule['direction']))
         for target in global_blocks:
             target, addresses = self.add_global_rule_sync(target, False)
             with self.lock:
@@ -2215,7 +2282,8 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
 
     def remove_auto_holds_locked(self, normalized_path=None):
         records = self.get_firewall_rules()
-        self.delete_rule_names((r['name'] for r in records if r['is_hold'] and (not normalized_path or r['normalized_path'] == normalized_path)))
+        holds = [r for r in records if r['is_hold'] and (not normalized_path or r['normalized_path'] == normalized_path)]
+        self._replace_rule_records(holds, (), lambda: None)
 
     def get_rule_status(self, exe_path):
         norm = normalize_path(exe_path)
@@ -2236,8 +2304,19 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         return {'allowed': 'Allowed', 'blocked_both': 'Blocked', 'blocked_in': 'Blocked (In)', 'blocked_out': 'Blocked'}.get(status, '—')
 
     def _global_match(self, collection, remote_ip, domain):
-        candidates = {normalize_target(remote_ip), normalize_target(domain)}
-        return any((target in candidates or remote_ip in data.get('addresses', ()) for target, data in collection.items()))
+        try:
+            remote = ipaddress.ip_address(str(remote_ip).split('%', 1)[0])
+        except ValueError:
+            return False
+        for target, data in collection.items():
+            for address in (target, *data.get('addresses', ())):
+                try:
+                    if remote in ipaddress.ip_network(address, strict=False):
+                        return True
+                except ValueError:
+                    continue
+        # Reverse DNS is a display hint, not proof of a domain's allowed addresses.
+        return False
 
     def is_globally_blocked(self, remote_ip, domain=''):
         with self.lock:
@@ -2271,33 +2350,26 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         norm = normalize_path(path)
         if not norm:
             return False
-        self._invalidate_auto_prompts(close_dialog=True)
         proc_name = proc_name or os.path.splitext(os.path.basename(path))[0] or 'Process'
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
-                previous = [r for r in records if r['normalized_path'] == norm and not r['is_hold']]
-                self.delete_rule_names((r['name'] for r in previous), strict=True)
-                try:
-                    self.remove_auto_holds_locked(norm)
-                    self.add_app_rules(proc_name, path, direction, kind='Block')
-                except Exception:
-                    try:
-                        self.delete_rule_names((r['name'] for r in self.get_firewall_rules() if r['normalized_path'] == norm))
-                    except Exception:
-                        pass
-                    self._restore_app_rule_records(previous)
-                    raise
+                previous = [r for r in records if r['normalized_path'] == norm]
+                base = self.app_rule_base(proc_name, path, 'Block')
+                self._replace_rule_records(previous, (base + '_In', base + '_Out'),
+                                           lambda: self.add_app_rules(proc_name, path, direction, kind='Block'))
                 with self.lock:
                     wanted = direction_set(direction)
                     self.allowed_apps.discard(norm)
                     self.blocked_paths[norm] = {'in': 'in' in wanted, 'out': 'out' in wanted, 'path': path}
                     self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
+            self._cancel_app_prompt(norm)
             self.save_settings()
             if refresh:
                 self.rules_changed()
             return True
         except Exception as exc:
+            self.queue_alert('High', path, '', '', f'Firewall rule update failed: {exc}')
             if not quiet:
                 messagebox.showerror('Block Failed', f'{proc_name}\n\n{exc}')
             return False
@@ -2307,28 +2379,23 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         norm = normalize_path(path)
         if not norm:
             return False
-        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
-                previous = [r for r in records if r['normalized_path'] == norm and not r['is_hold']]
-                self.delete_rule_names((r['name'] for r in previous), strict=True)
-                try:
-                    self.remove_auto_holds_locked(norm)
-                except Exception:
-                    self._restore_app_rule_records(previous)
-                    raise
+                previous = [r for r in records if r['normalized_path'] == norm]
+                self._replace_rule_records(previous, (), lambda: None)
                 with self.lock:
-                    changed = norm not in self.allowed_apps
                     self.allowed_apps.add(norm)
                     self.blocked_paths.pop(norm, None)
                     self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
                     self.upload_alerted = {k for k in self.upload_alerted if k[0] != norm}
+            self._cancel_app_prompt(norm)
             self.save_settings()
             if refresh:
                 self.rules_changed()
-            return changed
+            return True
         except Exception as exc:
+            self.queue_alert('High', path, '', '', f'Firewall rule update failed: {exc}')
             if not quiet:
                 messagebox.showerror('Allow Failed', f'{path}\n\n{exc}')
             return False
@@ -2337,7 +2404,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         target = normalize_target(target)
         if not target:
             return False
-        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 target, addresses = self.add_global_rule_sync(target, allow)
@@ -2347,17 +2413,21 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     destination[target] = {'addresses': addresses}
                     other.pop(target, None)
             self.save_settings()
+            try:
+                self.release_auto_holds()
+            except Exception as exc:
+                self.queue_alert('High', 'Temporary blocks', '', target, f'Global rule applied, but pending blocks could not be released: {exc}')
             if refresh:
                 self.rules_changed()
             return True
         except Exception as exc:
+            self.queue_alert('High', 'Global rule', '', target, f'Firewall rule update failed: {exc}')
             if not quiet:
                 messagebox.showerror('Global Rule Failed', f"{('Allow' if allow else 'Block')} {target}\n\n{exc}")
             return False
 
     def remove_rule(self, status, path, refresh=True):
         status = str(status).casefold()
-        self._invalidate_auto_prompts(close_dialog=True)
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
@@ -2365,15 +2435,16 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     target = normalize_target(str(path).split(' (', 1)[0])
                     allow = status == 'global allow'
                     base = self.global_rule_base(target, allow)
-                    self.delete_rule_names((r['name'] for r in records if r['name'].startswith(base)))
+                    self._replace_rule_records([r for r in records if r['name'].startswith(base)], (), lambda: None)
                     with self.lock:
                         (self.global_allows if allow else self.global_blocks).pop(target, None)
                 else:
                     norm = normalize_path(path)
-                    self.delete_rule_names((r['name'] for r in records if r['normalized_path'] == norm))
+                    self._replace_rule_records([r for r in records if r['normalized_path'] == norm], (), lambda: None)
                     with self.lock:
                         self.allowed_apps.discard(norm)
                         self.blocked_paths.pop(norm, None)
+                    self._cancel_app_prompt(norm)
             self.save_settings()
             if refresh:
                 self.rules_changed()
@@ -2400,10 +2471,16 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def sync_rule_cache(self):
         with self.firewall_lock:
             records = self.get_firewall_rules()
-        blocked = self._blocked_from_records(records)
-        with self.lock:
-            allowed = set(self.allowed_apps)
-            self.blocked_paths = {path: data for path, data in blocked.items() if path not in allowed}
+            blocked = self._blocked_from_records(records)
+            with self.lock:
+                self.allowed_apps.difference_update(blocked)
+                self.blocked_paths = blocked
+                names = {r['name'] for r in records}
+                for allow, collection in ((False, self.global_blocks), (True, self.global_allows)):
+                    for target in list(collection):
+                        base = self.global_rule_base(target, allow)
+                        if not ({base + '_In', base + '_Out'} & names):
+                            collection.pop(target, None)
 
     def refresh_rules(self, force=False):
         with self.lock:
@@ -2686,50 +2763,54 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         now = time.monotonic()
         if now - self.cache_time < 2:
             return
-        socket_cache = {}
-        listener_cache = {}
+        socket_cache, listener_cache = {}, {}
         try:
+            local_addresses = {normalize_target(a.address.split('%', 1)[0])
+                               for addresses in psutil.net_if_addrs().values()
+                               for a in addresses if a.family in (socket.AF_INET, socket.AF_INET6)}
+            local_addresses.update({'127.0.0.1', '::1'})
             for conn in psutil.net_connections(kind='inet'):
                 if not conn.laddr or not conn.pid:
                     continue
-                family = getattr(conn, 'family', None)
-                family_key = int(family.value) if hasattr(family, 'value') else str(family)
-                conn_type = int(getattr(conn, 'type', 0))
-                proto = 'TCP' if conn_type == int(socket.SOCK_STREAM) else 'UDP' if conn_type == int(socket.SOCK_DGRAM) else str(conn_type)
-                local_ip = normalize_target(getattr(conn.laddr, 'ip', conn.laddr[0]))
-                local_port = int(getattr(conn.laddr, 'port', conn.laddr[1]))
-                remote = getattr(conn, 'raddr', None)
-                if remote:
-                    remote_ip = normalize_target(getattr(remote, 'ip', remote[0]))
-                    remote_port = int(getattr(remote, 'port', remote[1]))
-                    socket_cache[(family_key, proto, local_ip, local_port, remote_ip, remote_port)] = conn.pid
-                listener_cache[(family_key, proto, local_ip, local_port)] = conn.pid
+                family_key = int(conn.family)
+                proto = 'TCP' if conn.type == socket.SOCK_STREAM else 'UDP'
+                local_ip = normalize_target(conn.laddr.ip.split('%', 1)[0])
+                local_port = conn.laddr.port
+                if conn.raddr:
+                    remote_ip = normalize_target(conn.raddr.ip.split('%', 1)[0])
+                    key = (family_key, proto, local_ip, local_port, remote_ip, conn.raddr.port)
+                    socket_cache.setdefault(key, set()).add(conn.pid)
+                elif proto == 'UDP' or conn.status == psutil.CONN_LISTEN:
+                    listener_cache.setdefault((family_key, proto, local_ip, local_port), set()).add(conn.pid)
+            self.local_addresses = local_addresses
             self.socket_process_cache = socket_cache
             self.listener_process_cache = listener_cache
             self.cache_time = now
-        except (psutil.AccessDenied, OSError):
-            return
-        except Exception:
-            return
+        except (psutil.Error, OSError) as exc:
+            # Never attribute traffic using a stale ownership snapshot after a failed refresh.
+            self.socket_process_cache = {}
+            self.listener_process_cache = {}
+            log_internal_error('refresh_process_cache', exc)
 
     def get_process_info(self, local_ip, local_port, remote_ip, remote_port, proto, family_key):
         self.refresh_process_cache()
-        local_ip_n = normalize_target(local_ip)
-        remote_ip_n = normalize_target(remote_ip)
-        pid = self.socket_process_cache.get((family_key, proto, local_ip_n, int(local_port), remote_ip_n, int(remote_port)))
-        if pid is None:
-            pid = self.listener_process_cache.get((family_key, proto, local_ip_n, int(local_port)))
-        if pid is None:
-            wildcard = '0.0.0.0' if family_key in (2, '2') else '::' if family_key in (23, '23') else None
-            if wildcard:
-                pid = self.listener_process_cache.get((family_key, proto, wildcard, int(local_port)))
-        if not pid:
-            return (None, None, None)
+        local_ip_n = normalize_target(local_ip.split('%', 1)[0])
+        remote_ip_n = normalize_target(remote_ip.split('%', 1)[0])
+        if local_ip_n not in self.local_addresses:
+            return None, None, None
+        candidates = self.socket_process_cache.get((family_key, proto, local_ip_n, int(local_port), remote_ip_n, int(remote_port)))
+        if candidates is None:
+            candidates = set(self.listener_process_cache.get((family_key, proto, local_ip_n, int(local_port)), ()))
+            wildcard = '0.0.0.0' if family_key == int(socket.AF_INET) else '::'
+            candidates.update(self.listener_process_cache.get((family_key, proto, wildcard, int(local_port)), ()))
+        if len(candidates) != 1:
+            return None, None, None
+        pid = next(iter(candidates))
         try:
             proc = psutil.Process(pid)
-            return (proc.name(), proc.exe(), pid)
+            return proc.name(), proc.exe(), pid
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return (None, None, None)
+            return None, None, None
 
     def _start_dns_workers(self):
         for index in range(DNS_MAX_WORKERS):
@@ -2849,6 +2930,9 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 return
             outgoing = self.get_process_info(src, sport, dst, dport, proto, family_key)
             incoming = self.get_process_info(dst, dport, src, sport, proto, family_key)
+            if outgoing[0] and incoming[0]:
+                # Loopback/shared endpoint ownership is ambiguous for auto-blocking.
+                return
             if outgoing[0] and outgoing[1]:
                 proc_name, exe, pid = outgoing
                 direction = 'Outgoing'
@@ -2954,7 +3038,21 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 continue
             try:
                 sniff(filter='ip or ip6', prn=self.packet_handler, store=False, timeout=1)
-            except Exception:
+                with self.lock:
+                    recovered = self.capture_error is not None
+                    self.capture_healthy = True
+                    self.capture_error = None
+                if recovered:
+                    self.queue_alert('Info', 'Packet capture', '', '', 'Packet capture recovered.')
+            except Exception as exc:
+                with self.lock:
+                    changed = self.capture_error != str(exc)
+                    self.capture_error = str(exc)
+                    self.capture_healthy = False
+                if changed:
+                    log_internal_error('packet_capture', exc)
+                    self.queue_alert('High', 'Packet capture', '', '',
+                                     f'Monitoring and Auto-Block unavailable: {exc}')
                 time.sleep(1)
 
     def install_auto_hold(self, proc_name, exe, remote_ip='', domain='', prompt_generation=None):
@@ -2965,6 +3063,8 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             with self.firewall_lock:
                 with self.lock:
                     if not self.log_alerts_only or not self.auto_block_enabled or self.is_paused or self.closed:
+                        return False
+                    if norm in self.allowed_apps:
                         return False
                     if prompt_generation is not None and prompt_generation != self.auto_prompt_generation:
                         return False
@@ -2979,6 +3079,31 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         except Exception:
             return False
 
+    def _cancel_app_prompt(self, norm):
+        dialog = None
+        with self.lock:
+            self.auto_prompt_keys.discard(norm)
+            pending = []
+            while True:
+                try:
+                    item = self.prompt_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item[1] != norm:
+                    pending.append(item)
+            for item in pending:
+                self.prompt_queue.put(item)
+            if self.auto_prompt_key == norm:
+                dialog = self.auto_prompt_dialog
+                self.auto_prompt_dialog = None
+                self.auto_prompt_key = None
+                self.auto_prompt_active = False
+        if dialog is not None:
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
     def _invalidate_auto_prompts(self, close_dialog=False):
         dialog = None
         with self.lock:
@@ -2989,11 +3114,11 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 self.auto_prompt_dialog = None
                 self.auto_prompt_key = None
                 self.auto_prompt_active = False
-        while True:
-            try:
-                self.prompt_queue.get_nowait()
-            except queue.Empty:
-                break
+            while True:
+                try:
+                    self.prompt_queue.get_nowait()
+                except queue.Empty:
+                    break
         if close_dialog and dialog is not None:
             try:
                 dialog.destroy()
@@ -3001,6 +3126,11 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 pass
 
     def start_auto_block(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail):
+        # Hold installation, generation validation, and prompt publication are one operation.
+        with self.firewall_lock:
+            self._start_auto_block_locked(proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail)
+
+    def _start_auto_block_locked(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail):
         prompt_key = normalize_path(exe) or key
         with self.lock:
             if not self.log_alerts_only or not self.auto_block_enabled or self.is_paused or self.closed:
@@ -3022,24 +3152,21 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 stale = True
             else:
                 stale = False
+                self.prompt_queue.put((generation, prompt_key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail))
         if stale:
             try:
                 with self.firewall_lock:
                     self.remove_auto_holds_locked(normalize_path(exe))
-            except Exception:
-                pass
+            except Exception as exc:
+                self.queue_alert('High', proc_name, pid, remote_ip, f'Could not release cancelled temporary block: {exc}')
             with self.lock:
                 self.auto_prompt_keys.discard(prompt_key)
             return
-        self.prompt_queue.put((generation, prompt_key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail))
 
     def release_auto_holds(self):
-        self._invalidate_auto_prompts(close_dialog=True)
-        try:
-            with self.firewall_lock:
-                self.remove_auto_holds_locked()
-        except Exception:
-            pass
+        with self.firewall_lock:
+            self.remove_auto_holds_locked()
+            self._invalidate_auto_prompts(close_dialog=True)
 
     def queue_alert(self, severity, process, pid, remote, reason):
         self.alert_queue.put((time.time(), severity, process, pid, remote, '', reason))
@@ -3534,6 +3661,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 return
             if not messagebox.askyesno('Import Rules', f'Apply {total} imported rule(s)?'):
                 return
+            failures = []
             for rule in rules:
                 if not isinstance(rule, dict):
                     continue
@@ -3542,19 +3670,26 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     continue
                 action = str(rule.get('action', 'Block')).casefold()
                 if 'allow' in action:
-                    self.allow_executable(path_value, refresh=False, quiet=True)
+                    if not self.allow_executable(path_value, refresh=False, quiet=True):
+                        failures.append(path_value)
                 else:
-                    self.block_executable(path_value, os.path.splitext(os.path.basename(path_value))[0] or 'Process', direction_name(rule.get('direction', 'Both')), refresh=False, quiet=True)
+                    if not self.block_executable(path_value, os.path.splitext(os.path.basename(path_value))[0] or 'Process', direction_name(rule.get('direction', 'Both')), refresh=False, quiet=True):
+                        failures.append(path_value)
             for entry in blocks:
                 target = entry.get('target', '') if isinstance(entry, dict) else entry
                 if target:
-                    self.add_global_rule(target, False, refresh=False, quiet=True)
+                    if not self.add_global_rule(target, False, refresh=False, quiet=True):
+                        failures.append(target)
             for entry in allows:
                 target = entry.get('target', '') if isinstance(entry, dict) else entry
                 if target:
-                    self.add_global_rule(target, True, refresh=False, quiet=True)
+                    if not self.add_global_rule(target, True, refresh=False, quiet=True):
+                        failures.append(target)
             self.rules_changed()
-            messagebox.showinfo('Import Complete', 'Imported rules were applied.')
+            if failures:
+                messagebox.showerror('Import Incomplete', 'Failed rules:\n' + '\n'.join(failures))
+            else:
+                messagebox.showinfo('Import Complete', 'Imported rules were applied.')
         except Exception as exc:
             messagebox.showerror('Import Failed', str(exc))
 
@@ -3680,31 +3815,22 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             nonlocal finished
             if finished:
                 return
-            finished = True
             with self.lock:
-                current = generation == self.auto_prompt_generation and (not self.closed)
-            try:
-                dialog.destroy()
-            except tk.TclError:
-                pass
-            try:
-                if current:
-                    if choice == 'allow':
-                        self.allow_executable(exe, refresh=False, quiet=True)
-                    elif choice == 'in':
-                        self.block_executable(exe, proc_name, 'in', refresh=False, quiet=True)
-                    else:
-                        self.block_executable(exe, proc_name, 'both', refresh=False, quiet=True)
-            finally:
-                with self.lock:
-                    self.auto_prompt_keys.discard(key)
-                    if self.auto_prompt_dialog is dialog:
-                        self.auto_prompt_dialog = None
-                    if self.auto_prompt_key == key:
-                        self.auto_prompt_key = None
-                    self.auto_prompt_active = False
-                if current:
-                    self.rules_changed()
+                current = generation == self.auto_prompt_generation and not self.closed
+            if not current:
+                return
+            finished = True
+            if choice == 'allow':
+                ok = self.allow_executable(exe, refresh=False, quiet=True)
+            else:
+                ok = self.block_executable(exe, proc_name, 'in' if choice == 'in' else 'both', refresh=False, quiet=True)
+            if not ok:
+                finished = False
+                messagebox.showerror('Firewall Update Failed',
+                                     'The decision could not be applied. Review Alerts for details and retry.', parent=dialog)
+                return
+            self._cancel_app_prompt(key)
+            self.rules_changed()
         action_specs = (('Block In & Out', 'both', '#f44336', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
         for column, (label, choice, bg, tip) in enumerate(action_specs):
             button = tk.Button(buttons, text=label, command=lambda value=choice: finish(value), bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
@@ -3751,11 +3877,18 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             self._last_capture_packets = packets_now
             self._last_status_time = now
         if not self.startup_complete:
-            self.status_state.config(text='● Starting', fg='#ff9800')
-            self.status_firewall.config(text='Firewall: Initializing...')
+            failed = not self.startup_running
+            self.status_state.config(text='Startup failed' if failed else 'Starting', fg='#f44336' if failed else '#ff9800')
+            self.status_firewall.config(text='Firewall: Initialization failed' if failed else 'Firewall: Initializing...')
+        elif paused:
+            self.status_state.config(text='Paused', fg='#ff9800')
+            self.status_firewall.config(text='Firewall: Rules remain active')
+        elif not self.capture_healthy:
+            self.status_state.config(text='Capture failed' if self.capture_error is not None else 'Starting capture', fg='#f44336')
+            self.status_firewall.config(text='Firewall: Rules active; Auto-Block unavailable')
         else:
-            self.status_state.config(text='● Paused' if paused else '● Monitoring', fg='#ff9800' if paused else '#4CAF50')
-            self.status_firewall.config(text='Firewall: Rules remain active' if paused else 'Firewall: Protected')
+            self.status_state.config(text='Monitoring', fg='#4CAF50')
+            self.status_firewall.config(text='Firewall: Protected')
         self.status_connections.config(text=f'Connections: {connections:,}')
         self.status_rules.config(text=f'Rules: {rules:,}')
         speed = f'{self.capture_rate / (1024 * 1024):.2f} MB/s' if self.capture_rate >= 1024 * 1024 else f'{self.capture_rate / 1024:.1f} KB/s'
@@ -3845,18 +3978,23 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         with self.lock:
             self.closed = True
             self.sniffing = False
+        shutdown_errors = []
         try:
             self.release_auto_holds()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_internal_error('shutdown_auto_holds', exc)
+            shutdown_errors.append(f'Temporary block cleanup: {exc}')
         try:
             with self.firewall_lock:
                 with self.lock:
                     profile_modified = self.firewall_profile_modified
                 if profile_modified:
                     self._restore_firewall_profile_state_locked()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_internal_error('shutdown_profile_restoration', exc)
+            shutdown_errors.append(f'Firewall profile restoration: {error_details(exc)}')
+        if shutdown_errors:
+            messagebox.showerror('Firewall Cleanup Failed', '\n'.join(shutdown_errors) + '\nAny unrestored profile backup is retained for recovery on the next launch.', parent=self.root)
         try:
             self.save_settings()
         finally:
