@@ -1838,6 +1838,29 @@ class FirewallMonitorApp:
         return self._run(('netsh', 'advfirewall', 'firewall', *args), check)
 
     def delete_rule_names(self, names, strict=True):
+        names = sorted(set(n for n in names if n))
+        if not names:
+            return False
+        # Keep discovery, deletion and verification in one process. Match literal
+        # display names (including legacy netsh rules whose Name is a GUID).
+        command = "$ErrorActionPreference='Stop'\n$names=@(" + ','.join(self._ps_quote(n) for n in names) + ")\n"
+        command += '''
+$existing = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.DisplayName -in $names })
+foreach ($r in $existing) { $r | Remove-NetFirewallRule -ErrorAction Stop }
+$remaining = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.DisplayName -in $names })
+if ($remaining.Count) { throw ('Firewall rules could not be removed: ' + ($remaining.DisplayName -join ', ')) }
+if ($existing.Count) { 'removed' } else { 'absent' }
+'''
+        try:
+            output = self.run_ps(command).stdout.strip()
+            if output not in {'removed', 'absent'}:
+                raise RuntimeError('Invalid firewall deletion result.')
+            return output == 'removed'
+        except Exception:
+            # Re-read actual state after a failed/partial batch before fallback.
+            return self._delete_rule_names_individually(names, strict)
+
+    def _delete_rule_names_individually(self, names, strict=True):
         names = set(n for n in names if n)
         if not names:
             return False
@@ -1852,11 +1875,14 @@ class FirewallMonitorApp:
             raise RuntimeError('Firewall rules could not be removed: ' + ', '.join(sorted(remaining)))
         return bool(names & existing)
 
-    def _replace_rule_records(self, previous, desired_names, apply):
+    def _replace_rule_records(self, previous, desired_names, apply, apply_first=False):
         names = {r['name'] for r in previous} | set(desired_names)
         try:
+            if apply_first:
+                apply()
             self.delete_rule_names(r['name'] for r in previous)
-            apply()
+            if not apply_first:
+                apply()
         except Exception as error:
             cleanup_error = None
             try:
@@ -1932,18 +1958,31 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def _ps_quote(value):
         return "'" + str(value).replace("'", "''") + "'"
 
-    def _add_app_firewall_rule(self, name, exe_path, side, action='block'):
-        """Create one verified Windows Firewall application rule with rollback."""
+    def _app_rule_commands(self, name, exe_path, side, action='block'):
         direction = 'Inbound' if side == 'in' else 'Outbound'
         action_name = 'Block' if str(action).casefold() == 'block' else 'Allow'
-        created = False
-        used_netsh = False
-
         ps_command = (
             f"New-NetFirewallRule -Name {self._ps_quote(name)} -DisplayName {self._ps_quote(name)} "
             f"-Direction {direction} -Program {self._ps_quote(exe_path)} "
             f"-Action {action_name} -Enabled True -Profile Any -ErrorAction Stop | Out-Null"
         )
+        verify = (
+            f"$r=Get-NetFirewallRule -Name {self._ps_quote(name)} -ErrorAction Stop; "
+            f"$a=Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop | Select-Object -First 1; "
+            f"if(-not $a){{throw 'Application filter is missing.'}}; "
+            f"if([string]$r.Enabled -ne 'True'){{throw 'Firewall rule is disabled.'}}; "
+            f"if([string]$r.Direction -ne {self._ps_quote(direction)}){{throw ('Wrong direction: ' + [string]$r.Direction)}}; "
+            f"if([string]$r.Action -ne {self._ps_quote(action_name)}){{throw ('Wrong action: ' + [string]$r.Action)}}; "
+            f"if(-not [string]::Equals([string]$a.Program,{self._ps_quote(exe_path)},[System.StringComparison]::OrdinalIgnoreCase)){{throw ('Wrong program: ' + [string]$a.Program)}}"
+        )
+        return ps_command, verify
+
+    def _add_app_firewall_rule(self, name, exe_path, side, action='block'):
+        """Compatibility path for one application rule, including netsh fallback."""
+        action_name = 'Block' if str(action).casefold() == 'block' else 'Allow'
+        created = False
+        used_netsh = False
+        ps_command, verify = self._app_rule_commands(name, exe_path, side, action)
 
         try:
             self.run_ps(ps_command)
@@ -1974,15 +2013,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     f"netsh: {str(second_detail).strip() or str(second_error)}"
                 ) from second_error
 
-        verify = (
-            f"$r=Get-NetFirewallRule -Name {self._ps_quote(name)} -ErrorAction Stop; "
-            f"$a=Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop | Select-Object -First 1; "
-            f"if(-not $a){{throw 'Application filter is missing.'}}; "
-            f"if(-not $r.Enabled){{throw 'Firewall rule is disabled.'}}; "
-            f"if([string]$r.Direction -ne {self._ps_quote(direction)}){{throw ('Wrong direction: ' + [string]$r.Direction)}}; "
-            f"if([string]$r.Action -ne {self._ps_quote(action_name)}){{throw ('Wrong action: ' + [string]$r.Action)}}; "
-            f"if(-not [string]::Equals([string]$a.Program,{self._ps_quote(exe_path)},[System.StringComparison]::OrdinalIgnoreCase)){{throw ('Wrong program: ' + [string]$a.Program)}}"
-        )
         try:
             self.run_ps(verify)
             return
@@ -2005,6 +2035,27 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             ) from exc
 
     def add_app_rules(self, proc_name, exe_path, direction, kind='Block'):
+        base = self.app_rule_base(proc_name, exe_path, kind)
+        names, commands, checks = [], [], []
+        for side in direction_set(direction):
+            name = f"{base}_{'In' if side == 'in' else 'Out'}"
+            create, verify = self._app_rule_commands(name, exe_path, side)
+            names.append(name)
+            commands.append(create)
+            checks.append(verify)
+        try:
+            self.run_ps("$ErrorActionPreference='Stop'\n" + '\n'.join(commands + checks))
+            return base
+        except Exception as error:
+            # A timeout can leave either direction installed. Confirm cleanup
+            # before retrying, so fallback cannot create duplicate rules.
+            try:
+                self.delete_rule_names(names)
+            except Exception as cleanup_error:
+                raise RuntimeError(f'Application rule batch failed: {error_details(error)}; cleanup failed: {cleanup_error}') from cleanup_error
+            return self._add_app_rules_individually(proc_name, exe_path, direction, kind)
+
+    def _add_app_rules_individually(self, proc_name, exe_path, direction, kind='Block'):
         base = self.app_rule_base(proc_name, exe_path, kind)
         created_names = []
         try:
@@ -2340,7 +2391,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def rules_changed(self):
         self.refresh_rules(force=True)
 
-    def block_executable(self, exe_path, proc_name=None, direction='both', refresh=True, quiet=False):
+    def block_executable(self, exe_path, proc_name=None, direction='both', refresh=True, quiet=False, update_ui=True):
         path = display_path(exe_path)
         norm = normalize_path(path)
         if not norm:
@@ -2351,16 +2402,21 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 records = self.get_firewall_rules()
                 previous = [r for r in records if r['normalized_path'] == norm]
                 base = self.app_rule_base(proc_name, path, 'Block')
+                # AutoHold and permanent rules have distinct names. Verify the
+                # permanent block before removing temporary protection.
+                replacing_hold = bool(previous) and all(r.get('is_hold') for r in previous)
                 self._replace_rule_records(previous, (base + '_In', base + '_Out'),
-                                           lambda: self.add_app_rules(proc_name, path, direction, kind='Block'))
+                                           lambda: self.add_app_rules(proc_name, path, direction, kind='Block'),
+                                           apply_first=replacing_hold)
                 with self.lock:
                     wanted = direction_set(direction)
                     self.allowed_apps.discard(norm)
                     self.blocked_paths[norm] = {'in': 'in' in wanted, 'out': 'out' in wanted, 'path': path}
                     self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
-            self._cancel_app_prompt(norm)
+            if update_ui:
+                self._cancel_app_prompt(norm)
             self.save_settings()
-            if refresh:
+            if refresh and update_ui:
                 self.rules_changed()
             return True
         except Exception as exc:
@@ -2369,7 +2425,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 messagebox.showerror('Block Failed', f'{proc_name}\n\n{exc}')
             return False
 
-    def allow_executable(self, exe_path, refresh=True, quiet=False):
+    def allow_executable(self, exe_path, refresh=True, quiet=False, update_ui=True):
         path = display_path(exe_path)
         norm = normalize_path(path)
         if not norm:
@@ -2384,9 +2440,10 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     self.blocked_paths.pop(norm, None)
                     self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
                     self.upload_alerted = {k for k in self.upload_alerted if k[0] != norm}
-            self._cancel_app_prompt(norm)
+            if update_ui:
+                self._cancel_app_prompt(norm)
             self.save_settings()
-            if refresh:
+            if refresh and update_ui:
                 self.rules_changed()
             return True
         except Exception as exc:
@@ -3784,6 +3841,27 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         with self.lock:
             return self.log_alerts_only and self.auto_block_enabled and (not self.is_paused) and (not self.closed)
 
+    def _auto_decision_worker(self, generation, key, exe, proc_name, choice, result_queue):
+        """Apply a decision without calling Tk; the prompt owns result delivery."""
+        ok = None
+        try:
+            with self.firewall_lock:
+                with self.lock:
+                    current = (not self.closed and generation == self.auto_prompt_generation
+                               and self.auto_prompt_key == key)
+                if current:
+                    if choice == 'allow':
+                        ok = self.allow_executable(exe, refresh=False, quiet=True, update_ui=False)
+                    else:
+                        ok = self.block_executable(exe, proc_name, 'in' if choice == 'in' else 'both',
+                                                   refresh=False, quiet=True, update_ui=False)
+        except Exception as exc:
+            ok = False
+            log_internal_error('auto_decision', exc)
+            self.queue_alert('High', exe, '', '', f'Firewall decision failed: {exc}')
+        finally:
+            result_queue.put(ok)
+
     def show_auto_prompt(self, generation, key, proc_name, exe, pid, remote_ip, reason, detail):
         dialog = tk.Toplevel(self.root)
         with self.lock:
@@ -3802,6 +3880,36 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         buttons.grid_columnconfigure((0, 1, 2), weight=1)
 
         finished = False
+        decision_buttons = []
+        result_queue = queue.Queue(maxsize=1)
+        applying = tk.Label(body, text='', anchor=tk.W, bg=self.colors['frame'], fg=self.colors['fg'])
+        applying.pack(fill=tk.X)
+
+        def poll_decision():
+            nonlocal finished
+            if self.closed:
+                return
+            try:
+                ok = result_queue.get_nowait()
+            except queue.Empty:
+                self.root.after(50, poll_decision)
+                return
+            with self.lock:
+                current = (generation == self.auto_prompt_generation
+                           and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key)
+            if ok:
+                if current:
+                    self._cancel_app_prompt(key)
+            elif current and ok is False:
+                finished = False
+                for button in decision_buttons:
+                    button.configure(state=tk.NORMAL)
+                applying.configure(text='Could not apply decision. Please retry.')
+                messagebox.showerror('Firewall Update Failed',
+                                     'The decision could not be applied. Review Alerts for details and retry.', parent=dialog)
+            # Also reconcile failed/cancelled work, whose start invalidated an
+            # older rule refresh and whose rollback may have reconciled caches.
+            self.rules_changed()
 
         def finish(choice):
             nonlocal finished
@@ -3812,24 +3920,30 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             if not current:
                 return
             finished = True
-            if choice == 'allow':
-                ok = self.allow_executable(exe, refresh=False, quiet=True)
-            else:
-                ok = self.block_executable(exe, proc_name, 'in' if choice == 'in' else 'both', refresh=False, quiet=True)
-            if not ok:
-                finished = False
-                messagebox.showerror('Firewall Update Failed',
-                                     'The decision could not be applied. Review Alerts for details and retry.', parent=dialog)
-                return
-            self._cancel_app_prompt(key)
-            self.rules_changed()
+            for button in decision_buttons:
+                button.configure(state=tk.DISABLED)
+            applying.configure(text='Applying decision...')
+            # Reject snapshots taken before this mutation; refresh on completion.
+            with self.lock:
+                self.rules_generation += 1
+            worker = threading.Thread(target=self._auto_decision_worker,
+                                      args=(generation, key, exe, proc_name, choice, result_queue),
+                                      daemon=True, name='PyFirewall-Decision')
+            try:
+                worker.start()
+            except Exception as exc:
+                self.queue_alert('High', exe, pid, remote_ip, f'Could not start firewall decision: {exc}')
+                result_queue.put(False)
+            self.root.after(50, poll_decision)
         action_specs = (('Block In & Out', 'both', '#f44336', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
         for column, (label, choice, bg, tip) in enumerate(action_specs):
             button = tk.Button(buttons, text=label, command=lambda value=choice: finish(value), bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
+            decision_buttons.append(button)
             self._bind_button_hover(button)
             button.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
             add_tooltip(button, tip)
         cancel = tk.Button(buttons, text='Cancel (Block)', command=lambda: finish('both'), bg=self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
+        decision_buttons.append(cancel)
         self._bind_button_hover(cancel)
         cancel.grid(row=1, column=0, columnspan=3, sticky='ew', padx=3, pady=(0, 0))
         add_tooltip(cancel, 'Dismiss the prompt and keep the executable blocked.')
