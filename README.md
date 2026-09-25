@@ -72,7 +72,7 @@ The main window can be closed but will remain in the system tray. Use **Close** 
 
 ## Important Firewall Behavior
 
-On first firewall initialization, PyFirewall saves the existing Windows Firewall profile settings. The saved firewall profile settings will be restored during uninstallation.
+On each launch, PyFirewall saves the existing Windows Firewall profile settings, enables the profiles, and sets their default inbound and outbound actions to Allow while its managed rules are active. On a normal exit, it restores the saved profile settings. If a session is interrupted, the retained backup is restored before the next session is initialized. Restoration failures are reported and the backup is retained for recovery. The uninstaller can also restore a retained backup.
 
 ## Known Issues
 
