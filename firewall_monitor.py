@@ -1841,8 +1841,6 @@ class FirewallMonitorApp:
         names = sorted(set(n for n in names if n))
         if not names:
             return False
-        # Keep discovery, deletion and verification in one process. Match literal
-        # display names (including legacy netsh rules whose Name is a GUID).
         command = "$ErrorActionPreference='Stop'\n$names=@(" + ','.join(self._ps_quote(n) for n in names) + ")\n"
         command += '''
 $existing = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.DisplayName -in $names })
@@ -1857,7 +1855,6 @@ if ($existing.Count) { 'removed' } else { 'absent' }
                 raise RuntimeError('Invalid firewall deletion result.')
             return output == 'removed'
         except Exception:
-            # Re-read actual state after a failed/partial batch before fallback.
             return self._delete_rule_names_individually(names, strict)
 
     def _delete_rule_names_individually(self, names, strict=True):
@@ -2047,8 +2044,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             self.run_ps("$ErrorActionPreference='Stop'\n" + '\n'.join(commands + checks))
             return base
         except Exception as error:
-            # A timeout can leave either direction installed. Confirm cleanup
-            # before retrying, so fallback cannot create duplicate rules.
             try:
                 self.delete_rule_names(names)
             except Exception as cleanup_error:
@@ -2402,8 +2397,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 records = self.get_firewall_rules()
                 previous = [r for r in records if r['normalized_path'] == norm]
                 base = self.app_rule_base(proc_name, path, 'Block')
-                # AutoHold and permanent rules have distinct names. Verify the
-                # permanent block before removing temporary protection.
                 replacing_hold = bool(previous) and all(r.get('is_hold') for r in previous)
                 self._replace_rule_records(previous, (base + '_In', base + '_Out'),
                                            lambda: self.add_app_rules(proc_name, path, direction, kind='Block'),
@@ -3907,8 +3900,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 applying.configure(text='Could not apply decision. Please retry.')
                 messagebox.showerror('Firewall Update Failed',
                                      'The decision could not be applied. Review Alerts for details and retry.', parent=dialog)
-            # Also reconcile failed/cancelled work, whose start invalidated an
-            # older rule refresh and whose rollback may have reconciled caches.
             self.rules_changed()
 
         def finish(choice):
@@ -3923,7 +3914,6 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             for button in decision_buttons:
                 button.configure(state=tk.DISABLED)
             applying.configure(text='Applying decision...')
-            # Reject snapshots taken before this mutation; refresh on completion.
             with self.lock:
                 self.rules_generation += 1
             worker = threading.Thread(target=self._auto_decision_worker,
