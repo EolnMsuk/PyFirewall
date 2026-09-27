@@ -114,7 +114,6 @@ For missing live traffic, verify that Npcap is installed and running and that Py
 - [Npcap](https://npcap.com/)
 - [Scapy Documentation](https://scapy.readthedocs.io/)
 
-## Donations
+## Support Developer
 
-- [Venmo](https://venmo.com/u/rustonrails/)
-- [Bitcoin](https://www.blockchain.com/explorer/addresses/btc/31uHLpioo1TbxAmo9kM7rrKcLz3wvcoZaL)
+[Venmo](https://venmo.com/u/rustonrails) | Bitcoin: `31uHLpioo1TbxAmo9kM7rrKcLz3wvcoZaL`
