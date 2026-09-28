@@ -2112,8 +2112,8 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         try:
             addresses = {result[4][0] for result in socket.getaddrinfo(target, None, type=socket.SOCK_STREAM)}
             return tuple(sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, value)))
-        except OSError:
-            return ()
+        except OSError as exc:
+            raise ValueError(f"Could not resolve global target '{target}': {error_details(exc)}") from exc
 
     def add_global_rule_sync(self, target, allow):
         target = normalize_target(target)
@@ -2466,9 +2466,11 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 self.rules_changed()
             return True
         except Exception as exc:
-            self.queue_alert('High', 'Global rule', '', target, f'Firewall rule update failed: {exc}')
+            details = error_details(exc)
+            log_internal_error(f'global_rule {"allow" if allow else "block"} {target}', exc)
+            self.queue_alert('High', 'Global rule', '', target, f'Firewall rule update failed: {details}')
             if not quiet:
-                messagebox.showerror('Global Rule Failed', f"{('Allow' if allow else 'Block')} {target}\n\n{exc}")
+                messagebox.showerror('Global Rule Failed', f"{('Allow' if allow else 'Block')} {target}\n\n{details}")
             return False
 
     def remove_rule(self, status, path, refresh=True):
