@@ -43,9 +43,11 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 5. Complete the Npcap installer manually if it appears.
 6. PyFirewall will launch after installation.
 
+---
+
 ### Method 2 (advanced)
 
-Manually download the PyFirewall.zip, unpack it and install Python 3.8+ with Tcl/Tk and pip, Npcap, then run the following 2 commands while in the unpacked directory:
+Manually download the PyFirewall.zip, unpack it. Manually find / download / install Python 3.8+ with Tcl/Tk and pip, Npcap, then run the following 2 commands while in the unpacked directory:
 
 ```powershell
 python -m pip install -r requirements.txt
