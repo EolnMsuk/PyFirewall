@@ -777,7 +777,7 @@ class FirewallMonitorApp:
         self.filter_border = self._button(self.top_controls, 'Filter All Connections OFF', self.toggle_filter_all, '#9E9E9E', pack=False, font=('Segoe UI', 10, 'bold'), padx=10, pady=2, tooltip=lambda: 'Filter All Connections is locked while monitoring is paused.' if self.is_paused else 'Force the Max Connections Threshold to 1 and inspect every new connection. Filter All Connections also enables and locks Alerts + Auto-Block Protection.')
         self.btn_filter = self.filter_border.winfo_children()[0]
         self.filter_border.pack(side=tk.LEFT, padx=(0, 4))
-        self.pause_border = self._button(self.top_controls, '⏸  Pause Monitoring', self.toggle_pause, '#2196F3', pack=False, font=('Segoe UI', 10, 'bold'), padx=10, pady=2, tooltip=lambda: 'Resume live packet capture and monitoring' if self.is_paused else 'Pause live packet capture and monitoring')
+        self.pause_border = self._button(self.top_controls, '⏸  Pause Monitoring', self.toggle_pause, '#2196F3', pack=False, font=('Segoe UI', 10, 'bold'), padx=10, pady=2, tooltip=lambda: 'Resume live packet capture and monitoring' if self.is_paused or self.capture_error is not None else 'Pause live packet capture and monitoring')
         self.btn_pause = self.pause_border.winfo_children()[0]
         self.pause_border.pack(side=tk.LEFT)
         self.chk_dark_top = tk.Checkbutton(self.top_controls, text='Dark Theme', variable=self.dark_mode_var, command=self.on_theme_changed, bg=self.colors['bg'], fg=self.colors['fg'], activebackground=self.colors['bg'], activeforeground=self.colors['fg'], selectcolor=self.colors['entry'], font=('Segoe UI', 9, 'bold'), relief=tk.FLAT, bd=0, highlightthickness=0)
@@ -1685,17 +1685,22 @@ class FirewallMonitorApp:
         self._queue_settings_change(release_auto_holds=not self.log_alerts_only or not self.auto_block_enabled)
         self.save_settings()
 
-    def toggle_pause(self):
-        with self.lock:
-            self.is_paused = not self.is_paused
-            paused = self.is_paused
-        if paused:
-            self._invalidate_auto_prompts(close_dialog=True)
-        pause_text = '▶  Resume Monitoring' if paused else '⏸  Pause Monitoring'
-        pause_color = '#9E9E9E' if paused else '#2196F3'
+    def update_pause_button(self, resume):
+        pause_text = '▶  Resume Monitoring' if resume else '⏸  Pause Monitoring'
+        pause_color = '#9E9E9E' if resume else '#2196F3'
         if hasattr(self, 'btn_pause'):
             self._set_button_colors(self.btn_pause, getattr(self, 'pause_border', None), pause_color, '#ffffff', tk.NORMAL)
             self.btn_pause.configure(text=pause_text)
+
+    def toggle_pause(self):
+        with self.lock:
+            capture_failed = not self.capture_healthy and self.capture_error is not None
+            # A failed capture displays Resume; clicking it must not pause retries.
+            self.is_paused = False if capture_failed else not self.is_paused
+            paused = self.is_paused
+        if paused:
+            self._invalidate_auto_prompts(close_dialog=True)
+        self.update_pause_button(paused or capture_failed)
         self.update_auto_block_controls()
         self.update_filter_ui()
         if paused:
@@ -1893,8 +1898,7 @@ class FirewallMonitorApp:
             self.auto_block_var.set(True)
             self.clear_alerts()
             self.clear_list()
-            self._set_button_colors(self.btn_pause, getattr(self, 'pause_border', None), '#2196F3', '#ffffff', tk.NORMAL)
-            self.btn_pause.config(text='⏸  Pause Monitoring')
+            self.update_pause_button(not self.capture_healthy and self.capture_error is not None)
             self.update_auto_block_controls()
             self.update_filter_ui()
             if self.startup_complete:
@@ -4194,6 +4198,9 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             down = self.total_download
             up = self.total_upload
             paused = self.is_paused
+            capture_healthy = self.capture_healthy
+            capture_error = self.capture_error
+        self.update_pause_button(paused or (not capture_healthy and capture_error is not None))
         elapsed = now - self._last_status_time
         if elapsed >= 0.5:
             self.capture_rate = max(0, bytes_now - self._last_capture_bytes) / elapsed
@@ -4208,8 +4215,8 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         elif paused:
             self.status_state.config(text='Paused', fg='#ff9800')
             self.status_firewall.config(text='Firewall: Rules remain active')
-        elif not self.capture_healthy:
-            self.status_state.config(text='Capture failed' if self.capture_error is not None else 'Starting capture', fg='#f44336')
+        elif not capture_healthy:
+            self.status_state.config(text='Capture failed' if capture_error is not None else 'Starting capture', fg='#f44336')
             self.status_firewall.config(text='Firewall: Rules active; Auto-Block unavailable')
         else:
             self.status_state.config(text='Monitoring', fg='#4CAF50')
