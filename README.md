@@ -34,7 +34,7 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 ## Installation
 
-### Method 1 (easy)
+### Method 1 (recommended)
 
 1. Download and unpack the latest PyFirewall.zip from [here](https://github.com/EolnMsuk/PyFirewall/releases).
 2. Keep the project files in the same directory.
