@@ -1498,14 +1498,33 @@ class FirewallMonitorApp:
         )
         support.pack(fill=tk.X, pady=18)
 
-        github_url = 'https://github.com/EolnMsuk/PyFirewall'
         venmo_url = 'https://venmo.com/u/rustonrails'
+        github_url = 'https://github.com/EolnMsuk/PyFirewall'
 
         def open_support_link(url):
             try:
                 os.startfile(url)
             except OSError:
                 pass
+
+        def bind_support_link(widget, url):
+            widget.bind('<Button-1>', lambda _event: open_support_link(url))
+            menu = tk.Menu(widget, tearoff=False)
+
+            def copy_link():
+                self.root.clipboard_clear()
+                self.root.clipboard_append(url)
+
+            menu.add_command(label='Copy Link', command=copy_link)
+
+            def show_link_menu(event):
+                try:
+                    menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    menu.grab_release()
+                return 'break'
+
+            widget.bind('<Button-3>', show_link_menu)
 
         try:
             import base64
@@ -1548,23 +1567,11 @@ class FirewallMonitorApp:
                         highlightthickness=0,
                         relief=tk.FLAT
                     )
-                    icon_label.pack(anchor=tk.W, pady=(0, 8))
-                    icon_label.bind('<Button-1>', lambda _event: open_support_link(github_url))
+                    icon_label.grid(row=0, column=0, rowspan=2, sticky=tk.W, padx=(0, 16))
+                    bind_support_link(icon_label, github_url)
                     add_tooltip(icon_label, 'Open the PyFirewall GitHub page.')
         except (OSError, ValueError, struct.error, tk.TclError):
             pass
-
-        github_label = tk.Label(
-            support,
-            text='GitHub • github.com/EolnMsuk/PyFirewall',
-            bg=self.colors['frame'],
-            fg=self.colors['select'],
-            cursor='hand2',
-            font=('Segoe UI', 9, 'underline')
-        )
-        github_label.pack(anchor=tk.W, pady=2)
-        github_label.bind('<Button-1>', lambda _event: open_support_link(github_url))
-        add_tooltip(github_label, 'Open the PyFirewall GitHub repository.')
 
         donation_label = tk.Label(
             support,
@@ -1574,9 +1581,21 @@ class FirewallMonitorApp:
             cursor='hand2',
             font=('Segoe UI', 9, 'underline')
         )
-        donation_label.pack(anchor=tk.W, pady=2)
-        donation_label.bind('<Button-1>', lambda _event: open_support_link(venmo_url))
+        donation_label.grid(row=0, column=1, sticky=tk.SW, pady=2)
+        bind_support_link(donation_label, venmo_url)
         add_tooltip(donation_label, 'Open venmo.com/u/rustonrails in your default browser.')
+
+        github_label = tk.Label(
+            support,
+            text='GitHub • github.com/EolnMsuk/PyFirewall',
+            bg=self.colors['frame'],
+            fg=self.colors['select'],
+            cursor='hand2',
+            font=('Segoe UI', 9, 'underline')
+        )
+        github_label.grid(row=1, column=1, sticky=tk.NW, pady=2)
+        bind_support_link(github_label, github_url)
+        add_tooltip(github_label, 'Open the PyFirewall GitHub repository.')
 
         backup = tk.LabelFrame(outer, text='Export Rules', padx=18, pady=14)
         backup.pack(fill=tk.X, pady=(0, 18))
