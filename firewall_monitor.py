@@ -11,6 +11,7 @@ import ctypes
 from ctypes import wintypes
 import queue
 import subprocess
+import tempfile
 import threading
 import traceback
 from collections import deque
@@ -1600,11 +1601,15 @@ class FirewallMonitorApp:
         bind_support_link(github_label, github_url)
         add_tooltip(github_label, 'Open the PyFirewall GitHub repository.')
 
-        backup = tk.LabelFrame(outer, text='Export Rules', padx=18, pady=14)
+        backup = tk.LabelFrame(outer, text='Export / Import Rules', padx=18, pady=14)
         backup.pack(fill=tk.X, pady=(0, 18))
-        tk.Label(backup, text='Save your managed application and global IP rules to a JSON backup.',
+        tk.Label(backup, text='Save managed application and global IP rules to a JSON backup, or restore them from a backup file.',
                  fg=self.colors['muted'], wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
-        self._button(backup, 'Export Rules', self.export_rules)
+        backup_buttons = tk.Frame(backup)
+        backup_buttons.pack(anchor=tk.W)
+        self._button(backup_buttons, 'Export Rules', self.export_rules)
+        self._button(backup_buttons, 'Import Rules', self.import_rules,
+                     tooltip='Restore managed application and global IP rules from a JSON backup file.')
 
         danger = tk.LabelFrame(outer, text='Danger Zone', padx=18, pady=14)
         danger.pack(fill=tk.X)
@@ -1910,7 +1915,7 @@ class FirewallMonitorApp:
         except Exception as exc:
             messagebox.showerror('Reset Failed', str(exc))
 
-    def _run(self, args, check=True):
+    def _run(self, args, check=True, timeout=None):
         return subprocess.run(
             args,
             stdout=subprocess.PIPE,
@@ -1918,11 +1923,21 @@ class FirewallMonitorApp:
             text=True,
             check=check,
             creationflags=CREATE_NO_WINDOW,
-            timeout=FIREWALL_COMMAND_TIMEOUT,
+            timeout=FIREWALL_COMMAND_TIMEOUT if timeout is None else timeout,
         )
 
-    def run_ps(self, command, check=True):
-        return self._run(('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command), check)
+    def run_ps(self, command, check=True, timeout=None):
+        args = ('powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass')
+        options = {} if timeout is None else {'timeout': timeout}
+        # Large imports exceed Windows' command-line limit. A BOM also preserves
+        # Unicode paths when Windows PowerShell 5.1 reads the temporary script.
+        if len(command.encode('utf-16-le')) > 16000:
+            with tempfile.TemporaryDirectory(prefix='pyfirewall-') as directory:
+                path = os.path.join(directory, 'rules.ps1')
+                with open(path, 'w', encoding='utf-8-sig') as script:
+                    script.write(command)
+                return self._run((*args, '-File', path), check, **options)
+        return self._run((*args, '-Command', command), check, **options)
 
     def run_netsh(self, args, check=True):
         return self._run(('netsh', 'advfirewall', 'firewall', *args), check)
@@ -1934,7 +1949,7 @@ class FirewallMonitorApp:
         command = "$ErrorActionPreference='Stop'\n$names=@(" + ','.join(self._ps_quote(n) for n in names) + ")\n"
         command += '''
 $existing = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.DisplayName -in $names })
-foreach ($r in $existing) { $r | Remove-NetFirewallRule -ErrorAction Stop }
+if ($existing.Count) { $existing | Remove-NetFirewallRule -ErrorAction Stop }
 $remaining = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.DisplayName -in $names })
 if ($remaining.Count) { throw ('Firewall rules could not be removed: ' + ($remaining.DisplayName -join ', ')) }
 if ($existing.Count) { 'removed' } else { 'absent' }
@@ -1962,13 +1977,18 @@ if ($existing.Count) { 'removed' } else { 'absent' }
             raise RuntimeError('Firewall rules could not be removed: ' + ', '.join(sorted(remaining)))
         return bool(names & existing)
 
-    def _replace_rule_records(self, previous, desired_names, apply, apply_first=False):
+    def _replace_rule_records(self, previous, desired_names, apply, apply_first=False, preserve_holds=False):
         names = {r['name'] for r in previous} | set(desired_names)
         try:
-            if apply_first:
+            if preserve_holds:
+                self.delete_rule_names(r['name'] for r in previous if not r.get('is_hold'))
                 apply()
-            self.delete_rule_names(r['name'] for r in previous)
-            if not apply_first:
+                self.delete_rule_names(r['name'] for r in previous if r.get('is_hold'))
+            elif apply_first:
+                apply()
+                self.delete_rule_names(r['name'] for r in previous)
+            else:
+                self.delete_rule_names(r['name'] for r in previous)
                 apply()
         except Exception as error:
             cleanup_error = None
@@ -2381,8 +2401,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             global_blocks = list(self.global_blocks)
             global_allows = list(self.global_allows)
         records = self.get_firewall_rules()
-        for path in allowed:
-            self.delete_rule_names((r['name'] for r in records if r['normalized_path'] == path))
+        requests = [(path, True, 'both', False) for path in allowed]
         for rule in pending:
             path = display_path(rule['path'])
             norm = normalize_path(path)
@@ -2396,19 +2415,11 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     if 'out' in d:
                         actual.add('out')
             if actual != wanted:
-                proc_name = os.path.splitext(os.path.basename(path))[0]
-                base = self.app_rule_base(proc_name, path)
-                self._replace_rule_records([r for r in records if r['normalized_path'] == norm],
-                                           (base + '_In', base + '_Out'),
-                                           lambda: self.add_app_rules(proc_name, path, rule['direction']))
-        for target in global_blocks:
-            target, addresses = self.add_global_rule_sync(target, False)
-            with self.lock:
-                self.global_blocks[target] = {'addresses': addresses}
-        for target in global_allows:
-            target, addresses = self.add_global_rule_sync(target, True)
-            with self.lock:
-                self.global_allows[target] = {'addresses': addresses}
+                requests.append((path, False, rule['direction'], False))
+        requests.extend((target, False, 'both', True) for target in global_blocks)
+        requests.extend((target, True, 'both', True) for target in global_allows)
+        if requests:
+            self._commit_rule_batch(requests, records=records)
         with self.lock:
             self.pending_rules.clear()
 
@@ -2497,36 +2508,165 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         else:
             messagebox.showwarning('Rule Already Exists', text)
 
-    def _apply_rule_batch(self, requests):
-        """Preflight a UI selection, warn once, and refresh only after changes."""
-        pending, duplicates, seen = [], [], set()
-        for request in requests:
-            target, allow, direction, global_target = request
+    def _create_rule_batch(self, rules):
+        """Create and verify every planned rule in one PowerShell process."""
+        if not rules:
+            return
+        payload = self._ps_quote(json.dumps(rules, ensure_ascii=True))
+        command = "$ErrorActionPreference='Stop'\n$rules=ConvertFrom-Json " + payload + '\n'
+        command += '''
+function Get-AddressKey([string]$address) {
+    $parts = $address.Split('/')
+    $ip = [System.Net.IPAddress]::Parse($parts[0])
+    $bits = $ip.GetAddressBytes().Length * 8
+    $prefix = $bits
+    if ($parts.Length -gt 1) {
+        if ($parts[1].Contains('.')) {
+            $prefix = 0
+            foreach ($byte in ([System.Net.IPAddress]::Parse($parts[1])).GetAddressBytes()) {
+                $prefix += ([Convert]::ToString($byte, 2).Replace('0', '')).Length
+            }
+        } else { $prefix = [int]$parts[1] }
+    }
+    $ip.ToString() + '/' + $prefix
+}
+foreach ($rule in $rules) {
+    $params = @{
+        Name=[string]$rule.name; DisplayName=[string]$rule.name
+        Direction=[string]$rule.direction; Action=[string]$rule.action
+        Enabled='True'; Profile='Any'; ErrorAction='Stop'
+    }
+    if ($rule.path) { $params.Program=[string]$rule.path }
+    else { $params.RemoteAddress=[string[]]$rule.addresses }
+    New-NetFirewallRule @params | Out-Null
+}
+foreach ($rule in $rules) {
+    $r = Get-NetFirewallRule -Name $rule.name -ErrorAction Stop
+    if (@($r).Count -ne 1 -or [string]$r.Enabled -ne 'True' -or
+        [string]$r.Action -ne $rule.action -or [string]$r.Direction -ne $rule.direction) {
+        throw ('Firewall rule verification failed: ' + $rule.name)
+    }
+    if ($rule.path) {
+        $filter = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop |
+            Select-Object -First 1
+        if (-not $filter -or -not [string]::Equals([string]$filter.Program,
+            [string]$rule.path, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw ('Wrong program for firewall rule: ' + $rule.name)
+        }
+    } else {
+        $actual = @((Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $r -ErrorAction Stop).RemoteAddress)
+        $expectedKeys = @($rule.addresses | ForEach-Object { Get-AddressKey $_ } | Sort-Object -Unique)
+        $actualKeys = @($actual | ForEach-Object { Get-AddressKey $_ } | Sort-Object -Unique)
+        if (-not $actualKeys.Count -or (Compare-Object $expectedKeys $actualKeys)) {
+            throw ('Wrong addresses for firewall rule: ' + $rule.name)
+        }
+    }
+}
+'''
+        self.run_ps(command, timeout=max(FIREWALL_COMMAND_TIMEOUT, len(rules) * 2.0))
+
+    def _commit_rule_batch(self, requests, records=None):
+        """Caller holds firewall_lock; publish caches only after the transaction."""
+        planned, apps, globals_, global_names = [], {}, {}, set()
+        for target, allow, direction, global_target in requests:
+            if global_target:
+                try:
+                    target = str(ipaddress.ip_network(target, strict=False)) if '/' in target else str(ipaddress.ip_address(target))
+                except ValueError:
+                    pass
+                addresses = self.resolve_global_target(target)
+                if not addresses:
+                    raise ValueError(f'No addresses found for {target}.')
+                globals_[target] = (allow, addresses)
+                base = self.global_rule_base(target, allow)
+                other = self.global_rule_base(target, not allow)
+                global_names.update(f'{prefix}_{side}' for prefix in (base, other) for side in ('In', 'Out'))
+                for suffix, side in (('In', 'Inbound'), ('Out', 'Outbound')):
+                    planned.append({'name': base + '_' + suffix, 'direction': side,
+                                    'action': 'Allow' if allow else 'Block', 'path': '',
+                                    'addresses': list(addresses)})
+            else:
+                norm = normalize_path(target)
+                wanted = direction_set(direction)
+                apps[norm] = (target, allow, wanted)
+                # Application allows are exclusions from monitoring; as in the
+                # single-rule path they remove blocks without creating allow rules.
+                if not allow:
+                    base = self.app_rule_base(None, target)
+                    for side in sorted(wanted):
+                        planned.append({'name': base + ('_In' if side == 'in' else '_Out'),
+                                        'direction': 'Inbound' if side == 'in' else 'Outbound',
+                                        'action': 'Block', 'path': target})
+        if records is None:
+            records = self.get_firewall_rules()
+        previous = [r for r in records if r.get('normalized_path') in apps or r['name'] in global_names
+                    or (globals_ and r.get('is_hold'))]
+        # Keep temporary blocks in place until all replacement rules verify.
+        self._replace_rule_records(previous, [r['name'] for r in planned],
+                                   lambda: self._create_rule_batch(planned), preserve_holds=True)
+        with self.lock:
+            for norm, (path, allow, wanted) in apps.items():
+                if allow:
+                    self.allowed_apps.add(norm)
+                    self.blocked_paths.pop(norm, None)
+                else:
+                    self.allowed_apps.discard(norm)
+                    self.blocked_paths[norm] = {'path': path, 'in': 'in' in wanted, 'out': 'out' in wanted}
+            self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] not in apps}
+            self.upload_alerted = {k for k in self.upload_alerted if k[0] not in apps or not apps[k[0]][1]}
+            for target, (allow, addresses) in globals_.items():
+                destination = self.global_allows if allow else self.global_blocks
+                other = self.global_blocks if allow else self.global_allows
+                destination[target] = {'addresses': addresses}
+                other.pop(target, None)
+        return apps, bool(globals_)
+
+    def _apply_rule_batch(self, requests, quiet=False):
+        """Apply a whole selection/import with one snapshot, save and refresh."""
+        selected = {}
+        for target, allow, direction, global_target in requests:
             target = normalize_target(target) if global_target else display_path(target)
             if not target:
                 continue
-            key = (target if global_target else normalize_path(target), allow,
-                   frozenset(direction_set(direction)), global_target)
-            if key in seen:
-                continue
-            seen.add(key)
-            if self._rule_is_duplicate(target, allow, direction, global_target):
-                duplicates.append(target)
-            else:
-                pending.append((target, allow, direction, global_target))
-        if duplicates:
+            if global_target:
+                try:
+                    target = str(ipaddress.ip_network(target, strict=False)) if '/' in target else str(ipaddress.ip_address(target))
+                except ValueError:
+                    pass
+            key = (target if global_target else normalize_path(target), global_target)
+            # Preserve the old sequential import's final state for conflicting entries.
+            selected[key] = (target, allow, direction, global_target)
+        if not selected:
+            return True
+        try:
+            with self.firewall_lock:
+                pending, duplicates = [], []
+                for request in selected.values():
+                    if self._rule_is_duplicate(*request):
+                        duplicates.append(request[0])
+                    else:
+                        pending.append(request)
+                if pending:
+                    apps, global_changed = self._commit_rule_batch(pending)
+                    if global_changed:
+                        self._invalidate_auto_prompts(close_dialog=True)
+                    else:
+                        for norm in apps:
+                            self._cancel_app_prompt(norm)
+            if pending:
+                self.save_settings()
+                self.rules_changed()
+        except Exception as exc:
+            details = error_details(exc)
+            log_internal_error('rule_batch', exc)
+            self.queue_alert('High', 'Bulk rules', '', '', f'Firewall rule update failed: {details}')
+            if not quiet:
+                messagebox.showerror('Rule Update Failed', details)
+            return False
+        if duplicates and not quiet:
             messagebox.showwarning('Rules Already Exist',
                                    f'Skipped {len(duplicates)} existing rule(s):\n' + '\n'.join(duplicates))
-        changed = False
-        for target, allow, direction, global_target in pending:
-            if global_target:
-                changed |= self.add_global_rule(target, allow, refresh=False, quiet=True)
-            elif allow:
-                changed |= self.allow_executable(target, refresh=False, quiet=True)
-            else:
-                changed |= self.block_executable(target, direction=direction, refresh=False, quiet=True)
-        if changed:
-            self.rules_changed()
+        return True
 
     def block_executable(self, exe_path, proc_name=None, direction='both', refresh=True, quiet=False, update_ui=True):
         path = display_path(exe_path)
@@ -2634,23 +2774,36 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             return False
 
     def remove_rule(self, status, path, refresh=True):
-        status = str(status).casefold()
+        return self._remove_rule_batch(((status, path),), refresh=refresh)
+
+    def _remove_rule_batch(self, requests, refresh=True):
+        apps, globals_ = set(), set()
+        for status, path in requests:
+            status = str(status).casefold()
+            if status in {'global block', 'global allow'}:
+                target = normalize_target(str(path).split(' (', 1)[0])
+                if target:
+                    globals_.add((target, status == 'global allow'))
+            else:
+                norm = normalize_path(path)
+                if norm:
+                    apps.add(norm)
+        if not apps and not globals_:
+            return False
         try:
             with self.firewall_lock:
                 records = self.get_firewall_rules()
-                if status in {'global block', 'global allow'}:
-                    target = normalize_target(str(path).split(' (', 1)[0])
-                    allow = status == 'global allow'
-                    base = self.global_rule_base(target, allow)
-                    self._replace_rule_records([r for r in records if r['name'].startswith(base)], (), lambda: None)
-                    with self.lock:
+                names = {self.global_rule_base(target, allow) + '_' + side
+                         for target, allow in globals_ for side in ('In', 'Out')}
+                previous = [r for r in records if r.get('normalized_path') in apps or r['name'] in names]
+                self._replace_rule_records(previous, (), lambda: None)
+                with self.lock:
+                    for target, allow in globals_:
                         (self.global_allows if allow else self.global_blocks).pop(target, None)
-                else:
-                    norm = normalize_path(path)
-                    self._replace_rule_records([r for r in records if r['normalized_path'] == norm], (), lambda: None)
-                    with self.lock:
+                    for norm in apps:
                         self.allowed_apps.discard(norm)
                         self.blocked_paths.pop(norm, None)
+                for norm in apps:
                     self._cancel_app_prompt(norm)
             self.save_settings()
             if refresh:
@@ -3701,26 +3854,20 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
 
     def remove_selected_rule(self, event=None):
         rows = self.selected_rows(self.rules_tree)
-        if not rows:
-            return
-        changed = False
-        for _, values in rows:
-            if len(values) >= 6:
-                changed |= self.remove_rule(values[0], values[-1], refresh=False)
-        if changed:
-            self.rules_changed()
+        self._remove_rule_batch((values[0], values[-1]) for _, values in rows if len(values) >= 6)
 
     def remove_selected_connection_rules(self, tree):
         rows = self.selected_connection_data(tree)
+        requests = []
         for row in rows:
             status = self.get_rule_status(row.get('exe', ''))
             if status:
-                self.remove_rule(status, row['exe'], refresh=False)
+                requests.append((status, row['exe']))
             elif self.is_globally_blocked(row['dst_ip'], row.get('domain', '')):
-                self.remove_rule('Global Block', row.get('domain') or row['dst_ip'], refresh=False)
+                requests.append(('Global Block', row.get('domain') or row['dst_ip']))
             elif self.is_globally_allowed(row['dst_ip'], row.get('domain', '')):
-                self.remove_rule('Global Allow', row.get('domain') or row['dst_ip'], refresh=False)
-        self.rules_changed()
+                requests.append(('Global Allow', row.get('domain') or row['dst_ip']))
+        self._remove_rule_batch(requests)
 
     def bulk_global(self, tree, allow, domain=False):
         targets = set()
@@ -3876,15 +4023,14 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         self._apply_rule_batch((target, allow, 'both', True) for target in targets)
 
     def remove_selected_alert_rules(self):
-        changed = False
+        requests = []
         for _, values in self.selected_rows(self.alerts_tree):
             row, remote_ip = self.alert_context(values)
             if row and row.get('exe'):
                 status = self.get_rule_status(row['exe'])
                 if status:
-                    changed |= self.remove_rule(status, row['exe'], refresh=False)
-        if changed:
-            self.rules_changed()
+                    requests.append((status, row['exe']))
+        self._remove_rule_batch(requests)
 
     def export_connections(self, tree=None):
         tree = tree or self.tree
@@ -3930,39 +4076,28 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             rules = data.get('rules', data.get('managed_rules', []))
             blocks = data.get('global_ip_blocks', []) or []
             allows = data.get('global_ip_allows', []) or []
-            total = len(rules) + len(blocks) + len(allows)
-            if not total:
-                messagebox.showerror('Import Rules', 'No valid managed rules were found.')
-                return
-            if not messagebox.askyesno('Import Rules', f'Apply {total} imported rule(s)?'):
-                return
-            failures = []
+            if not all(isinstance(entries, list) for entries in (rules, blocks, allows)):
+                raise ValueError('Rule collections must be JSON arrays.')
+            requests = []
             for rule in rules:
                 if not isinstance(rule, dict):
                     continue
                 path_value = display_path(rule.get('path', ''))
-                if not path_value:
-                    continue
-                action = str(rule.get('action', 'Block')).casefold()
-                if 'allow' in action:
-                    if not self.allow_executable(path_value, refresh=False, quiet=True):
-                        failures.append(path_value)
-                else:
-                    if not self.block_executable(path_value, os.path.splitext(os.path.basename(path_value))[0] or 'Process', direction_name(rule.get('direction', 'Both')), refresh=False, quiet=True):
-                        failures.append(path_value)
-            for entry in blocks:
-                target = entry.get('target', '') if isinstance(entry, dict) else entry
-                if target:
-                    if not self.add_global_rule(target, False, refresh=False, quiet=True):
-                        failures.append(target)
-            for entry in allows:
-                target = entry.get('target', '') if isinstance(entry, dict) else entry
-                if target:
-                    if not self.add_global_rule(target, True, refresh=False, quiet=True):
-                        failures.append(target)
-            self.rules_changed()
-            if failures:
-                messagebox.showerror('Import Incomplete', 'Failed rules:\n' + '\n'.join(failures))
+                if path_value:
+                    requests.append((path_value, 'allow' in str(rule.get('action', 'Block')).casefold(),
+                                     direction_name(rule.get('direction', 'Both')), False))
+            for entries, allow in ((blocks, False), (allows, True)):
+                for entry in entries:
+                    target = entry.get('target', '') if isinstance(entry, dict) else entry
+                    if isinstance(target, str) and normalize_target(target):
+                        requests.append((target, allow, 'both', True))
+            if not requests:
+                messagebox.showerror('Import Rules', 'No valid managed rules were found.')
+                return
+            if not messagebox.askyesno('Import Rules', f'Apply {len(requests)} imported rule(s)?'):
+                return
+            if not self._apply_rule_batch(requests, quiet=True):
+                messagebox.showerror('Import Incomplete', 'The rule batch could not be applied. See Alerts for details.')
             else:
                 messagebox.showinfo('Import Complete', 'Imported rules were applied.')
         except Exception as exc:
