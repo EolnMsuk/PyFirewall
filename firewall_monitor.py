@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 try:
     import psutil
-    from scapy.all import sniff, IP, IPv6, TCP, UDP
+    from scapy.all import conf, sniff, IP, IPv6, TCP, UDP
 except ImportError as exc:
     raise SystemExit(f'Missing dependency: {exc}. Install psutil, scapy, and Npcap first.')
 DEFAULT_RATE_THRESHOLD = 50
@@ -130,7 +130,7 @@ def display_path(path):
 def normalize_target(target):
     value = str(target or '').strip().strip('[]').casefold().rstrip('.')
     try:
-        return str(ipaddress.ip_address(value))
+        return str(ipaddress.ip_network(value, strict=False)) if '/' in value else str(ipaddress.ip_address(value))
     except ValueError:
         return value
 
@@ -539,6 +539,7 @@ class FirewallMonitorApp:
         self.local_addresses = set()
         self.capture_error = None
         self.capture_healthy = False
+        self.capture_interface = None
         self.filter_all_enabled = True
         self.filter_all_saved_alerts = None
         self.filter_all_saved_auto_block = None
@@ -568,6 +569,7 @@ class FirewallMonitorApp:
         self.alert_sort = ['Time', True]
         self.load_settings()
         self.setup_gui()
+        self._fit_initial_window()
         self.root.protocol('WM_DELETE_WINDOW', self.minimize_to_tray)
         try:
             self.tray = PyFirewallSystemTray(self.tray_command_queue, filter_all_enabled=self.filter_all_enabled, is_paused=self.is_paused)
@@ -731,6 +733,8 @@ class FirewallMonitorApp:
                     pass
                 repaint(widget)
         repaint(self.root)
+        if hasattr(self, 'settings_canvas'):
+            self.settings_canvas.configure(bg=self.colors['frame'])
         self.configure_tags()
         self.update_filter_ui()
         self.update_status()
@@ -791,6 +795,26 @@ class FirewallMonitorApp:
         self.root.bind_all('<Delete>', self._on_global_delete_key, add='+')
         self.root.bind_all('<KP_Delete>', self._on_global_delete_key, add='+')
         self.apply_theme()
+
+    def _fit_initial_window(self):
+        """Size the first window from Settings content, including DPI-scaled fonts."""
+        self.root.update_idletasks()
+        content = self.settings_canvas.winfo_children()[0]
+        self.settings_canvas.configure(height=content.winfo_reqheight())
+        self.root.update_idletasks()
+        width = max(1800, self.root.winfo_reqwidth())
+        height = max(900, self.root.winfo_reqheight())
+        work_area = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(work_area), 0):
+            # Leave room for the taskbar, title bar, and resize borders.
+            user32 = ctypes.windll.user32
+            frame_x = user32.GetSystemMetrics(32) + user32.GetSystemMetrics(92)
+            frame_y = user32.GetSystemMetrics(33) + user32.GetSystemMetrics(92)
+            width = min(width, work_area.right - work_area.left - 2 * frame_x)
+            height = min(height, work_area.bottom - work_area.top
+                         - user32.GetSystemMetrics(4) - 2 * frame_y)
+        self.root.minsize(min(1500, width), min(750, height))
+        self.root.geometry(f'{width}x{height}')
 
     def _on_f5(self, _event=None):
         if hasattr(self, 'notebook') and self.notebook.select() == str(self.tab_rules):
@@ -1352,7 +1376,7 @@ class FirewallMonitorApp:
     def setup_monitor_tab(self):
         bar = tk.Frame(self.tab_monitor, pady=8)
         bar.pack(fill=tk.X)
-        self._button(bar, 'Block Selected', self.block_process, '#f44336')
+        self._button(bar, 'Block Selected', self.block_process, '#c62828')
         self._button(bar, 'Allow Selected', self.allow_process, '#4CAF50')
         self._button(bar, 'Export CSV', self.export_connections)
         self._button(bar, 'Clear List', self.clear_list)
@@ -1365,7 +1389,7 @@ class FirewallMonitorApp:
     def setup_active_tab(self):
         bar = tk.Frame(self.tab_active, pady=8)
         bar.pack(fill=tk.X)
-        self._button(bar, 'Block Selected', lambda: self.block_process(self.active_tree), '#f44336')
+        self._button(bar, 'Block Selected', lambda: self.block_process(self.active_tree), '#c62828')
         self._button(bar, 'Allow Selected', lambda: self.allow_process(self.active_tree), '#4CAF50')
         self._button(bar, 'Export CSV', lambda: self.export_connections(self.active_tree))
         self.active_search_var.trace_add('write', lambda *_: self.render_active())
@@ -1381,7 +1405,7 @@ class FirewallMonitorApp:
         self._button(bar, 'Add Custom Rule', self.add_custom_rule, '#ff9800')
         self._button(bar, 'Allow Global IP', lambda: self.add_global_target('Allow'), '#90CAF9')
         self._button(bar, 'Block Global IP', lambda: self.add_global_target('Block'), '#7B1FA2')
-        self._button(bar, 'Remove Selected', self.remove_selected_rule, '#f44336')
+        self._button(bar, 'Remove Selected', self.remove_selected_rule, '#c62828')
         self._button(bar, 'Export Rules', self.export_rules)
         self._button(bar, 'Import Rules', self.import_rules)
         self._button(bar, 'Windows Firewall', self.open_windows_firewall)
@@ -1404,8 +1428,42 @@ class FirewallMonitorApp:
         self.alerts_tree = self._make_tree(self.tab_alerts, self.ALERT_COLUMNS, {'Time': (85, tk.CENTER, False), 'Severity': (90, tk.CENTER, False), 'Process': (170, tk.W, True), 'PID': (70, tk.CENTER, False), 'Remote IP': (170, tk.W, True), 'Remote Host': (180, tk.W, True), 'Reason': (480, tk.W, True)}, 'alerts')
 
     def setup_settings_tab(self):
-        outer = tk.Frame(self.tab_settings, padx=30, pady=25)
-        outer.pack(fill=tk.BOTH, expand=True)
+        # Keep Export Rules and Danger Zone reachable at the minimum window size.
+        canvas = self.settings_canvas = tk.Canvas(self.tab_settings, highlightthickness=0, bd=0,
+                                                  bg=self.colors['frame'])
+        scrollbar = ttk.Scrollbar(self.tab_settings, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        outer = tk.Frame(canvas, padx=30, pady=25)
+        content = canvas.create_window((0, 0), window=outer, anchor=tk.NW)
+        def update_scroll_region(_event=None):
+            viewport_height = canvas.winfo_height()
+            content_height = outer.winfo_reqheight()
+            overflow = content_height > viewport_height
+            # A scroll region smaller than the viewport lets Tk move the page
+            # into blank space. Pin it to the viewport when everything fits.
+            canvas.configure(scrollregion=(0, 0, canvas.winfo_width(),
+                                           max(content_height, viewport_height)))
+            if overflow:
+                if not scrollbar.winfo_manager():
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y, before=canvas)
+            else:
+                scrollbar.pack_forget()
+                canvas.yview_moveto(0)
+
+        def resize_settings(event):
+            canvas.itemconfigure(content, width=event.width)
+            update_scroll_region()
+
+        outer.bind('<Configure>', update_scroll_region)
+        canvas.bind('<Configure>', resize_settings)
+
+        def scroll_settings(event):
+            if (str(event.widget).startswith(str(self.tab_settings) + '.')
+                    and outer.winfo_height() > canvas.winfo_height() and event.delta):
+                canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
+                return 'break'
+        self.root.bind('<MouseWheel>', scroll_settings, add='+')
         frame = tk.LabelFrame(outer, text='Auto-Block Protection', padx=18, pady=14)
         frame.pack(fill=tk.X)
         self.chk_alerts = ttk.Checkbutton(frame, text='Enable Alerts (required for Auto-Block)', variable=self.log_alerts_var, command=self.on_log_alerts_changed)
@@ -1479,7 +1537,7 @@ class FirewallMonitorApp:
                             factor -= 1
                         icon_image = icon_image.subsample(factor, factor)
 
-                    self.settings_icon_photo = icon_image
+                    self.settings_icon_photo = icon_image.subsample(2, 2)
 
                     icon_label = tk.Label(
                         support,
@@ -1520,6 +1578,12 @@ class FirewallMonitorApp:
         donation_label.bind('<Button-1>', lambda _event: open_support_link(venmo_url))
         add_tooltip(donation_label, 'Open venmo.com/u/rustonrails in your default browser.')
 
+        backup = tk.LabelFrame(outer, text='Export Rules', padx=18, pady=14)
+        backup.pack(fill=tk.X, pady=(0, 18))
+        tk.Label(backup, text='Save your managed application and global IP rules to a JSON backup.',
+                 fg=self.colors['muted'], wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
+        self._button(backup, 'Export Rules', self.export_rules)
+
         danger = tk.LabelFrame(outer, text='Danger Zone', padx=18, pady=14)
         danger.pack(fill=tk.X)
         tk.Label(danger, text='Reset saved settings and remove only PyFirewall_* rules.', fg=self.colors['muted'], wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
@@ -1550,7 +1614,7 @@ class FirewallMonitorApp:
             text = ('🔒' if self.filter_all_enabled else '🔓') + f"  Filter All Connections {('ON' if self.filter_all_enabled else 'OFF')}"
             color, state, fg = ('#9E9E9E', tk.DISABLED, '#ffffff')
         elif self.filter_all_enabled:
-            text, color, state, fg = ('🔒  Filter All Connections ON', '#f44336', tk.NORMAL, '#ffffff')
+            text, color, state, fg = ('🔒  Filter All Connections ON', '#c62828', tk.NORMAL, '#ffffff')
         else:
             text, color, state, fg = ('🔓  Filter All Connections OFF', '#9E9E9E', tk.NORMAL, '#ffffff')
         if hasattr(self, 'btn_filter'):
@@ -2386,14 +2450,72 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def rules_changed(self):
         self.refresh_rules(force=True)
 
+    def _rule_is_duplicate(self, target, allow=False, direction='both', global_target=False):
+        """Use the managed-rule cache; never launch a firewall command to check."""
+        with self.lock:
+            if global_target:
+                target = normalize_target(target)
+                collection = self.global_allows if allow else self.global_blocks
+                return target in collection
+            norm = normalize_path(target)
+            if allow:
+                return norm in self.allowed_apps and norm not in self.blocked_paths
+            data = self.blocked_paths.get(norm, {})
+            actual = {side for side in ('in', 'out') if data.get(side)}
+            return norm not in self.allowed_apps and actual == direction_set(direction)
+
+    def _warn_duplicate_rule(self, target, quiet=False):
+        text = f'The requested rule already exists and was skipped:\n{target}'
+        if quiet:
+            self.queue_alert('Info', 'Duplicate rule', '', '', text)
+        else:
+            messagebox.showwarning('Rule Already Exists', text)
+
+    def _apply_rule_batch(self, requests):
+        """Preflight a UI selection, warn once, and refresh only after changes."""
+        pending, duplicates, seen = [], [], set()
+        for request in requests:
+            target, allow, direction, global_target = request
+            target = normalize_target(target) if global_target else display_path(target)
+            if not target:
+                continue
+            key = (target if global_target else normalize_path(target), allow,
+                   frozenset(direction_set(direction)), global_target)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._rule_is_duplicate(target, allow, direction, global_target):
+                duplicates.append(target)
+            else:
+                pending.append((target, allow, direction, global_target))
+        if duplicates:
+            messagebox.showwarning('Rules Already Exist',
+                                   f'Skipped {len(duplicates)} existing rule(s):\n' + '\n'.join(duplicates))
+        changed = False
+        for target, allow, direction, global_target in pending:
+            if global_target:
+                changed |= self.add_global_rule(target, allow, refresh=False, quiet=True)
+            elif allow:
+                changed |= self.allow_executable(target, refresh=False, quiet=True)
+            else:
+                changed |= self.block_executable(target, direction=direction, refresh=False, quiet=True)
+        if changed:
+            self.rules_changed()
+
     def block_executable(self, exe_path, proc_name=None, direction='both', refresh=True, quiet=False, update_ui=True):
         path = display_path(exe_path)
         norm = normalize_path(path)
         if not norm:
             return False
         proc_name = proc_name or os.path.splitext(os.path.basename(path))[0] or 'Process'
+        if self._rule_is_duplicate(path, direction=direction):
+            self._warn_duplicate_rule(path, quiet)
+            return True
         try:
             with self.firewall_lock:
+                if self._rule_is_duplicate(path, direction=direction):
+                    self._warn_duplicate_rule(path, quiet)
+                    return True  # The requested state is already satisfied.
                 records = self.get_firewall_rules()
                 previous = [r for r in records if r['normalized_path'] == norm]
                 base = self.app_rule_base(proc_name, path, 'Block')
@@ -2423,8 +2545,14 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         norm = normalize_path(path)
         if not norm:
             return False
+        if self._rule_is_duplicate(path, allow=True):
+            self._warn_duplicate_rule(path, quiet)
+            return True
         try:
             with self.firewall_lock:
+                if self._rule_is_duplicate(path, allow=True):
+                    self._warn_duplicate_rule(path, quiet)
+                    return True
                 records = self.get_firewall_rules()
                 previous = [r for r in records if r['normalized_path'] == norm]
                 self._replace_rule_records(previous, (), lambda: None)
@@ -2449,8 +2577,14 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         target = normalize_target(target)
         if not target:
             return False
+        if self._rule_is_duplicate(target, allow, global_target=True):
+            self._warn_duplicate_rule(target, quiet)
+            return True
         try:
             with self.firewall_lock:
+                if self._rule_is_duplicate(target, allow, global_target=True):
+                    self._warn_duplicate_rule(target, quiet)
+                    return True
                 target, addresses = self.add_global_rule_sync(target, allow)
                 with self.lock:
                     destination = self.global_allows if allow else self.global_blocks
@@ -3072,33 +3206,127 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         if active and not globally_blocked and not globally_allowed and not app_rule_exists:
             self.start_auto_block(proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail)
 
-    def start_sniffing(self):
-        while True:
-            with self.lock:
-                if not self.sniffing or self.closed:
-                    return
-                paused = self.is_paused
-            if paused:
-                time.sleep(0.25)
+    def _open_capture_socket(self):
+        """Resolve fresh Npcap device identities and validate by opening a socket.
+
+        conf.iface may refer to a removed VPN/USB adapter or to loopback. A
+        Windows adapter name alone does not prove Npcap can capture from it.
+        """
+        if not conf.use_pcap:
+            conf.use_pcap = True
+        if not conf.use_pcap:
+            raise OSError('Npcap capture is unavailable. Install or repair Npcap and restart PyFirewall.')
+        conf.ifaces.reload()  # Also refreshes the Windows provider's pcap device list.
+        conf.route.resync()
+        conf.route6.resync()
+        conf.ifaces.load_confiface()
+        stats = psutil.net_if_stats()
+        candidates = []
+        default_name = getattr(conf.iface, 'network_name', '')
+        for iface in conf.ifaces.values():
+            if not iface.is_valid() or not iface.network_name:
                 continue
+            if iface.network_name == conf.loopback_name:
+                continue
+            state = stats.get(iface.name) or stats.get(iface.description)
+            if state is not None and not state.isup:
+                continue
+            addresses = []
+            for version in (4, 6):
+                for address in iface.ips.get(version, []):
+                    try:
+                        addresses.append(ipaddress.ip_address(str(address).split('%', 1)[0]))
+                    except ValueError:
+                        continue
+            if not any(not ip.is_loopback and not ip.is_unspecified for ip in addresses):
+                continue
+            candidates.append(iface)
+        candidates.sort(key=lambda iface: (iface.network_name != default_name, iface.network_name))
+        errors = []
+        for iface in candidates:
+            with self.lock:
+                if self.closed or not self.sniffing or self.is_paused:
+                    return None
             try:
-                sniff(filter='ip or ip6', prn=self.packet_handler, store=False, timeout=1)
+                # Keep the validated socket: avoid a probe/open race and repeated
+                # Npcap opens every second. Normal IP capture needs no promiscuity.
+                capture_socket = conf.L2listen(iface=iface, filter='ip or ip6', promisc=False)
                 with self.lock:
-                    recovered = self.capture_error is not None
-                    self.capture_healthy = True
-                    self.capture_error = None
-                if recovered:
-                    self.queue_alert('Info', 'Packet capture', '', '', 'Packet capture recovered.')
+                    self.capture_interface = f'{iface.name} ({iface.network_name})'
+                return capture_socket
             except Exception as exc:
+                errors.append(f'{iface.name} ({iface.network_name}): {exc}')
+        detail = '; '.join(errors) if errors else 'Npcap exposes no active non-loopback IP adapter.'
+        raise OSError(f'{detail} Check that your network adapter is connected and Npcap is installed '
+                      'and bound to it; repair Npcap if needed. Capture will retry automatically.')
+
+    def _capture_wait(self, seconds):
+        # Bounded slices let shutdown/pause interrupt even the longest backoff.
+        for _ in range(max(1, int(seconds / 0.25))):
+            with self.lock:
+                if self.closed or not self.sniffing or self.is_paused:
+                    return
+            time.sleep(0.25)
+
+    @staticmethod
+    def _close_capture_socket(capture_socket):
+        if capture_socket is not None:
+            try:
+                capture_socket.close()
+            except Exception as exc:
+                log_internal_error('packet_capture_close', exc)
+
+    def start_sniffing(self):
+        capture_socket = None
+        refresh_at, retry_delay = 0.0, 1.0
+        try:
+            while True:
                 with self.lock:
-                    changed = self.capture_error != str(exc)
-                    self.capture_error = str(exc)
-                    self.capture_healthy = False
-                if changed:
-                    log_internal_error('packet_capture', exc)
-                    self.queue_alert('High', 'Packet capture', '', '',
-                                     f'Monitoring and Auto-Block unavailable: {exc}')
-                time.sleep(1)
+                    if not self.sniffing or self.closed:
+                        return
+                    paused = self.is_paused
+                if paused:
+                    self._close_capture_socket(capture_socket)
+                    capture_socket = None
+                    time.sleep(0.25)
+                    continue
+                try:
+                    # Periodic rediscovery handles silent disconnects and route
+                    # changes even when the old socket never raises an error.
+                    if capture_socket is None or time.monotonic() >= refresh_at:
+                        self._close_capture_socket(capture_socket)
+                        capture_socket = None
+                        capture_socket = self._open_capture_socket()
+                        if capture_socket is None:
+                            continue
+                        refresh_at = time.monotonic() + 30.0
+                    sniff(opened_socket=capture_socket, prn=self.packet_handler, store=False, timeout=1)
+                    # Scapy can swallow receive errors and close a supplied socket.
+                    if capture_socket.closed:
+                        raise OSError('The capture adapter disconnected or its socket was closed.')
+                    with self.lock:
+                        recovered = self.capture_error is not None
+                        self.capture_healthy = True
+                        self.capture_error = None
+                    retry_delay = 1.0
+                    if recovered:
+                        self.queue_alert('Info', 'Packet capture', '', '', 'Packet capture recovered.')
+                except Exception as exc:
+                    self._close_capture_socket(capture_socket)
+                    capture_socket = None
+                    with self.lock:
+                        changed = self.capture_error != str(exc)
+                        self.capture_error = str(exc)
+                        self.capture_healthy = False
+                        self.capture_interface = None
+                    if changed:
+                        log_internal_error('packet_capture', exc)
+                        self.queue_alert('High', 'Packet capture', '', '',
+                                         f'Monitoring and Auto-Block unavailable: {exc}')
+                    self._capture_wait(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30.0)
+        finally:
+            self._close_capture_socket(capture_socket)
 
     def install_auto_hold(self, proc_name, exe, remote_ip='', domain='', prompt_generation=None):
         norm = normalize_path(exe)
@@ -3428,37 +3656,22 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         direction = direction or self.ask_direction(prompt)
         if not direction:
             return
-        for row in paths.values():
-            self.block_executable(row['exe'], row['name'], direction, refresh=False, quiet=True)
-        self.rules_changed()
+        self._apply_rule_batch((row['exe'], False, direction, False) for row in paths.values())
 
     def allow_process(self, tree=None):
         tree = tree or self.tree
         rows = self.selected_connection_data(tree)
-        seen = set()
-        for row in rows:
-            norm = normalize_path(row.get('exe'))
-            if norm and norm not in seen:
-                seen.add(norm)
-                self.allow_executable(row['exe'], refresh=False, quiet=True)
-        if seen:
-            self.rules_changed()
+        self._apply_rule_batch((row.get('exe'), True, 'both', False) for row in rows)
 
     def rules_menu_allow(self):
-        for _, values in self.selected_rows(self.rules_tree):
-            if len(values) >= 6 and str(values[0]).casefold() not in {'global block', 'global allow'}:
-                self.allow_executable(values[-1], refresh=False, quiet=True)
-        self.rules_changed()
+        self._apply_rule_batch((values[-1], True, 'both', False)
+                               for _, values in self.selected_rows(self.rules_tree)
+                               if len(values) >= 6 and str(values[0]).casefold() not in {'global block', 'global allow'})
 
     def rules_menu_block(self, direction):
-        for _, values in self.selected_rows(self.rules_tree):
-            if len(values) < 6:
-                continue
-            if str(values[0]).casefold() in {'global block', 'global allow'}:
-                continue
-            path = values[-1]
-            self.block_executable(path, os.path.splitext(os.path.basename(path))[0] or 'Process', direction, refresh=False, quiet=True)
-        self.rules_changed()
+        self._apply_rule_batch((values[-1], False, direction, False)
+                               for _, values in self.selected_rows(self.rules_tree)
+                               if len(values) >= 6 and str(values[0]).casefold() not in {'global block', 'global allow'})
 
     def remove_selected_rule(self, event=None):
         rows = self.selected_rows(self.rules_tree)
@@ -3501,15 +3714,11 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             return
         if not messagebox.askyesno('Global Rule', f"{('Allow' if allow else 'Block')} {len(targets)} selected target(s) globally?"):
             return
-        for target in targets:
-            self.add_global_rule(target, allow, refresh=False, quiet=True)
-        self.rules_changed()
+        self._apply_rule_batch((target, allow, 'both', True) for target in targets)
 
     def bulk_rule_global(self, allow):
         targets = {normalize_target(str(values[-1]).split(' (', 1)[0]) for _, values in self.selected_rows(self.rules_tree) if len(values) >= 6}
-        for target in filter(None, targets):
-            self.add_global_rule(target, allow, refresh=False, quiet=True)
-        self.rules_changed()
+        self._apply_rule_batch((target, allow, 'both', True) for target in filter(None, targets))
 
     def _center_dialog(self, dialog, width=None, height=None):
         dialog.update_idletasks()
@@ -3617,16 +3826,14 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         return (None, remote_ip)
 
     def alert_action(self, allow, global_target, direction='both'):
+        requests = []
         for _, values in self.selected_rows(self.alerts_tree):
             row, remote_ip = self.alert_context(values)
             if global_target:
-                self.add_global_rule(remote_ip, allow, refresh=False, quiet=True)
+                requests.append((remote_ip, allow, 'both', True))
             elif row and row.get('exe'):
-                if allow:
-                    self.allow_executable(row['exe'], refresh=False, quiet=True)
-                else:
-                    self.block_executable(row['exe'], row['name'], direction, refresh=False, quiet=True)
-        self.rules_changed()
+                requests.append((row['exe'], allow, direction, False))
+        self._apply_rule_batch(requests)
 
     def alert_global_domain(self, allow):
         targets = set()
@@ -3640,9 +3847,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         if not targets:
             messagebox.showinfo('Global Domain Rule', 'No domain was linked to the selected alert.')
             return
-        for target in targets:
-            self.add_global_rule(target, allow, refresh=False, quiet=True)
-        self.rules_changed()
+        self._apply_rule_batch((target, allow, 'both', True) for target in targets)
 
     def remove_selected_alert_rules(self):
         changed = False
