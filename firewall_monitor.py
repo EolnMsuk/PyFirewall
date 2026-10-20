@@ -210,7 +210,7 @@ class ToolTip:
 def add_tooltip(widget, text, delay=400):
     widget._tooltip = ToolTip(widget, text, delay)
     return widget._tooltip
-BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add Custom Rule': 'Create an inbound or outbound application rule.', 'Allow Global IP': 'Allow an IP address or domain globally.', 'Block Global IP': 'Block an IP address or domain globally.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
+BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Allow Global IP': 'Allow an IP address or domain globally.', 'Block Global IP': 'Block an IP address or domain globally.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
 
 class PyFirewallSystemTray:
     WM_TRAYICON = 1024 + 1
@@ -1405,7 +1405,7 @@ class FirewallMonitorApp:
         bar = tk.Frame(self.tab_rules, pady=8)
         bar.pack(fill=tk.X)
         self._button(bar, 'Refresh Rules', self.refresh_rules, '#2196F3')
-        self._button(bar, 'Add Custom Rule', self.add_custom_rule, '#ff9800')
+        self._button(bar, 'Add App Rule', self.add_custom_rule, '#ff9800')
         self._button(bar, 'Allow Global IP', lambda: self.add_global_target('Allow'), '#90CAF9')
         self._button(bar, 'Block Global IP', lambda: self.add_global_target('Block'), '#7B1FA2')
         self._button(bar, 'Remove Selected', self.remove_selected_rule, '#c62828')
@@ -2803,7 +2803,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         def choose(value):
             result['value'] = value
             dialog.destroy()
-        for text, value, color, tip in (('Block In & Out', 'both', '#f44336', 'Block incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic and leave outgoing traffic allowed.')):
+        for text, value, color, tip in (('Block In & Out', 'both', '#c62828', 'Block incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic and leave outgoing traffic allowed.')):
             button = tk.Button(buttons, text=text, command=lambda v=value: choose(v), bg=color, fg='white', relief='flat')
             self._bind_button_hover(button)
             button.pack(fill=tk.X, pady=3)
@@ -4154,7 +4154,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                 self.queue_alert('High', exe, pid, remote_ip, f'Could not start firewall decision: {exc}')
                 result_queue.put(False)
             self.root.after(50, poll_decision)
-        action_specs = (('Block In & Out', 'both', '#f44336', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
+        action_specs = (('Block In & Out', 'both', '#c62828', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming Only', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
         for column, (label, choice, bg, tip) in enumerate(action_specs):
             button = tk.Button(buttons, text=label, command=lambda value=choice: finish(value), bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
             decision_buttons.append(button)
