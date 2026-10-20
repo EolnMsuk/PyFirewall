@@ -6,7 +6,7 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 ---
 
-<img width="1554" height="2591" alt="example" src="https://github.com/user-attachments/assets/521ea0f0-647f-4288-8b45-d16946022ed4" />
+<img width="1554" height="2591" alt="example" src="https://github.com/user-attachments/assets/d96e82fb-4829-4a1a-9c48-93529336c776" />
 
 ---
 
