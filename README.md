@@ -77,7 +77,7 @@ On each launch, PyFirewall saves the existing Windows Firewall profile settings,
 
 ## Known Issues
 
-- At first launch or when all managed firewall rules are removed, Windows will display a notification to enable Windows Defender Firewall.
+- If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator".
 
 ## Files
 
