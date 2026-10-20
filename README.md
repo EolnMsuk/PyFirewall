@@ -34,7 +34,7 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 ## Installation
 
-### Recommended
+### Recommended Method
 
 1. Keep the project files in the same directory.
 2. Right-click **`Install-PyFirewall.cmd`** and select **Run as administrator**.
@@ -44,7 +44,7 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 The installer offers to install and/or configure Python, Python packages, Npcap, Windows Firewall requirements, a desktop shortcut, and a scheduled task for starting PyFirewall at login.
 
-### Manual
+### Manual Method
 
 Install Python 3.8+ with Tcl/Tk and pip, install Npcap, then run:
 
