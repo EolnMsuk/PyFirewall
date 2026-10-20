@@ -193,8 +193,11 @@ class ToolTip:
         if self.tip or not str(text or '').strip():
             return
         try:
-            x = self.widget.winfo_rootx() + 10
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            # Use the pointer's current position after the hover delay, even if
+            # it moved within a wide control. Leave a little room for the cursor.
+            x, y = self.widget.winfo_pointerxy()
+            x += 12
+            y += 18
             tip = tk.Toplevel(self.widget)
             tip.wm_overrideredirect(True)
             tip.wm_geometry(f'+{x}+{y}')
