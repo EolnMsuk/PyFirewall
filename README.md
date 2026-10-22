@@ -2,7 +2,7 @@
 
 **Python Personal Firewall & Network Monitor for Windows**
 
-PyFirewall is a Windows desktop application for monitoring network connections and managing Windows Defender Firewall rules. **It monitors and blocks both incoming and outgoing connections** using process and IP/domain specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
+PyFirewall is a Windows desktop application for monitoring network connections and managing Windows Defender Firewall rules. **It monitors and configures both incoming and outgoing connections** using process and IP/domain specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
 
 ---
 
@@ -12,31 +12,33 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 ## Features
 
-- Live network connection monitoring
-- Auto-Block Protection
-- Per-application allow/block rules
-- Global IP/domain allow and block rules
-- IPv4 and IPv6 address and CIDR support
-- Connection-rate and upload-threshold alerts
-- Configurable connection and alert history limit
-- CSV export for connection data
-- JSON export/import for managed firewall rules
-- System-tray support and automatic start at Windows login
-- Dark/light theme support
+* Live network connection monitoring
+* Auto-Block Protection
+* Per-application allow/block rules
+* Global IP/domain allow and block rules
+* Saved column visibility and ordering, header menus, and double-click column sizing
+* IPv4 and IPv6 address and CIDR support
+* Connection-rate and upload-threshold alerts
+* Configurable connection and alert history limit
+* CSV export for connection data
+* JSON export/import for managed firewall rules
+* System-tray support and automatic start at Windows login
+* Dark/light theme support
+* Optional startup update checks and a manual **Check for Updates** button
 
 ## Requirements
 
-- Windows 10 or Windows 11
-- Administrator privileges
-- Python 3.8+ with Tkinter and pip
-- Npcap
-- Python packages listed in `requirements.txt`
+* Windows 10 or Windows 11
+* Administrator privileges
+* Python 3.8+ with Tkinter and pip
+* Npcap
+* Python packages listed in `requirements.txt`
 
 ## Installation
 
 ### Method 1 (recommended)
 
-1. Download and unpack the latest PyFirewall.zip from [here](https://github.com/EolnMsuk/PyFirewall/releases).
+1. Download and unpack the latest PyFirewall.zip from [here](https://github.com/EolnMsuk/PyFirewall/releases/latest).
 2. Keep the project files in the same directory.
 3. Right-click **`Install-PyFirewall.cmd`** and select **Run as administrator**.
 4. Follow the prompts for any required components and startup options.
@@ -47,21 +49,22 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 ### Method 2 (advanced)
 
-Manually download the PyFirewall.zip, unpack it. Manually find / download / install Python 3.8+ with Tcl/Tk and pip, Npcap, then run the following 2 commands while in the unpacked directory:
+Manually find / download / install [Python 3.8+](https://www.python.org/downloads/windows/) with Tcl/Tk and pip, [Npcap](https://npcap.com/). Manually download the [PyFirewall.zip](https://github.com/EolnMsuk/PyFirewall/releases/latest), unpack it. Then run the following 2 commands (cmd/ps as admin) while in the unpacked directory:
 
 ```powershell
 python -m pip install -r requirements.txt
 python firewall_monitor.py
+
 ```
 
 ## Usage
 
-The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application. The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme. When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that do not already have an application rule.
+The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application. The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme. When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that pass the threshold (assuming they do not already have an application rule allowing or blocking it).
 
 ### Default Settings
 
 | Setting | Default |
-|---|---:|
+| --- | --- |
 | Filter All Connections | Enabled |
 | Connection threshold | 50 |
 | Time window | 5 seconds |
@@ -70,6 +73,7 @@ The main window can be closed but will remain in the system tray. Use **Close** 
 | Alerts | Enabled |
 | Auto-Block Protection | Enabled |
 | Dark theme | Enabled |
+| Check for updates on startup | Enabled |
 
 ## Important Firewall Behavior
 
@@ -77,18 +81,31 @@ On each launch, PyFirewall saves the existing Windows Firewall profile settings,
 
 ## Known Issues
 
-- If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator".
+* If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator".
 
 ## Files
 
-- `firewall_monitor.py` — main application
-- `requirements.txt` — Python dependencies
-- `requirements.ps1` — automated prerequisite/setup script
-- `Install-PyFirewall.cmd` — administrator installer launcher
-- `Uninstall-PyFirewall.cmd` — interactive uninstaller
-- `PyFirewall.ico` — application and system-tray icon
+* `firewall_monitor.py` - launch entry point, administrator elevation, and single-instance guard
+* `app.py` - main window, shared state, startup, and UI event loop
+* `widgets.py` - themes, button feedback, tooltips, custom menus, and table interactions
+* `tray.py` - native Windows system-tray icon and menu
+* `firewall.py` - firewall commands, rule transactions, verification, and profile recovery
+* `settings.py` - settings persistence/UI, defaults, and support dialogs
+* `monitoring.py` - packet capture, process attribution, DNS, and traffic accounting
+* `auto_block.py` - temporary holds, cancellation, and Auto-Block decisions
+* `views.py` - connection/rule/alert views, context actions, and import/export
+* `updates.py` - release checking and update prompts
+* `constants.py` - shared defaults, version, and resource paths
+* `helpers.py` - normalization, formatting, and error diagnostics
+* `requirements.txt` - Python dependencies
+* `requirements.ps1` - automated prerequisite/setup script
+* `Install-PyFirewall.cmd` - administrator installer launcher
+* `Uninstall-PyFirewall.cmd` - interactive uninstaller
+* `PyFirewall.ico` - application and system-tray icon
 
 PyFirewall stores its configuration in `firewall_config.json` beside the application when needed.
+
+Keep **all Python modules together** with the installer scripts and `PyFirewall.ico` when copying or packaging a release. Launch with `python firewall_monitor.py` as before; shortcuts and the Windows login task continue using that entry point. Settings, profile recovery backups, and error logs remain in the same application directory. The installer checks that the sibling modules are present before installing dependencies.
 
 ## Uninstallation
 
@@ -96,12 +113,12 @@ Run **`Uninstall-PyFirewall.cmd`** as administrator and answer each prompt with 
 
 The uninstaller will prompt you to remove:
 
-- PyFirewall-managed firewall rules
-- Saved Windows Firewall profile settings
-- The scheduled task
-- Desktop shortcuts
-- PyFirewall-installed Python and packages
-- Npcap
+* PyFirewall-managed firewall rules
+* Saved Windows Firewall profile settings
+* The scheduled task
+* Desktop shortcuts
+* Python and packages
+* Npcap
 
 The installer records which Python components were installed by PyFirewall so shared or pre-existing installations can be kept. Review each prompt carefully because Python or Npcap may also be used by other software.
 
@@ -111,9 +128,9 @@ For missing live traffic, verify that Npcap is installed and running and that Py
 
 ## References
 
-- [Python for Windows](https://www.python.org/downloads/windows/)
-- [Npcap](https://npcap.com/)
-- [Scapy Documentation](https://scapy.readthedocs.io/)
+* [Python for Windows](https://www.python.org/downloads/windows/)
+* [Npcap](https://npcap.com/)
+* [Scapy Documentation](https://scapy.readthedocs.io/)
 
 ## Support Developer
 
