@@ -116,7 +116,7 @@ The uninstaller will prompt you to remove:
 * Python and packages
 * Npcap
 
-The installer records which Python components were installed by PyFirewall, warning the user during uninstall.
+The installer records which Python components were installed by PyFirewall, preventing any 3rd party dependency issues.
 
 ## References
 
