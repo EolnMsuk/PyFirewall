@@ -134,10 +134,53 @@ class TreeAndPopupTests(unittest.TestCase):
         self.a.default_column_orders = App.DEFAULT_COLUMN_ORDERS
         self.a.column_orders = {k: list(v) for k, v in App.DEFAULT_COLUMN_ORDERS.items()}
         self.a.hidden_columns = {}
+        self.a.selection_anchors = {}
 
     def tearDown(self):
         self.root.destroy()
         self.assertEqual(self.errors, [])
+
+    def test_drag_does_not_extend_selection_and_click_modifiers_still_work(self):
+        for key, columns in App.DEFAULT_COLUMN_ORDERS.items():
+            with self.subTest(tree=key):
+                tree = self.a._make_tree(self.root, columns, {}, key)
+                self.a._bind_tree_selection(tree)
+                for i in range(4):
+                    tree.insert('', 'end', iid=str(i), values=[str(i)] * len(columns))
+                self.root.update()
+                x = 20
+                ys = [tree.bbox(str(i))[1] + 5 for i in range(4)]
+
+                def click(y, state=0):
+                    tree.event_generate('<Button-1>', x=x, y=y, state=state)
+                    tree.event_generate('<ButtonRelease-1>', x=x, y=y, state=state)
+
+                tree.event_generate('<Button-1>', x=x, y=ys[0])
+                tree.event_generate('<B1-Motion>', x=x, y=ys[3], state=256)
+                tree.event_generate('<ButtonRelease-1>', x=x, y=ys[3])
+                self.assertEqual(tree.selection(), ('0',))
+                click(ys[2], state=4)
+                self.assertEqual(tree.selection(), ('0', '2'))
+                click(ys[2], state=4)
+                self.assertEqual(tree.selection(), ('0',))
+                click(ys[0])
+                click(ys[2], state=1)
+                self.assertEqual(tree.selection(), ('0', '1', '2'))
+
+                blank_y = ys[-1] + 35
+                tree.event_generate('<Button-1>', x=x, y=blank_y)
+                tree.event_generate('<B1-Motion>', x=x, y=ys[0], state=256)
+                tree.event_generate('<ButtonRelease-1>', x=x, y=ys[0])
+                self.assertEqual(tree.selection(), ())
+                # The same motion event must still resize column separators.
+                width = tree.column(columns[0], 'width')
+                separator_x = next(px for px in range(width - 5, width + 6)
+                                   if tree.identify_region(px, 10) == 'separator')
+                tree.event_generate('<Button-1>', x=separator_x, y=10)
+                tree.event_generate('<B1-Motion>', x=separator_x + 25, y=10, state=256)
+                tree.event_generate('<ButtonRelease-1>', x=separator_x + 25, y=10)
+                self.assertGreater(tree.column(columns[0], 'width'), width)
+                tree.master.destroy() if tree.master is not self.root else tree.destroy()
 
     def test_all_trees_fill_last_visible_column_and_toggle_both_scrollbars(self):
         for key, columns in App.DEFAULT_COLUMN_ORDERS.items():

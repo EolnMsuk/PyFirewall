@@ -609,94 +609,10 @@ class WidgetsMixin:
             self.save_settings()
         return 'break'
 
-    # Mouse selection and rubberband overlay
+    # Mouse selection
 
     def _bind_tree_selection(self, tree):
         tree.bind('<Button-1>', self._tree_selection_press, add='+')
-        tree.bind('<B1-Motion>', self._tree_selection_drag, add='+')
-        tree.bind('<ButtonRelease-1>', self._tree_selection_release, add='+')
-
-    @staticmethod
-    def _nearest_tree_row_for_y(tree, y):
-        try:
-            children = list(tree.get_children())
-            if not children:
-                return None
-            first_box = tree.bbox(children[0])
-            last_box = tree.bbox(children[-1])
-            if first_box and y < first_box[1]:
-                return children[0]
-            if last_box and y >= last_box[1] + last_box[3]:
-                return children[-1]
-            best_iid = None
-            best_distance = None
-            for iid in children:
-                box = tree.bbox(iid)
-                if not box:
-                    continue
-                top, height = (box[1], box[3])
-                center = top + height / 2
-                distance = abs(y - center)
-                if best_distance is None or distance < best_distance:
-                    best_distance = distance
-                    best_iid = iid
-            return best_iid
-        except tk.TclError:
-            return None
-
-    def _create_drag_indicator(self, tree, start_x, start_y):
-        self._destroy_drag_indicator()
-        try:
-            indicator = tk.Toplevel(self.root)
-            indicator.overrideredirect(True)
-            indicator.attributes('-topmost', True)
-            canvas = tk.Canvas(indicator, bg='#ffffff', highlightthickness=0, bd=0)
-            canvas.pack(fill=tk.BOTH, expand=True)
-            canvas.bind('<B1-Motion>', self._tree_selection_drag, add='+')
-            canvas.bind('<ButtonRelease-1>', self._tree_selection_release, add='+')
-            try:
-                indicator.wm_attributes('-disabled', True)
-            except tk.TclError:
-                pass
-            try:
-                indicator.wm_attributes('-transparentcolor', '#ffffff')
-            except tk.TclError:
-                pass
-            canvas.create_rectangle(1, 1, 2, 2, outline='#808080', dash=(2, 2), width=1, tags='rubberband')
-            self._drag_indicator = indicator
-            self._drag_indicator_canvas = canvas
-            self._drag_indicator_start = (int(start_x), int(start_y))
-            self._update_drag_indicator(start_x, start_y)
-        except tk.TclError:
-            self._drag_indicator = None
-            self._drag_indicator_canvas = None
-
-    def _update_drag_indicator(self, current_x, current_y):
-        if not self._drag_indicator:
-            return
-        try:
-            x1, y1 = self._drag_indicator_start
-            x2, y2 = (int(current_x), int(current_y))
-            left, right = sorted((x1, x2))
-            top, bottom = sorted((y1, y2))
-            width = max(2, right - left + 2)
-            height = max(2, bottom - top + 2)
-            self._drag_indicator.geometry(f'{width}x{height}+{left}+{top}')
-            self._drag_indicator_canvas.delete('rubberband')
-            self._drag_indicator_canvas.create_rectangle(1, 1, max(1, width - 2), max(1, height - 2), outline='#666666', dash=(2, 2), width=1, tags='rubberband')
-            self._drag_indicator.update_idletasks()
-        except tk.TclError:
-            self._destroy_drag_indicator()
-
-    def _destroy_drag_indicator(self):
-        indicator = getattr(self, '_drag_indicator', None)
-        if indicator:
-            try:
-                indicator.destroy()
-            except tk.TclError:
-                pass
-        self._drag_indicator = None
-        self._drag_indicator_canvas = None
 
     def _tree_selection_press(self, event):
         tree = event.widget
@@ -704,16 +620,11 @@ class WidgetsMixin:
             return
         region = tree.identify_region(event.x, event.y)
         if region in {'heading', 'separator'}:
-            tree._drag_selection_state = None
-            if self._active_drag_tree is tree:
-                self._active_drag_tree = None
-            self._destroy_drag_indicator()
             return
         children = list(tree.get_children())
         iid = tree.identify_row(event.y)
         started_on_blank = not iid or iid not in children
         if not children:
-            tree._drag_selection_state = None
             return
         last_box = tree.bbox(children[-1])
         started_below_rows = bool(started_on_blank and last_box and (event.y >= last_box[1] + last_box[3]))
@@ -721,14 +632,6 @@ class WidgetsMixin:
             tree.selection_remove(tree.selection())
             self.selection_anchors.pop(str(tree), None)
         if started_on_blank:
-            start_iid = self._nearest_tree_row_for_y(tree, event.y)
-            if not start_iid:
-                tree._drag_selection_state = None
-                if self._active_drag_tree is tree:
-                    self._active_drag_tree = None
-                return 'break' if started_below_rows else None
-            tree._drag_selection_state = {'start_iid': start_iid, 'start_x': event.x, 'start_y': event.y, 'start_root_x': event.x_root, 'start_root_y': event.y_root, 'control': bool(event.state & 4), 'shift': bool(event.state & 1), 'dragging': False, 'started_on_blank': True, 'drag_base_selection': tuple(tree.selection())}
-            self._active_drag_tree = tree
             return 'break' if started_below_rows else None
         anchor = self.selection_anchors.get(str(tree))
         shift = bool(event.state & 1)
@@ -755,116 +658,7 @@ class WidgetsMixin:
             tree.focus_set()
         tree.focus(iid)
         self.selection_anchors[str(tree)] = iid
-        tree._drag_selection_state = {'start_iid': iid, 'start_x': event.x, 'start_y': event.y, 'start_root_x': event.x_root, 'start_root_y': event.y_root, 'control': control, 'shift': shift, 'dragging': False, 'started_on_blank': False, 'drag_base_selection': tuple(tree.selection())}
-        self._active_drag_tree = tree
         return 'break'
-
-    def _tree_selection_drag(self, event):
-        tree = event.widget
-        if not isinstance(tree, ttk.Treeview):
-            tree = self._active_drag_tree
-            if not tree:
-                return
-            return self._perform_tree_selection_drag(tree, event.x_root, event.y_root, None, event)
-        state = getattr(tree, '_drag_selection_state', None)
-        if not state:
-            return
-        return self._perform_tree_selection_drag(tree, event.x_root, event.y_root, event.y, event)
-
-    def _perform_tree_selection_drag(self, tree, root_x, root_y, local_y, event=None):
-        state = getattr(tree, '_drag_selection_state', None)
-        if not state:
-            return
-        if self.header_drag.get(str(tree)):
-            return 'break'
-        if event is not None and isinstance(event.widget, ttk.Treeview):
-            region = tree.identify_region(event.x, event.y)
-            if region in {'heading', 'separator'}:
-                return 'break'
-        delta = max(abs(int(root_x) - state['start_root_x']), abs(int(root_y) - state['start_root_y']))
-        if not state['dragging'] and delta < 4:
-            return
-        state['dragging'] = True
-        try:
-            current_local_y = local_y
-            if current_local_y is None:
-                current_local_y = int(root_y) - tree.winfo_rooty()
-            children = list(tree.get_children())
-            start_iid = state['start_iid']
-            if start_iid not in children or not children:
-                return
-            current_iid = tree.identify_row(current_local_y)
-            if current_iid not in children:
-                current_iid = self._nearest_tree_row_for_y(tree, current_local_y)
-            if not current_iid:
-                return
-            start = children.index(start_iid)
-            end = children.index(current_iid)
-            lo, hi = sorted((start, end))
-            range_iids = children[lo:hi + 1]
-            if state['control']:
-                tree.selection_set(state['drag_base_selection'])
-                tree.selection_add(range_iids)
-            elif state['started_on_blank']:
-                tree.selection_set(range_iids)
-            else:
-                tree.selection_set(range_iids)
-            try:
-                tree.focus(current_iid)
-            except tk.TclError:
-                pass
-            self._active_drag_tree = tree
-            if not self._drag_indicator:
-                self._create_drag_indicator(tree, state['start_root_x'], state['start_root_y'])
-            self._update_drag_indicator(root_x, root_y)
-        except tk.TclError:
-            pass
-        return
-
-    def _tree_selection_release(self, event):
-        tree = event.widget
-        if not isinstance(tree, ttk.Treeview):
-            tree = self._active_drag_tree
-        if not isinstance(tree, ttk.Treeview):
-            return
-        if isinstance(event.widget, ttk.Treeview):
-            region = tree.identify_region(event.x, event.y)
-            if region in {'heading', 'separator'} and (not getattr(tree, '_drag_selection_state', None)):
-                return
-        state = getattr(tree, '_drag_selection_state', None)
-        if not state:
-            self._active_drag_tree = None
-            self._destroy_drag_indicator()
-            return
-        try:
-            if state.get('dragging'):
-                children = list(tree.get_children())
-                current_local_y = int(event.y) if isinstance(event.widget, ttk.Treeview) else int(event.y_root) - tree.winfo_rooty()
-                current_iid = tree.identify_row(current_local_y)
-                if current_iid not in children:
-                    current_iid = self._nearest_tree_row_for_y(tree, current_local_y) if children else None
-                if current_iid:
-                    self.selection_anchors[str(tree)] = current_iid
-                    try:
-                        tree.focus(current_iid)
-                    except tk.TclError:
-                        pass
-        except (tk.TclError, IndexError, AttributeError):
-            pass
-        finally:
-            tree._drag_selection_state = None
-            if self._active_drag_tree is tree:
-                self._active_drag_tree = None
-            self._destroy_drag_indicator()
-            try:
-                tree.configure(cursor='')
-            except tk.TclError:
-                pass
-        if state.get('dragging') or state.get('started_on_blank'):
-            return 'break'
-
-    def _tree_selection_click(self, event):
-        return self._tree_selection_press(event)
 
     def _remember_selection_anchor(self, tree, iid):
         if iid and tree.exists(iid):

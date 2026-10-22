@@ -73,8 +73,6 @@ class FirewallMonitorApp(
         self.next_connection_number = 1
         self.connection_rates = {}
         self.selection_anchors = {}
-        self._active_drag_tree = None
-        self._drag_indicator = None
         self.default_column_orders = self.DEFAULT_COLUMN_ORDERS
         self.column_orders = {key: list(order) for key, order in self.default_column_orders.items()}
         self.hidden_columns = {}
