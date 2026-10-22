@@ -61,7 +61,7 @@ python firewall_monitor.py
 
 ## Usage
 
-The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application. The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, and the UI theme. When a threshold is exceeded, the connection is recorded in **Alerts**. Auto-Block prompting is used for applications that pass the threshold (assuming they do not already have an application rule allowing or blocking it).
+The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application. The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, the UI theme, (auto) update checking, export / import rules, reset to defaults and uninstall option. When a threshold is exceeded, the connection is recorded in **Alerts**, triggering Auto-Block prompting, used for applications that pass the threshold (assuming they do not already have an application rule allowing or blocking it). Enabling **Filter All Connections** will set the threshold to 1, allowing you to live filter any new requests.
 
 ### Default Settings
 
@@ -105,9 +105,7 @@ On each launch, PyFirewall saves the existing Windows Firewall profile settings,
 * `Uninstall-PyFirewall.cmd` - interactive uninstaller
 * `PyFirewall.ico` - application and system-tray icon
 
-PyFirewall stores its configuration in `firewall_config.json` beside the application when needed.
-
-Keep **all Python modules together** with the installer scripts and `PyFirewall.ico` when copying or packaging a release. Launch with `python firewall_monitor.py` as before; shortcuts and the Windows login task continue using that entry point. Settings, profile recovery backups, and error logs remain in the same application directory. The installer checks that the sibling modules are present before installing dependencies.
+PyFirewall stores its configuration in `firewall_config.json` beside the application.
 
 ## Uninstallation
 
@@ -122,7 +120,7 @@ The uninstaller will prompt you to remove:
 * Python and packages
 * Npcap
 
-The installer records which Python components were installed by PyFirewall so shared or pre-existing installations can be kept. Review each prompt carefully because Python or Npcap may also be used by other software.
+The installer records which Python components were installed by PyFirewall, warning the user during uninstall.
 
 ## Troubleshooting
 
