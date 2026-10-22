@@ -21,6 +21,7 @@ function Get-PythonPackageInfo { @([pscustomobject]@{name='psutil';version='1'},
 function Get-NpcapEntry { [pscustomobject]@{DisplayName='Npcap test'} }
 function Get-NpcapUninstaller { 'C:\fake\uninstall.exe' }
 function Get-PyFirewallRules { @([pscustomobject]@{Name='PyFirewall_test'}) }
+function Get-PyFirewallProcesses { @() }
 function Get-ScheduledTask { [pscustomobject]@{TaskName='test'} }
 function Get-PyFirewallFirewallProfileBackup { [pscustomobject]@{profiles=@()} }
 function Test-Path { $true }

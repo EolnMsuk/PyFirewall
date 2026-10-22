@@ -469,12 +469,16 @@ function Restore-PyFirewallFirewallProfileState([object]$Backup) {
     return $skippedNames.Count -eq 0
 }
 
-function Stop-PyFirewallProcesses {
-    $processes = Get-CimInstance Win32_Process -ErrorAction Stop |
+function Get-PyFirewallProcesses {
+    Get-CimInstance Win32_Process -ErrorAction Stop |
         Where-Object {
             $_.Name -match '^(?i:pythonw?|py)(?:\d+(?:\.\d+)*)?\.exe$' -and
             $_.CommandLine -match '(?i)firewall_monitor\.py(?:"|\s|$)'
         }
+}
+
+function Stop-PyFirewallProcesses {
+    $processes = @(Get-PyFirewallProcesses)
     foreach ($process in $processes) {
         $running = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
         if (-not $running) { continue }
@@ -488,6 +492,9 @@ function Stop-PyFirewallProcesses {
 
 try {
     $desktop = [Environment]::GetFolderPath('Desktop')
+    # Capture the initial state before any selected removal closes PyFirewall.
+    $pyFirewallWasRunning = @(Get-PyFirewallProcesses).Count -gt 0
+    $firewallProfileBackupWasPresent = Test-Path -LiteralPath $FirewallProfileBackupFile
     $shortcut = Join-Path $desktop 'PyFirewall - Firewall & Network Monitor.lnk'
     $legacyShortcut = Join-Path $desktop 'PyFirewall.lnk'
     $shortcutPaths = @($shortcut, $legacyShortcut) | Select-Object -Unique
@@ -580,7 +587,11 @@ try {
     $removeSettings = $removeFirewallRules
     $restoreFirewallProfile = Select-Removal 'Windows Firewall profile settings' $hasFirewallProfileBackup $true 'Restore the Windows Firewall profile settings saved by PyFirewall?' ''
     if (-not $hasFirewallProfileBackup) {
-        $RetainedComponents['Windows Firewall profile settings'] = 'no valid firewall-profile backup was found; original settings cannot be restored safely'
+        if (-not $pyFirewallWasRunning -and -not $firewallProfileBackupWasPresent) {
+            $RetainedComponents['Windows Firewall profile settings'] = 'no backup profile found, PyFirewall restored it when last closed (ignored)'
+        } else {
+            $RetainedComponents['Windows Firewall profile settings'] = 'no valid firewall-profile backup was found; original settings cannot be restored safely'
+        }
     }
     $removeTask = Select-Removal 'Scheduled task' $hasTask $true "Remove the '$taskName' Scheduled Task?" ''
     $removeShortcut = Select-Removal 'Desktop shortcuts' $hasShortcut $true 'Remove the PyFirewall desktop shortcut(s)?' ''
