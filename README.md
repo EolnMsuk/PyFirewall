@@ -53,6 +53,8 @@ Manually find / download / install [Python 3.8+](https://www.python.org/download
 
 ```powershell
 python -m pip install -r requirements.txt
+```
+```powershell
 python firewall_monitor.py
 
 ```
