@@ -30,9 +30,8 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 
 * Windows 10 or Windows 11
 * Administrator privileges
-* Python 3.8+ with Tkinter and pip
-* Npcap
-* Python packages listed in `requirements.txt`
+* [Python 3.8+](https://www.python.org/downloads/windows/) w/ Tkinter / psutil / scapy
+* [Npcap](https://npcap.com/)
 
 ## Installation
 
