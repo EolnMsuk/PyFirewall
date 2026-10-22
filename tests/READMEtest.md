@@ -10,3 +10,4 @@
 | [test_installer_lifecycle.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_installer_lifecycle.py) | Installer consent to close the app and preservation/creation of the startup task, using mocked Windows operations. |
 | [test_uninstall_policy.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_uninstall_policy.py) | Dependency ownership, missing install logs, declined removals, and cleanup ordering. |
 | [test_update_checks.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_update_checks.py) | Version comparisons, failed HTTP responses, background checks, preferences, and update prompts. |
+| [test_uninstall_policy.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_uninstall_policy.py) | Dependency ownership, missing install logs, declined removals, combined rules/settings cleanup, and closing PyFirewall before removal. |
