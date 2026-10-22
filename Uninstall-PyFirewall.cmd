@@ -19,6 +19,42 @@ $ProgressPreference = 'SilentlyContinue'
 $ScriptDir = Split-Path -Parent $env:PYFW_UNINSTALL_FILE
 $InstallMetadataFile = Join-Path $ScriptDir 'pyfirewall_install.json'
 $FirewallProfileBackupFile = Join-Path $ScriptDir 'firewall_profile_backup.json'
+$ConfigFile = Join-Path $ScriptDir 'firewall_config.json'
+$script:RetainedComponents = [ordered]@{}
+$script:MetadataProblem = 'install log file was missing'
+
+function Test-InstallerOwned([object]$Metadata, [string]$Component) {
+    $value = $Metadata."${Component}_installed_by_pyfirewall"
+    return ($value -is [bool] -and $value -eq $true)
+}
+
+function Select-Removal([string]$Name, [bool]$Present, [bool]$Eligible, [string]$Question, [string]$SkipReason) {
+    if (-not $Eligible) {
+        $script:RetainedComponents[$Name] = $SkipReason
+        return $false
+    }
+    if (-not $Present) {
+        $script:RetainedComponents[$Name] = 'not detected, or no usable uninstaller was found'
+        return $false
+    }
+    if (Ask-YesNo $Question) {
+        $script:RetainedComponents[$Name] = 'removal selected but not completed or verified'
+        return $true
+    }
+    $script:RetainedComponents[$Name] = 'removal rejected by the user'
+    return $false
+}
+
+function Write-RetainedSummary {
+    Write-Step 'Components / applications not uninstalled'
+    foreach ($name in $script:RetainedComponents.Keys) {
+        Write-Host ("  - {0}: {1}." -f $name, $script:RetainedComponents[$name])
+    }
+    Write-Host '  - PyFirewall source files, icon and exported backups: retained by design.'
+    if (Test-Path -LiteralPath $InstallMetadataFile) {
+        Write-Host '  - Installation log: retained to preserve ownership history for future uninstall attempts.'
+    }
+}
 
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -74,9 +110,12 @@ function Get-UninstallEntries {
 function Get-PyFirewallInstallMetadata {
     if (-not (Test-Path -LiteralPath $InstallMetadataFile)) { return $null }
     try {
-        return Get-Content -LiteralPath $InstallMetadataFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        $metadata = Get-Content -LiteralPath $InstallMetadataFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($null -eq $metadata -or $metadata -isnot [PSCustomObject]) { throw 'Expected an installation metadata object.' }
+        return $metadata
     } catch {
         Write-WarnMsg "PyFirewall installation metadata could not be read: $($_.Exception.Message)"
+        $script:MetadataProblem = 'install log file was unreadable or invalid'
         return $null
     }
 }
@@ -195,11 +234,11 @@ function Get-PythonPackageInfo([string]$PythonPath) {
     if (-not $PythonPath) { return @() }
     try {
         $json = & $PythonPath -m pip list --format=json 2>$null
-        if ($LASTEXITCODE -ne 0) { return @() }
+        if ($LASTEXITCODE -ne 0) { throw 'pip could not enumerate packages in the recorded Python environment.' }
         return ($json -join '' | ConvertFrom-Json) |
             Where-Object { $_.name -in @('psutil', 'scapy') }
     } catch {
-        return @()
+        throw "Could not inspect Python packages: $($_.Exception.Message)"
     }
 }
 
@@ -454,14 +493,18 @@ try {
     $preferredPythonPath = if ($installMetadata) { [string]$installMetadata.python_path } else { $null }
     $pythonEntry = Get-PythonEntry $preferredPythonPath
     $pythonPath = Get-PythonPath $pythonEntry $preferredPythonPath
-    $packages = @(Get-PythonPackageInfo $pythonPath)
+    $packageInspectionFailed = $false
+    try {
+        $packages = @(Get-PythonPackageInfo $pythonPath)
+    } catch {
+        $packages = @()
+        $packageInspectionFailed = $true
+        Write-WarnMsg $_.Exception.Message
+    }
     $npcapEntry = Get-NpcapEntry
     $npcapUninstaller = if ($npcapEntry) { Get-NpcapUninstaller $npcapEntry } else { $null }
     $firewallRules = @(Get-PyFirewallRules)
 
-    $pythonInstalledByPyFirewall = [bool]($installMetadata -and $installMetadata.python_installed_by_pyfirewall)
-    $psutilInstalledByPyFirewall = [bool]($installMetadata -and $installMetadata.psutil_installed_by_pyfirewall)
-    $scapyInstalledByPyFirewall = [bool]($installMetadata -and $installMetadata.scapy_installed_by_pyfirewall)
     $hasPython = [bool]$pythonPath -or [bool]$pythonEntry
     $hasPackages = $packages.Count -gt 0
     $hasNpcap = [bool]$npcapEntry
@@ -469,11 +512,15 @@ try {
     $hasShortcut = $existingShortcuts.Count -gt 0
     $hasTask = [bool]$task
     $hasFirewallRules = $firewallRules.Count -gt 0
+    $hasSettings = Test-Path -LiteralPath $ConfigFile
     $firewallProfileBackup = Get-PyFirewallFirewallProfileBackup
     $hasFirewallProfileBackup = [bool]$firewallProfileBackup
 
     Write-Step 'PyFirewall Uninstall Review'
     Write-Host 'Detected components:' -ForegroundColor White
+    if ($hasSettings) {
+        Write-Host '  - Saved settings, application/IP/domain rules, and column layout' -ForegroundColor White
+    }
 
     if ($hasFirewallRules) {
         Write-Host "  - PyFirewall-managed firewall rules: $($firewallRules.Count)" -ForegroundColor White
@@ -496,24 +543,20 @@ try {
     }
     if ($hasPython) {
         $pythonLabel = if ($pythonEntry) { [string]$pythonEntry.DisplayName } else { "Python interpreter at $pythonPath" }
-        $ownership = if ($pythonInstalledByPyFirewall) { 'installed by PyFirewall' } else { 'existing/shared installation' }
+        $ownership = if (Test-InstallerOwned $installMetadata 'python') { 'installed by PyFirewall' } else { 'existing/shared installation' }
         Write-Host "  - $pythonLabel ($ownership)" -ForegroundColor White
     }
     if ($hasFirewallProfileBackup) {
         Write-Host '  - Saved Windows Firewall profile state' -ForegroundColor White
     }
 
-    if (-not ($hasPython -or $hasPackages -or $hasNpcap -or $hasShortcut -or $hasTask -or $hasFirewallRules -or $hasFirewallProfileBackup)) {
-        Write-Host '  No removable PyFirewall components were detected.' -ForegroundColor Gray
-        exit 0
-    }
-
     Write-Host ''
-    Write-Host 'Choose what to remove. Answer Y or N for each detected component.' -ForegroundColor White
+    Write-Host 'Choose what to remove. Only installer-owned prerequisites are eligible.' -ForegroundColor White
     Write-Host 'Answering N keeps that component in place.' -ForegroundColor Gray
     Write-Host ''
 
     $removeFirewallRules = $false
+    $removeSettings = $false
     $removeTask = $false
     $removeShortcut = $false
     $removePython = $false
@@ -522,56 +565,46 @@ try {
     $removeScapy = $false
     $restoreFirewallProfile = $false
 
-    if ($hasFirewallRules) {
-        $removeFirewallRules = Ask-YesNo "Remove all $($firewallRules.Count) PyFirewall-managed Windows Firewall rule(s)?"
+    $skipReason = if ($installMetadata) {
+        'not recorded as newly installed by Install-PyFirewall.cmd (pre-existing or ownership unknown)'
+    } else { $MetadataProblem }
+    $removeFirewallRules = Select-Removal 'PyFirewall firewall rules' $hasFirewallRules $true 'Remove all PyFirewall-managed Windows Firewall rules?' ''
+    # Settings are application-created data, not an installer-owned prerequisite.
+    $RetainedComponents['Saved settings and rules (firewall_config.json)'] = if ($installMetadata) {
+        'not installed by Install-PyFirewall.cmd; application-created settings are preserved'
+    } else { $MetadataProblem }
+    $restoreFirewallProfile = Select-Removal 'Windows Firewall profile settings' $hasFirewallProfileBackup $true 'Restore the Windows Firewall profile settings saved by PyFirewall?' ''
+    if (-not $hasFirewallProfileBackup) {
+        $RetainedComponents['Windows Firewall profile settings'] = 'no valid firewall-profile backup was found; original settings cannot be restored safely'
     }
+    $removeTask = Select-Removal 'Scheduled task' $hasTask $true "Remove the '$taskName' Scheduled Task?" ''
+    $removeShortcut = Select-Removal 'Desktop shortcuts' $hasShortcut $true 'Remove the PyFirewall desktop shortcut(s)?' ''
 
-    if ($hasFirewallProfileBackup) {
-        $restoreFirewallProfile = Ask-YesNo 'Restore the Windows Firewall profile settings that PyFirewall saved before initialization?'
+    # Only explicit JSON boolean true grants ownership. Missing fields and old logs
+    # cannot authorize removal of a shared dependency.
+    $pythonRecorded = [bool]($installMetadata -and $preferredPythonPath)
+    $removePsutil = Select-Removal 'psutil' ([bool]($packages | Where-Object { $_.name -eq 'psutil' })) ($pythonRecorded -and (Test-InstallerOwned $installMetadata 'psutil')) 'Uninstall psutil from the recorded Python environment?' $skipReason
+    $removeScapy = Select-Removal 'scapy' ([bool]($packages | Where-Object { $_.name -eq 'scapy' })) ($pythonRecorded -and (Test-InstallerOwned $installMetadata 'scapy')) 'Uninstall scapy from the recorded Python environment?' $skipReason
+    $removeNpcap = Select-Removal 'Npcap' $hasNpcap (Test-InstallerOwned $installMetadata 'npcap') 'Uninstall Npcap installed by PyFirewall?' $skipReason
+
+    # Removing Python must not bypass a decision to retain one of its packages.
+    $keptPackages = @($packages | Where-Object {
+        ($_.name -eq 'psutil' -and -not $removePsutil) -or
+        ($_.name -eq 'scapy' -and -not $removeScapy)
+    })
+    $pythonEligible = $pythonRecorded -and (Test-InstallerOwned $installMetadata 'python')
+    $pythonSkipReason = $skipReason
+    if ($pythonEligible -and $keptPackages.Count -gt 0) {
+        $pythonEligible = $false
+        $pythonSkipReason = 'required by retained packages: ' + (($keptPackages | ForEach-Object { $_.name }) -join ', ')
     }
-
-    if ($hasTask) {
-        $removeTask = Ask-YesNo "Remove the '$taskName' Scheduled Task?"
+    if ($pythonEligible -and $packageInspectionFailed) {
+        $pythonEligible = $false
+        $pythonSkipReason = 'installed packages could not be inspected; retained to protect packages with unknown ownership'
     }
+    $removePython = Select-Removal 'Python' ([bool]$pythonEntry) $pythonEligible 'Uninstall the Python installation recorded by PyFirewall?' $pythonSkipReason
 
-    if ($hasShortcut) {
-        $removeShortcut = Ask-YesNo 'Remove the PyFirewall desktop shortcut(s)?'
-    }
-
-    if ($hasPython) {
-        Write-Host ''
-        Write-Host 'Python is managed separately from the Python packages.' -ForegroundColor Gray
-        if ($pythonEntry -and $pythonInstalledByPyFirewall) {
-            Write-Host 'PyFirewall recorded this Python installation as installed by the PyFirewall installer.' -ForegroundColor Gray
-        } else {
-            Write-WarnMsg 'This Python installation was detected but was not recorded as installed by PyFirewall. Removing it may affect other software.'
-        }
-
-        if ($pythonEntry) {
-            $removePython = Ask-YesNo "Uninstall $($pythonEntry.DisplayName)?"
-        } else {
-            Write-WarnMsg "The detected Python interpreter at $pythonPath has no matching Windows uninstall entry. Python will be kept."
-        }
-
-        if (-not $removePython -and $hasPackages) {
-            $psutilLabel = if ($psutilInstalledByPyFirewall) { 'psutil was installed by PyFirewall' } else { 'psutil was already present or its ownership is unknown' }
-            $scapyLabel = if ($scapyInstalledByPyFirewall) { 'Scapy was installed by PyFirewall' } else { 'Scapy was already present or its ownership is unknown' }
-            Write-Info $psutilLabel
-            $removePsutil = Ask-YesNo 'Uninstall the Python package psutil from the detected Python environment?'
-            Write-Info $scapyLabel
-            $removeScapy = Ask-YesNo 'Uninstall the Python package scapy from the detected Python environment?'
-        } elseif ($removePython -and $hasPackages) {
-            Write-Info 'The selected Python installation is being removed, so its psutil/scapy packages will be removed with that Python installation.'
-        }
-    }
-
-    if ($hasNpcap) {
-        Write-Host ''
-        Write-Host 'Npcap may also be used by other network-analysis software.' -ForegroundColor Yellow
-        $removeNpcap = Ask-YesNo "Uninstall $($npcapEntry.DisplayName)?"
-    }
-
-    if (-not ($removeFirewallRules -or $restoreFirewallProfile -or $removeTask -or $removeShortcut -or $removePsutil -or $removeScapy -or $removeNpcap -or $removePython)) {
+    if (-not ($removeFirewallRules -or $removeSettings -or $restoreFirewallProfile -or $removeTask -or $removeShortcut -or $removePsutil -or $removeScapy -or $removeNpcap -or $removePython)) {
         Write-Host ''
         Write-Host 'No removals were selected. No changes were made.' -ForegroundColor Yellow
         exit 0
@@ -579,6 +612,7 @@ try {
 
     Write-Host ''
     Write-Host 'Selected removals:' -ForegroundColor White
+    if ($removeSettings) { Write-Host '  - Saved settings, rules, and column layout (firewall_config.json)' }
     if ($removeFirewallRules) { Write-Host "  - PyFirewall-managed firewall rules ($($firewallRules.Count))" }
     if ($restoreFirewallProfile) { Write-Host '  - Restore saved Windows Firewall profile settings' }
     if ($removeTask) { Write-Host "  - Scheduled Task: $taskName" }
@@ -593,7 +627,7 @@ try {
     if ($removePython) { Write-Host "  - $($pythonEntry.DisplayName)" }
     Write-Host ''
 
-    $needsProcessStop = $removeFirewallRules -or $restoreFirewallProfile -or $removePsutil -or $removeScapy -or $removeNpcap -or $removePython
+    $needsProcessStop = $removeFirewallRules -or $removeSettings -or $restoreFirewallProfile -or $removePsutil -or $removeScapy -or $removeNpcap -or $removePython
     if ($needsProcessStop) {
         Stop-PyFirewallProcesses
     }
@@ -602,8 +636,18 @@ try {
         Remove-PyFirewallFirewallRules
     }
 
+    if ($removeSettings) {
+        Remove-Item -LiteralPath $ConfigFile -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $ConfigFile) { throw 'Saved settings could not be removed.' }
+        Write-OK 'Saved settings and rule policy removed. A clean launch will use current column defaults.'
+    }
+
     if ($restoreFirewallProfile) {
-        [void](Restore-PyFirewallFirewallProfileState $firewallProfileBackup)
+        if (Restore-PyFirewallFirewallProfileState $firewallProfileBackup) {
+            $RetainedComponents.Remove('Windows Firewall profile settings')
+        } else {
+            $RetainedComponents['Windows Firewall profile settings'] = 'restoration incomplete; one or more profiles changed since PyFirewall initialization or no longer exist (backup retained)'
+        }
     }
 
     if ($removeTask) {
@@ -636,6 +680,12 @@ try {
         if ($LASTEXITCODE -ne 0) {
             Write-WarnMsg "pip returned exit code $LASTEXITCODE while removing selected packages."
         } else {
+            $remainingPackages = @(Get-PythonPackageInfo $pythonPath)
+            foreach ($name in $packageNames) {
+                if (-not ($remainingPackages | Where-Object { $_.name -eq $name })) {
+                    $RetainedComponents.Remove($name)
+                }
+            }
             Write-OK ("Removed selected Python package(s): " + ($packageNames -join ', '))
         }
     }
@@ -669,7 +719,8 @@ try {
             if ($remainingFirewallRules.Count -gt 0) {
                 Write-WarnMsg "$($remainingFirewallRules.Count) PyFirewall-managed firewall rule(s) are still present."
             } else {
-                Write-OK 'PyFirewall-managed firewall rules selected for removal are gone.'
+                $RetainedComponents.Remove('PyFirewall firewall rules')
+            Write-OK 'PyFirewall-managed firewall rules selected for removal are gone.'
             }
         } elseif ($remainingFirewallRules.Count -eq $firewallRules.Count) {
             Write-OK "PyFirewall-managed firewall rules were kept ($($firewallRules.Count) remain)."
@@ -683,6 +734,7 @@ try {
         if ($remainingTask) {
             Write-WarnMsg "Scheduled Task '$taskName' is still registered."
         } else {
+            $RetainedComponents.Remove('Scheduled task')
             Write-OK 'PyFirewall scheduled task selected for removal is gone.'
         }
     } elseif ($hasTask -and $remainingTask) {
@@ -695,6 +747,7 @@ try {
             $names = ($remainingShortcuts | ForEach-Object { Split-Path -Leaf $_ }) -join ', '
             Write-WarnMsg ("The following PyFirewall desktop shortcut(s) could not be verified as removed: {0}" -f $names)
         } else {
+            $RetainedComponents.Remove('Desktop shortcuts')
             Write-OK 'PyFirewall desktop shortcut(s) selected for removal are gone.'
         }
     } elseif ($hasShortcut -and $remainingShortcuts.Count -gt 0) {
@@ -708,6 +761,7 @@ try {
         if ($pythonStillExists -or $remainingPythonEntry) {
             Write-WarnMsg 'The selected Python installation may still be present. A restart may be required, or the uninstall may have been cancelled by Windows.'
         } else {
+            $RetainedComponents.Remove('Python')
             Write-OK 'The selected Python installation is no longer registered and its recorded interpreter path is gone.'
         }
     } elseif ($hasPython) {
@@ -719,6 +773,7 @@ try {
         if ($remainingNpcap) {
             Write-WarnMsg "$($remainingNpcap.DisplayName) is still registered. A restart may be required."
         } else {
+            $RetainedComponents.Remove('Npcap')
             Write-OK 'Npcap selected for removal is no longer registered.'
         }
     } elseif ($hasNpcap) {
@@ -735,17 +790,16 @@ try {
         Write-OK 'Saved Windows Firewall profile state was kept.'
     }
 
-    if ($removePython -and (Test-Path -LiteralPath $InstallMetadataFile)) {
-        Remove-Item -LiteralPath $InstallMetadataFile -Force -ErrorAction SilentlyContinue
-        Write-OK 'PyFirewall installation ownership metadata was removed.'
-    }
-
     Write-Host ''
     Write-Host 'PyFirewall uninstall selections have been processed.' -ForegroundColor Green
-    Write-Host 'PyFirewall source/project files, including PyFirewall.ico, were not deleted by this script.' -ForegroundColor Green
+    Write-Host 'PyFirewall source code, exported rule backups, and PyFirewall.ico were not deleted by this script.' -ForegroundColor Green
     exit 0
 }
 catch {
     Write-Host "`n[ERROR] $($_.Exception.Message)" -ForegroundColor Red
     exit 1
+}
+
+finally {
+    Write-RetainedSummary
 }

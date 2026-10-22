@@ -49,6 +49,8 @@ if /I not "%ISADMIN%"=="True" (
 
 echo.
 echo Starting PyFirewall installer...
+echo Existing application, global IP/domain, global port rules, and column preferences are preserved.
+echo Clean installs use the current defaults from firewall_monitor.py.
 echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
 set "EXITCODE=%ERRORLEVEL%"

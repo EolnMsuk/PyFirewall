@@ -165,11 +165,11 @@ function Write-PyFirewallInstallMetadata([object]$PythonInfo, [bool]$PythonInsta
                 [System.IO.Path]::GetFullPath([string]$PythonInfo.Path),
                 [StringComparison]::OrdinalIgnoreCase
             )
+            $NpcapInstalledByPyFirewall = $NpcapInstalledByPyFirewall -or ($previous.npcap_installed_by_pyfirewall -is [bool] -and $previous.npcap_installed_by_pyfirewall -eq $true)
             if ($samePython) {
-                $PythonInstalledByPyFirewall = $PythonInstalledByPyFirewall -or [bool]$previous.python_installed_by_pyfirewall
-                $PsutilInstalledByPyFirewall = $PsutilInstalledByPyFirewall -or [bool]$previous.psutil_installed_by_pyfirewall
-                $ScapyInstalledByPyFirewall = $ScapyInstalledByPyFirewall -or [bool]$previous.scapy_installed_by_pyfirewall
-                $NpcapInstalledByPyFirewall = $NpcapInstalledByPyFirewall -or [bool]$previous.npcap_installed_by_pyfirewall
+                $PythonInstalledByPyFirewall = $PythonInstalledByPyFirewall -or ($previous.python_installed_by_pyfirewall -is [bool] -and $previous.python_installed_by_pyfirewall -eq $true)
+                $PsutilInstalledByPyFirewall = $PsutilInstalledByPyFirewall -or ($previous.psutil_installed_by_pyfirewall -is [bool] -and $previous.psutil_installed_by_pyfirewall -eq $true)
+                $ScapyInstalledByPyFirewall = $ScapyInstalledByPyFirewall -or ($previous.scapy_installed_by_pyfirewall -is [bool] -and $previous.scapy_installed_by_pyfirewall -eq $true)
             }
         } catch {
             Write-WarnMsg 'Previous PyFirewall installation metadata could not be read; new ownership state will be recorded.'
@@ -196,22 +196,24 @@ function Write-PyFirewallInstallMetadata([object]$PythonInfo, [bool]$PythonInsta
 }
 
 function Get-PythonPackageStatus([string]$PythonExe, [string]$ModuleName, [Version]$MinimumVersion, [Version]$MaximumExclusive) {
+    $present = $false
     try {
         $result = @(& $PythonExe -c "import importlib.metadata as m; print(m.version('$ModuleName'))" 2>$null)
         if ($LASTEXITCODE -ne 0 -or $result.Count -lt 1) {
-            return [PSCustomObject]@{ Installed=$false; Version=$null }
+            return [PSCustomObject]@{ Installed=$false; Present=$present; Version=$null }
         }
 
         $versionText = [string]$result[0]
         if ([string]::IsNullOrWhiteSpace($versionText)) {
-            return [PSCustomObject]@{ Installed=$false; Version=$null }
+            return [PSCustomObject]@{ Installed=$false; Present=$present; Version=$null }
         }
 
+        $present = $true
         $version = [Version]$versionText.Trim()
         $valid = ($version -ge $MinimumVersion) -and ($version -lt $MaximumExclusive)
-        return [PSCustomObject]@{ Installed=$valid; Version=$version }
+        return [PSCustomObject]@{ Installed=$valid; Present=$true; Version=$version }
     } catch {
-        return [PSCustomObject]@{ Installed=$false; Version=$null }
+        return [PSCustomObject]@{ Installed=$false; Present=$present; Version=$null }
     }
 }
 
@@ -346,6 +348,13 @@ try {
     if (-not (Test-Path -LiteralPath $AppScript)) {
         throw "firewall_monitor.py was not found beside this installer: $AppScript"
     }
+    # Releases include the entry point and its sibling implementation modules.
+    foreach ($module in 'app.py','widgets.py','tray.py','firewall.py','settings.py',
+                        'monitoring.py','auto_block.py','views.py','updates.py','constants.py','helpers.py') {
+        if (-not (Test-Path -LiteralPath (Join-Path $ScriptDir $module) -PathType Leaf)) {
+            throw "Required application module is missing: $module. Extract all PyFirewall files into the same directory."
+        }
+    }
 
     Write-Step 'Checking Python and Tkinter'
     $python = Get-UsablePython
@@ -371,7 +380,7 @@ try {
         $psutilAction = Read-YesNo 'psutil is required and is not installed in the expected version range. Install/upgrade psutil?'
         if ($psutilAction) {
             Install-PythonPackage $python.Path 'psutil>=5.9.0,<8.0' 'psutil'
-            $PsutilInstalledByPyFirewall = $true
+            $PsutilInstalledByPyFirewall = -not $psutil.Present
             $psutil = Get-PythonPackageStatus $python.Path 'psutil' ([Version]'5.9.0') ([Version]'8.0.0')
         } else {
             Write-WarnMsg 'psutil installation was declined.'
@@ -385,7 +394,7 @@ try {
         $scapyAction = Read-YesNo 'Scapy is required and is not installed in the expected version range. Install/upgrade Scapy?'
         if ($scapyAction) {
             Install-PythonPackage $python.Path 'scapy>=2.5.0,<3.0' 'Scapy'
-            $ScapyInstalledByPyFirewall = $true
+            $ScapyInstalledByPyFirewall = -not $scapy.Present
             $scapy = Get-PythonPackageStatus $python.Path 'scapy' ([Version]'2.5.0') ([Version]'3.0.0')
         } else {
             Write-WarnMsg 'Scapy installation was declined.'
@@ -468,6 +477,17 @@ try {
     Write-Step 'Recording installation ownership'
     Write-PyFirewallInstallMetadata $python $PythonInstalledByPyFirewall $PsutilInstalledByPyFirewall $ScapyInstalledByPyFirewall $NpcapInstalledByPyFirewall
     Write-OK "Installation metadata recorded: $InstallMetadataFile"
+
+    # The application owns the settings schema (including default-on update checks) and column defaults. Do not seed
+    # an old config here: missing settings are initialized by firewall_monitor.py.
+    $configPath = Join-Path $ScriptDir 'firewall_config.json'
+    if (Test-Path -LiteralPath $configPath) {
+        Write-OK 'Existing application, global IP/domain, global port rules, and column preferences will be preserved.'
+        Write-Host 'Use Settings > Manage Settings & Updates > Reset to Defaults to reset rules, column layout, and enable startup update checks.' -ForegroundColor Gray
+    } else {
+        Write-OK 'Clean install: Live Monitor and Active use the same default columns, including Status.'
+        Write-Host 'Startup update checks are ON by default; disable them in Settings > Manage Settings & Updates if desired.' -ForegroundColor Gray
+    }
 
     Write-Step 'Startup at login'
     if (Read-YesNo 'Would you like PyFirewall to start automatically when you log in to Windows?') {
