@@ -1,5 +1,5 @@
 | File | What it covers |
-|---|---|---|
+|---|---|
 | [support.py](/C:/PyFirewall/tests/support.py) | Shared application imports and dependency mocking used throughout the tests. |
 | [test_firewall_monitor.py](/C:/PyFirewall/tests/test_firewall_monitor.py) | Core firewall transactions, rollback, profile recovery, Auto-Block races, packet-capture recovery, and rule actions. Also supplies shared test fixtures. |
 | [test_native_port_rules.py](/C:/PyFirewall/tests/test_native_port_rules.py) | Port-rule creation, removal, rollback, precedence, validation, and preservation of unrelated rules. |
