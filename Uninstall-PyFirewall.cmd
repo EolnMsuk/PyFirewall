@@ -470,15 +470,19 @@ function Restore-PyFirewallFirewallProfileState([object]$Backup) {
 }
 
 function Stop-PyFirewallProcesses {
-    try {
-        $processes = Get-CimInstance Win32_Process -ErrorAction Stop |
-            Where-Object { $_.CommandLine -and $_.CommandLine -match '(?i)firewall_monitor\.py' }
-        foreach ($process in $processes) {
-            Write-WarnMsg "Stopping PyFirewall process $($process.ProcessId) before removing selected prerequisites."
-            Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    $processes = Get-CimInstance Win32_Process -ErrorAction Stop |
+        Where-Object {
+            $_.Name -match '^(?i:pythonw?|py)(?:\d+(?:\.\d+)*)?\.exe$' -and
+            $_.CommandLine -match '(?i)firewall_monitor\.py(?:"|\s|$)'
         }
-    } catch {
-        Write-WarnMsg "Could not inspect running processes: $($_.Exception.Message)"
+    foreach ($process in $processes) {
+        $running = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
+        if (-not $running) { continue }
+        Write-Info "Closing PyFirewall (PID $($process.ProcessId)) before uninstalling components."
+        Stop-Process -InputObject $running -Force -ErrorAction Stop
+        if (-not $running.WaitForExit(10000)) {
+            throw 'PyFirewall did not close. Uninstall was stopped before removing components.'
+        }
     }
 }
 
@@ -551,7 +555,8 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'Choose what to remove. Only installer-owned prerequisites are eligible.' -ForegroundColor White
+    Write-Host 'Choose what to remove. PyFirewall rules and saved settings can always be removed.' -ForegroundColor White
+    Write-Host 'Other applications and Python packages are offered only if installed by the PyFirewall installer.' -ForegroundColor Gray
     Write-Host 'Answering N keeps that component in place.' -ForegroundColor Gray
     Write-Host ''
 
@@ -566,13 +571,13 @@ try {
     $restoreFirewallProfile = $false
 
     $skipReason = if ($installMetadata) {
-        'not recorded as newly installed by Install-PyFirewall.cmd (pre-existing or ownership unknown)'
+        'Not installed by PyFirewall install script (ignored)'
     } else { $MetadataProblem }
-    $removeFirewallRules = Select-Removal 'PyFirewall firewall rules' $hasFirewallRules $true 'Remove all PyFirewall-managed Windows Firewall rules?' ''
-    # Settings are application-created data, not an installer-owned prerequisite.
-    $RetainedComponents['Saved settings and rules (firewall_config.json)'] = if ($installMetadata) {
-        'not installed by Install-PyFirewall.cmd; application-created settings are preserved'
-    } else { $MetadataProblem }
+    # Application-owned rules/settings are eligible regardless of install metadata.
+    # Offer one choice even if only the config exists, or neither exists yet.
+    $rulesAndSettingsLabel = 'PyFirewall firewall rules and saved settings (firewall_config.json)'
+    $removeFirewallRules = Select-Removal $rulesAndSettingsLabel $true $true 'Remove all PyFirewall firewall rules and saved configuration (firewall_config.json), including saved rules and column layout?' ''
+    $removeSettings = $removeFirewallRules
     $restoreFirewallProfile = Select-Removal 'Windows Firewall profile settings' $hasFirewallProfileBackup $true 'Restore the Windows Firewall profile settings saved by PyFirewall?' ''
     if (-not $hasFirewallProfileBackup) {
         $RetainedComponents['Windows Firewall profile settings'] = 'no valid firewall-profile backup was found; original settings cannot be restored safely'
@@ -627,17 +632,18 @@ try {
     if ($removePython) { Write-Host "  - $($pythonEntry.DisplayName)" }
     Write-Host ''
 
-    $needsProcessStop = $removeFirewallRules -or $removeSettings -or $restoreFirewallProfile -or $removePsutil -or $removeScapy -or $removeNpcap -or $removePython
-    if ($needsProcessStop) {
-        Stop-PyFirewallProcesses
-    }
+    # The no-selections path exited above. Every removal, including just a task
+    # or shortcut, must close the application before making changes.
+    Stop-PyFirewallProcesses
 
     if ($removeFirewallRules) {
         Remove-PyFirewallFirewallRules
     }
 
     if ($removeSettings) {
-        Remove-Item -LiteralPath $ConfigFile -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $ConfigFile) {
+            Remove-Item -LiteralPath $ConfigFile -Force -ErrorAction Stop
+        }
         if (Test-Path -LiteralPath $ConfigFile) { throw 'Saved settings could not be removed.' }
         Write-OK 'Saved settings and rule policy removed. A clean launch will use current column defaults.'
     }
@@ -713,14 +719,16 @@ try {
 
     Start-Sleep -Seconds 2
 
-    if ($hasFirewallRules) {
+    if ($hasFirewallRules -or $removeFirewallRules) {
         $remainingFirewallRules = @(Get-PyFirewallRules)
         if ($removeFirewallRules) {
             if ($remainingFirewallRules.Count -gt 0) {
                 Write-WarnMsg "$($remainingFirewallRules.Count) PyFirewall-managed firewall rule(s) are still present."
             } else {
-                $RetainedComponents.Remove('PyFirewall firewall rules')
-            Write-OK 'PyFirewall-managed firewall rules selected for removal are gone.'
+                if (-not (Test-Path -LiteralPath $ConfigFile)) {
+                    $RetainedComponents.Remove($rulesAndSettingsLabel)
+                }
+                Write-OK 'PyFirewall-managed firewall rules selected for removal are gone.'
             }
         } elseif ($remainingFirewallRules.Count -eq $firewallRules.Count) {
             Write-OK "PyFirewall-managed firewall rules were kept ($($firewallRules.Count) remain)."

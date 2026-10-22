@@ -55,6 +55,8 @@ echo.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
 set "EXITCODE=%ERRORLEVEL%"
 
+if "%EXITCODE%"=="1223" exit /b %EXITCODE%
+
 if not "%EXITCODE%"=="0" (
     echo.
     echo Installer exited with code %EXITCODE%.

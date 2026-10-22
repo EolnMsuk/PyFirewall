@@ -46,7 +46,7 @@ function Ask-YesNo([string]$Question) { Write-Host "PROMPT:$Question"; return $f
     def test_preexisting_dependencies_are_not_offered(self):
         output = self.run_review({'python_path': 'C:\\fake\\python.exe'})
         self.assertEqual(output.count('PROMPT:'), 4)
-        self.assertIn('not recorded as newly installed', output)
+        self.assertIn('Not installed by PyFirewall install script (ignored)', output)
 
     def test_owned_dependencies_are_offered_and_declines_reported(self):
         metadata = {'python_path': 'C:\\fake\\python.exe'}
@@ -74,6 +74,60 @@ function Ask-YesNo([string]$Question) { Write-Host "PROMPT:$Question"; return $f
         output = self.run_review(None, "\nfunction Get-PythonPackageInfo { throw 'pip unavailable' }\n")
         self.assertEqual(output.count('PROMPT:'), 4)
         self.assertIn('Python: install log file was missing', output)
+
+    def test_task_only_removal_closes_app_before_removing_task(self):
+        output = self.run_review(None, r'''
+function Ask-YesNo([string]$Question) { return $Question -like '*Scheduled Task?*' }
+function Stop-PyFirewallProcesses { $script:closed = $true; Write-Host 'APP_CLOSED' }
+function Unregister-ScheduledTask {
+    if (-not $script:closed) { throw 'App must close before task removal' }
+    Write-Host 'TASK_REMOVED'
+}
+function Start-Sleep {}
+''')
+        self.assertLess(output.index('APP_CLOSED'), output.index('TASK_REMOVED'))
+        self.assertIn('Windows Firewall profile settings: removal rejected by the user', output)
+
+    def test_combined_choice_declined_keeps_rules_and_config(self):
+        output = self.run_review(None, r'''
+function Remove-Item { throw 'Must preserve config' }
+function Remove-PyFirewallFirewallRules { throw 'Must preserve rules' }
+function Stop-PyFirewallProcesses { throw 'No removals selected' }
+''')
+        self.assertIn('PyFirewall firewall rules and saved settings (firewall_config.json): removal rejected by the user', output)
+        self.assertEqual(output.count('PROMPT:Remove all PyFirewall firewall rules and saved configuration'), 1)
+
+    def test_combined_choice_removes_config_and_rules_without_ownership_log(self):
+        for rules_present, config_present in ((True, True), (False, True), (True, False), (False, False)):
+            with self.subTest(rules=rules_present, config=config_present):
+                mocks = r'''
+$script:rulesPresent = INITIAL_RULES
+$script:configPresent = INITIAL_CONFIG
+function Ask-YesNo([string]$Question) { return $Question -like '*saved configuration*' }
+function Stop-PyFirewallProcesses { $script:closed = $true; Write-Host 'APP_CLOSED' }
+function Get-PyFirewallRules { if ($script:rulesPresent) { [pscustomobject]@{Name='PyFirewall_test'} } }
+function Remove-PyFirewallFirewallRules {
+    if (-not $script:closed) { throw 'App must close first' }
+    $script:rulesPresent = $false
+    Write-Host 'RULES_CLEANED'
+}
+function Test-Path([string]$LiteralPath) {
+    if ($LiteralPath -like '*firewall_config.json') { return $script:configPresent }
+    return $true
+}
+function Remove-Item([string]$LiteralPath) {
+    if (-not $script:closed) { throw 'App must close first' }
+    if ($LiteralPath -notlike '*firewall_config.json') { throw 'Unexpected deletion' }
+    $script:configPresent = $false
+    Write-Host 'CONFIG_REMOVED'
+}
+function Start-Sleep {}
+'''.replace('INITIAL_RULES', '$true' if rules_present else '$false').replace('INITIAL_CONFIG', '$true' if config_present else '$false')
+                output = self.run_review(None, mocks)
+                self.assertIn('Saved settings and rule policy removed', output)
+                summary = output.split('== Components / applications not uninstalled ==')[1]
+                self.assertNotIn('PyFirewall firewall rules and saved settings', summary)
+                self.assertIn('Python: install log file was missing', summary)
 
 
 if __name__ == '__main__':

@@ -315,12 +315,35 @@ function Register-PyFirewallScheduledTask([string]$PythonExe, [string]$ScriptPat
     Write-OK "Scheduled Task configured: $taskName (At Login, Highest privileges)."
 }
 
-function Remove-PyFirewallScheduledTask {
+function Confirm-PyFirewallClosed {
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $_.Name -match '^(?i:pythonw?|py)(?:\d+(?:\.\d+)*)?\.exe$' -and
+        $_.CommandLine -match '(?i)firewall_monitor\.py(?:"|\s|$)'
+    })
+    if ($processes.Count -eq 0) { return $true }
+    if (-not (Read-YesNo 'PyFirewall is running. Close it and continue installation?' $false)) {
+        Write-Host 'Installation cancelled. PyFirewall was left running.' -ForegroundColor Yellow
+        return $false
+    }
+    foreach ($process in $processes) {
+        $running = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
+        if (-not $running) { continue }
+        Stop-Process -InputObject $running -Force -ErrorAction Stop
+        if (-not $running.WaitForExit(10000)) {
+            throw 'PyFirewall did not close. Installation cannot continue.'
+        }
+    }
+    Write-OK 'PyFirewall closed.'
+    return $true
+}
+
+function Configure-PyFirewallStartup([string]$PythonExe, [string]$ScriptPath, [string]$WorkingDirectory) {
     $taskName = 'PyFirewall - At Login'
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-        Write-OK 'PyFirewall will not start automatically at login.'
+        Write-OK 'PyFirewall startup-at-login task already exists; keeping it.'
+    } elseif (Read-YesNo 'Would you like PyFirewall to start automatically when you log in to Windows?') {
+        Register-PyFirewallScheduledTask $PythonExe $ScriptPath $WorkingDirectory
     } else {
         Write-OK 'PyFirewall startup-at-login was not configured.'
     }
@@ -328,6 +351,7 @@ function Remove-PyFirewallScheduledTask {
 
 try {
     Assert-Admin
+    if (-not (Confirm-PyFirewallClosed)) { exit 1223 }
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 
     Write-Step 'Checking Windows'
@@ -490,11 +514,7 @@ try {
     }
 
     Write-Step 'Startup at login'
-    if (Read-YesNo 'Would you like PyFirewall to start automatically when you log in to Windows?') {
-        Register-PyFirewallScheduledTask $pythonw $AppScript $ScriptDir
-    } else {
-        Remove-PyFirewallScheduledTask
-    }
+    Configure-PyFirewallStartup $pythonw $AppScript $ScriptDir
 
     Write-Step 'Launching PyFirewall'
     Write-Host 'Launching firewall_monitor.py...' -ForegroundColor White
