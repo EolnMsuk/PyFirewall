@@ -99,6 +99,10 @@ The main window can be closed but will remain in the system tray. Use **Close** 
 
 PyFirewall stores its configuration in `firewall_config.json` beside the application.
 
+## Troubleshooting
+
+If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator". For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule. For unexpected errors, check `firewall_monitor_errors.log` beside the application for diagnostic details.
+
 ## Uninstallation
 
 Run **`Uninstall-PyFirewall.cmd`** as administrator and answer each prompt with **Y** or **N**.
@@ -113,10 +117,6 @@ The uninstaller will prompt you to remove:
 * Npcap
 
 The installer records which Python components were installed by PyFirewall, warning the user during uninstall.
-
-## Troubleshooting
-
-If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator". For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule. For unexpected errors, check `firewall_monitor_errors.log` beside the application for diagnostic details.
 
 ## References
 
