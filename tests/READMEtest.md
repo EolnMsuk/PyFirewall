@@ -6,7 +6,7 @@
 | [test_review_fixes.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_review_fixes.py) | DNS failures and observed-IP fallback, saved domain rules, table scrolling/resizing, themes, and popup dismissal. |
 | [test_feature_updates.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_feature_updates.py) | Import compatibility, rule directions, column controls, settings persistence/reset, GUI layout, and PowerShell syntax. |
 | [test_settings_and_traffic.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_settings_and_traffic.py) | Traffic totals after pruning, overlapping address accounting, uninstall launch behavior, and settings/donation UI. |
-| [test_startup.py](/C:/PyFirewall/tests/test_startup.py) | Import side effects, elevation/startup ordering, duplicate-instance handling, and resource paths. |
+| [test_startup.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_startup.py) | Import side effects, elevation/startup ordering, duplicate-instance handling, and resource paths. |
 | [test_installer_lifecycle.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_installer_lifecycle.py) | Installer consent to close the app and preservation/creation of the startup task, using mocked Windows operations. |
 | [test_uninstall_policy.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_uninstall_policy.py) | Dependency ownership, missing install logs, declined removals, and cleanup ordering. |
 | [test_update_checks.py](https://github.com/EolnMsuk/PyFirewall/blob/main/tests/test_update_checks.py) | Version comparisons, failed HTTP responses, background checks, preferences, and update prompts. |
