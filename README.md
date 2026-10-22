@@ -77,14 +77,6 @@ The main window can be closed but will remain in the system tray. Use **Close** 
 | Dark theme | Enabled |
 | Check for updates on startup | Enabled |
 
-## Important Firewall Behavior
-
-On each launch, PyFirewall saves the existing Windows Firewall profile settings, enables the profiles, and sets their default inbound and outbound actions to Allow while its managed rules are active. On a normal exit, it restores the saved profile settings. If a session is interrupted, the retained backup is restored before the next session is initialized. Restoration failures are reported and the backup is retained for recovery. The uninstaller can also restore a retained backup.
-
-## Known Issues
-
-* If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator".
-
 ## Files
 
 * `firewall_monitor.py` - launch entry point, administrator elevation, and single-instance guard
@@ -124,7 +116,7 @@ The installer records which Python components were installed by PyFirewall, warn
 
 ## Troubleshooting
 
-For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule. For unexpected errors, check `firewall_monitor_errors.log` beside the application for diagnostic details.
+If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator". For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For repeated Auto-Block prompts, verify that the application does not already have an Allow or Block rule. For unexpected errors, check `firewall_monitor_errors.log` beside the application for diagnostic details.
 
 ## References
 
