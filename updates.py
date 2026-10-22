@@ -98,8 +98,8 @@ class UpdatesMixin:
         dialog.resizable(False, False)
         self._theme_dialog(dialog)
         ttk.Label(dialog, text=f'PyFirewall {version} is available. You are using {__version__}.\n\n'
-                  'Open the release page to read release information and optionally download the update manually. '
-                  'PyFirewall will not download or replace any files.', wraplength=440, padding=16).pack(fill=tk.X)
+                  'Open the release page to downloadthe zip and update manually. '
+                  'After downloading, close PyFirewall from the tray and replace folder.', wraplength=440, padding=16).pack(fill=tk.X)
 
         def cancel():
             self.update_dialog = None

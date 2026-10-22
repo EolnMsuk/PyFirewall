@@ -192,7 +192,7 @@ class SettingsMixin:
         self._make_monitor_controls(self.settings_monitor_controls, prefix='settings_', stacked=True)
         for row, description in enumerate((
                 'Pause or Resume the live capture and threshold rules.',
-                'Filter All Connections auto-blocks and prompts for every new process (requires Monitoring)')):
+                'Filter All Connections auto-blocks and prompts for every new process (requires Monitoring).')):
             tk.Label(self.settings_monitor_controls, text=description, fg=self.colors['muted'],
                      wraplength=600, justify=tk.LEFT).grid(row=row, column=1, sticky=tk.W,
                                                          padx=(18, 0), pady=(0, 12) if row == 0 else 0)
@@ -302,31 +302,31 @@ class SettingsMixin:
 
         donation_label = tk.Label(
             support,
-            text='Donate via Venmo • Support the dev (EolnMsuk)',
+            text='Donate via Venmo',
             bg=self.colors['frame'],
             fg=self.colors['select'],
             cursor='hand2',
-            font=('Segoe UI', 9, 'underline')
+            font=('Segoe UI', 10, 'underline')
         )
         donation_label.grid(row=0, column=1, sticky=tk.SW, pady=2)
         bind_support_link(donation_label, venmo_url)
         add_tooltip(donation_label, 'Open venmo.com/u/rustonrails in your default browser.')
 
         crypto_label = tk.Label(
-            support, text='Donate via Crypto • Support the dev (EolnMsuk)',
+            support, text='Donate via Crypto',
             bg=self.colors['frame'], fg=self.colors['select'], cursor='hand2',
-            font=('Segoe UI', 9, 'underline'))
+            font=('Segoe UI', 10, 'underline'))
         crypto_label.grid(row=1, column=1, sticky=tk.W, pady=2)
         crypto_label.bind('<Button-1>', lambda _event: self.show_crypto_wallets())
         add_tooltip(crypto_label, 'View EolnMsuk’s crypto wallets and click an address to copy it for a donation.')
 
         github_label = tk.Label(
             support,
-            text='GitHub • github.com/EolnMsuk/PyFirewall',
+            text='PyFirewall GitHub',
             bg=self.colors['frame'],
             fg=self.colors['select'],
             cursor='hand2',
-            font=('Segoe UI', 9, 'underline')
+            font=('Segoe UI', 10, 'underline')
         )
         github_label.grid(row=2, column=1, sticky=tk.NW, pady=2)
         bind_support_link(github_label, github_url)
@@ -356,7 +356,7 @@ class SettingsMixin:
             row=5, column=0, sticky=tk.E)
         for row, description in enumerate((
                 'Check for updates at startup, prompts user when one is available.',
-                f'Manually check for updates. PyFirewall-v{__version__} is currently installed.',
+                f'Manually check for updates. PyFirewall v{__version__} is currently installed.',
                 'Export managed global IP/domain, and global port rules to a JSON backup file.',
                 'Import and apply managed global IP/domain, and global port rules from a JSON backup file.',
                 'Reset settings to default and remove all PyFirewall rules.',
@@ -405,9 +405,9 @@ class SettingsMixin:
         body = tk.Frame(dialog, bg=self.colors['frame'])
         body.pack(fill=tk.BOTH, expand=True, padx=18, pady=12)
         title = tk.Label(body, text='Support EolnMsuk - Click any wallet to copy its address',
-                         bg=self.colors['frame'], fg=self.colors['select'], font=('Segoe UI', 10, 'bold'))
-        title._theme_foreground_key = 'select'
+                         bg=self.colors['frame'], fg='#cccccc', font=('Segoe UI', 10, 'bold'))
         title.pack(anchor=tk.W, pady=(0, 8))
+        
         confirmation = tk.Label(body, text='Choose a wallet above.', anchor=tk.W,
                                 bg=self.colors['frame'], fg=self.colors['select'])
         confirmation._theme_foreground_key = 'select'

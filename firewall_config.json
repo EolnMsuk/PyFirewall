@@ -1,0 +1,97 @@
+{
+  "filter_all_enabled": false,
+  "filter_all_saved_alerts": null,
+  "filter_all_saved_auto_block": null,
+  "saved_rate_threshold": 50,
+  "rate_threshold": 50,
+  "rate_window": 5.0,
+  "upload_threshold_mb": 50.0,
+  "max_connections_alerts": 250,
+  "log_alerts_only_enabled": true,
+  "auto_block_enabled": true,
+  "allowed_apps": [
+    "c:\\program files\\mozilla firefox\\firefox.exe",
+    "c:\\program files\\windowsapps\\openai.codex_26.1016.6573.0_x64__2p2nqsd0c76g0\\app\\chatgpt.exe",
+    "c:\\windows\\system32\\svchost.exe"
+  ],
+  "managed_rules": [
+    {
+      "action": "Allow",
+      "direction": "Both",
+      "path": "c:\\program files\\mozilla firefox\\firefox.exe"
+    },
+    {
+      "action": "Allow",
+      "direction": "Both",
+      "path": "c:\\program files\\windowsapps\\openai.codex_26.1016.6573.0_x64__2p2nqsd0c76g0\\app\\chatgpt.exe"
+    },
+    {
+      "action": "Allow",
+      "direction": "Both",
+      "path": "c:\\windows\\system32\\svchost.exe"
+    }
+  ],
+  "global_ip_blocks": [],
+  "global_ip_allows": [],
+  "global_port_rules": [],
+  "hidden_columns": {
+    "monitor": [],
+    "active": [],
+    "rules": [],
+    "alerts": []
+  },
+  "dark_mode": true,
+  "firewall_initialized": false,
+  "column_orders": {
+    "monitor": [
+      "#",
+      "Process Name",
+      "Status",
+      "Direction",
+      "Remote IP",
+      "Remote Host",
+      "Protocol",
+      "Remote Port",
+      "Local Port",
+      "Download (MB)",
+      "Upload (MB)",
+      "Signal",
+      "PID",
+      "Exe Path"
+    ],
+    "active": [
+      "#",
+      "Process Name",
+      "Status",
+      "Direction",
+      "Remote IP",
+      "Remote Host",
+      "Protocol",
+      "Remote Port",
+      "Local Port",
+      "Download (MB)",
+      "Upload (MB)",
+      "Signal",
+      "PID",
+      "Exe Path"
+    ],
+    "rules": [
+      "Status",
+      "Rule / Application",
+      "Direction",
+      "Download (MB)",
+      "Upload (MB)",
+      "Program Path"
+    ],
+    "alerts": [
+      "Time",
+      "Severity",
+      "Process",
+      "PID",
+      "Remote IP",
+      "Remote Host",
+      "Reason"
+    ]
+  },
+  "check_updates_on_startup": true
+}
