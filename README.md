@@ -16,10 +16,9 @@ PyFirewall is a Windows desktop application for monitoring network connections a
 * Auto-Block Protection
 * Per-application allow/block rules
 * Global IP/domain allow and block rules
-* Saved column visibility and ordering, header menus, and double-click column sizing
+* Saved column visibility and ordering and double-click sizing
 * IPv4 and IPv6 address and CIDR support
 * Connection-rate and upload-threshold alerts
-* Configurable connection and alert history limit
 * CSV export for connection data
 * JSON export/import for managed firewall rules
 * System-tray support and automatic start at Windows login
