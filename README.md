@@ -119,7 +119,7 @@ The installer records which Python components were installed by PyFirewall, prev
 
 ## References
 
-* [Python for Windows](https://www.python.org/downloads/windows/)
+* [Python](https://www.python.org/downloads/windows/)
 * [Npcap](https://npcap.com/)
 * [Scapy Documentation](https://scapy.readthedocs.io/)
 
