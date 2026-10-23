@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "2.7"
+__version__ = "2.8"
 LATEST_RELEASE_API = 'https://api.github.com/repos/EolnMsuk/PyFirewall/releases/latest'
 LATEST_RELEASE_PAGE = 'https://github.com/EolnMsuk/PyFirewall/releases/latest'
 DEFAULT_CHECK_UPDATES_ON_STARTUP = True

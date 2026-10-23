@@ -382,7 +382,7 @@ class FirewallMonitorApp(
         bar.pack(fill=tk.X)
         self._button(bar, 'Refresh Rules', self.refresh_rules, '#2196F3')
         self._button(bar, 'Add App Rule', self.add_custom_rule, '#ff9800')
-        self._button(bar, 'Add Global Rule', self.add_global_rule_dialog, GLOBAL_PURPLE)
+        self._button(bar, 'Add Global Rule', self.add_global_rule_dialog, GLOBAL_PURPLE, dark_color_key='global_rule_button')
         self._button(bar, 'Remove Selected', self.remove_selected_rule, '#c62828')
         self._button(bar, 'Export Rules', self.export_rules)
         self._button(bar, 'Import Rules', self.import_rules)

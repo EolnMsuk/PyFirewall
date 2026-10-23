@@ -173,7 +173,8 @@ class WidgetsMixin:
     def apply_theme(self):
         dark = self.dark_mode_var.get()
         self.dark_mode = bool(dark)
-        self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#8b1e1e' if dark else '#ffcaca', 'blocked_in': '#7a4b11' if dark else '#ffcc99', 'global_block': GLOBAL_PURPLE, 'global_allow': '#17665f' if dark else '#c3eee7', 'global_block_in': '#71630f' if dark else '#fff1a8', 'allowed': '#294f31' if dark else '#cce8d2', 'watch': '#5b4a16' if dark else '#fff3cd'}
+        self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#8b1e1e' if dark else '#ffcaca', 'blocked_in': '#7a4b11' if dark else '#ffcc99', 'global_block': '#381b4b' if dark else '#eadcf4', 'global_allow': '#17665f' if dark else '#c3eee7', 'global_block_in': '#71630f' if dark else '#fff1a8', 'allowed': '#294f31' if dark else '#cce8d2', 'watch': '#5b4a16' if dark else '#fff3cd'}
+        self.colors['global_rule_button'] = '#704090'
         self.colors['wallet'] = '#bdbdbd'
         self.root.configure(bg=self.colors['bg'])
         style = ttk.Style(self.root)
@@ -190,7 +191,7 @@ class WidgetsMixin:
         style.map('TNotebook.Tab', background=[('selected', self.colors['frame']), ('active', self.colors['sub'])], foreground=[('selected', self.colors['fg']), ('active', self.colors['fg'])], padding=[('selected', [10, 8, 10, 4]), ('!selected', [10, 5, 10, 5])])
         style.configure('TCheckbutton', background=self.colors['frame'], foreground=self.colors['fg'])
         style.map('TCheckbutton', background=[('active', self.colors['frame'])], foreground=[('disabled', self.colors['muted']), ('active', self.colors['fg'])])
-        style.configure('Treeview', background=self.colors['sub'], foreground=self.colors['fg'], fieldbackground=self.colors['sub'], rowheight=25)
+        style.configure('Treeview', background=self.colors['sub'], foreground=self.colors['fg'] if dark else '#000000', fieldbackground=self.colors['sub'], rowheight=25)
         style.configure('Treeview.Heading', background=self.colors['head'], foreground=self.colors['fg'], font=('Segoe UI', 9, 'bold'))
         style.map('Treeview.Heading', background=[('active', '#d8d8d8'), ('pressed', '#c8c8c8')], foreground=[('active', '#000000'), ('pressed', '#000000')])
         style.map('Treeview', background=[('selected', self.colors['select'])], foreground=[('selected', '#ffffff')])
@@ -229,8 +230,8 @@ class WidgetsMixin:
             tree = getattr(self, name, None)
             if tree is None:
                 continue
-            for tag, key, fg in (('even', 'even', None), ('odd', 'odd', None), ('blocked', 'blocked', None), ('blocked_in', 'blocked_in', None), ('global_block', 'global_block', '#171717'), ('global_block_in', 'global_block_in', '#ffffff' if self.dark_mode else '#171717'), ('global_allow', 'global_allow', '#ffffff' if self.dark_mode else '#171717'), ('allowed', 'allowed', None), ('watch', 'watch', None)):
-                tree.tag_configure(tag, background=self.colors[key], foreground=fg or self.colors['fg'])
+            for tag in ('even', 'odd', 'blocked', 'blocked_in', 'global_block', 'global_block_in', 'global_allow', 'allowed', 'watch'):
+                tree.tag_configure(tag, background=self.colors[tag], foreground=self.colors['fg'] if self.dark_mode else '#000000')
 
     def on_theme_changed(self):
         with self.lock:
@@ -325,7 +326,10 @@ class WidgetsMixin:
             active = button._pyfirewall_source_active_bg
             fg = '#ffffff' if self.dark_mode else '#000000'
             border = button._pyfirewall_border
-            if self.dark_mode:
+            dark_color_key = getattr(button, '_pyfirewall_dark_color_key', None)
+            if self.dark_mode and dark_color_key:
+                color = active = self.colors[dark_color_key]
+            elif self.dark_mode:
                 # Derive from the original semantic color on every update so
                 # theme switches and state changes never compound the shading.
                 channels = button.winfo_rgb(color)
@@ -358,13 +362,14 @@ class WidgetsMixin:
         except tk.TclError:
             pass
 
-    def _button(self, parent, text, command, color=None, pack=True, tooltip=None, **options):
+    def _button(self, parent, text, command, color=None, pack=True, tooltip=None, dark_color_key=None, **options):
         color = color or '#757575'
         border = tk.Frame(parent, bg=color, bd=0, highlightthickness=0)
         border._button_border_frame = True
         settings = {'text': text, 'command': command, 'bg': color, 'fg': 'white', 'activebackground': color, 'activeforeground': 'white', 'relief': 'flat', 'borderwidth': 0, 'highlightthickness': 0, 'font': ('Segoe UI', 9, 'bold'), 'padx': 9}
         settings.update(options)
         button = tk.Button(border, **settings)
+        button._pyfirewall_dark_color_key = dark_color_key
         self._bind_button_hover(button, border)
         button.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         if pack:
