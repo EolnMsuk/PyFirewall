@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 
-from scapy.all import IP, IPv6, TCP, UDP, conf, sniff
+from scapy.all import DNS, IP, IPv6, TCP, UDP, conf, sniff
 
 from constants import (
     DNS_CACHE_MAX_ENTRIES,
@@ -20,7 +20,7 @@ from constants import (
     TRAFFIC_PRUNE_INTERVAL,
     WATCH_PORTS,
 )
-from helpers import log_internal_error, mb, normalize_path, normalize_target
+from helpers import address_networks, is_global_target, is_ip, log_internal_error, mb, normalize_path, normalize_target
 
 class MonitoringMixin:
     """Methods composed into FirewallMonitorApp; state is owned by that application."""
@@ -80,6 +80,75 @@ class MonitoringMixin:
             return None, None, None
 
     # Bounded DNS workers and cache
+
+    def observe_dns_response(self, packet):
+        """Learn display hints from captured DNS; never use hints to enforce rules."""
+        if DNS not in packet:
+            return
+        dns = packet[DNS]
+        if not dns.qr or dns.rcode or dns.tc or not dns.qd:
+            return
+
+        def name(value):
+            if isinstance(value, bytes):
+                value = value.decode('ascii')
+            value = normalize_target(value)
+            return value if is_global_target(value) and not is_ip(value) else ''
+
+        try:
+            query = name(dns.qd[0].qname)
+            if not query or int(dns.qd[0].qtype) not in (1, 28):
+                return
+            answers = [dns.an[index] for index in range(min(int(dns.ancount or len(dns.an)), 128))]
+            aliases = {name(rr.rrname): (name(rr.rdata), int(rr.ttl))
+                       for rr in answers if int(rr.type) == 5}
+            owners, owner, ttl = {}, query, DNS_CACHE_TTL
+            for _ in range(16):
+                if owner in owners or not owner:
+                    break
+                owners[owner] = ttl
+                if owner not in aliases:
+                    break
+                owner, alias_ttl = aliases[owner]
+                ttl = min(ttl, alias_ttl)
+            now = time.monotonic()
+            learned = {}
+            for rr in answers:
+                owner = name(rr.rrname)
+                if int(rr.type) not in (1, 28) or owner not in owners:
+                    continue
+                lifetime = min(owners[owner], int(rr.ttl))
+                if lifetime > 0:
+                    learned[str(ipaddress.ip_address(rr.rdata))] = (query, now + lifetime)
+            with self.dns_lock:
+                cache = getattr(self, 'dns_observed_names', {})
+                cache = {ip: entry for ip, entry in cache.items() if entry[1] > now}
+                # Shared hosting may have many names; display the latest query.
+                for ip, entry in learned.items():
+                    cache.pop(ip, None)
+                    cache[ip] = entry
+                while len(cache) > DNS_CACHE_MAX_ENTRIES:
+                    cache.pop(next(iter(cache)))
+                self.dns_observed_names = cache
+        except (ValueError, TypeError, AttributeError, UnicodeError, IndexError):
+            return
+
+    def remote_host(self, row):
+        if row.get('display_host'):
+            return row['display_host']
+        ip = row.get('dst_ip', '')
+        reverse = row.get('domain', '') or ''
+        friendly = ''
+        if hasattr(self, 'dns_lock'):
+            with self.dns_lock:
+                entry = getattr(self, 'dns_observed_names', {}).get(ip)
+                if entry and entry[1] > time.monotonic():
+                    friendly = entry[0]
+                if time.monotonic() - self.dns_cache_times.get(ip, 0) < DNS_CACHE_TTL:
+                    reverse = self.dns_cache.get(ip) or reverse
+        if friendly and friendly != reverse:
+            return f'{friendly} ({reverse})' if reverse else friendly
+        return reverse or friendly
 
     def _start_dns_workers(self):
         for index in range(DNS_MAX_WORKERS):
@@ -212,6 +281,10 @@ class MonitoringMixin:
                 return
             if not sport:
                 return
+            if sport == 53:
+                self.refresh_process_cache()
+                if normalize_target(dst) in self.local_addresses:
+                    self.observe_dns_response(packet)
             outgoing = self.get_process_info(src, sport, dst, dport, proto, family_key)
             incoming = self.get_process_info(dst, dport, src, sport, proto, family_key)
             if outgoing[0] and incoming[0]:
@@ -274,7 +347,11 @@ class MonitoringMixin:
                     if rate_hit:
                         self.connection_rates.pop(rate_key, None)
             if signal and is_new:
-                self.queue_alert('Watch', proc_name, pid, f'{remote_ip}:{remote_port}', f'{direction} connection on {proto}; {signal}.')
+                with self.lock:
+                    alert_connection = dict(self.active_connections.get(key, {}))
+                endpoint = f'[{remote_ip}]:{remote_port}' if ':' in remote_ip else f'{remote_ip}:{remote_port}'
+                self.queue_alert('Watch', proc_name, pid, endpoint, f'{direction} connection on {proto}; {signal}.',
+                                 connection=alert_connection)
             if upload_key and log_alerts and (upload_total >= upload_threshold * 1024 * 1024):
                 with self.lock:
                     first_upload_alert = upload_key not in self.upload_alerted
@@ -434,9 +511,9 @@ class MonitoringMixin:
     @staticmethod
     def _target_networks(target, addresses=()):
         networks = set()
-        for address in (target, *addresses):
+        for address in (*target.split(','), *addresses):
             try:
-                networks.add(ipaddress.ip_network(normalize_target(address), strict=False))
+                networks.update(address_networks(normalize_target(address)))
             except ValueError:
                 continue
         return networks

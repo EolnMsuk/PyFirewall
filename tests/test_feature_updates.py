@@ -19,26 +19,23 @@ class ColumnAndDialogTests(unittest.TestCase):
         self.a.hidden_columns = {}
         self.a.root = Mock()
 
-    def test_global_dialog_applies_only_ip_domain_actions(self):
+    def test_global_dialog_uses_selected_action_without_second_prompt(self):
         a = self.a
-        a.add_global_rule = Mock()
-        for action in ('allow', 'both', 'in', None):
-            a.add_global_rule.reset_mock()
-            a._choose_option = Mock(side_effect=['ip', action])
-            with patch.object(NS['simpledialog'], 'askstring', return_value=' example.test '):
-                a.add_global_rule_dialog()
-            choices = a._choose_option.call_args.args[2]
-            self.assertEqual([c[0] for c in choices], ['Allow All (Globally)', 'Block (Globally)', 'Block Incoming (Globally)'])
+        a._apply_rule_batch = Mock()
+        a.resolve_global_target = Mock(return_value=['192.0.2.1'])
+        a._choose_option = Mock()
+        for action in ('Allow', 'Block', 'Block Incoming', None):
+            a._apply_rule_batch.reset_mock()
+            a._ask_global_rule_fields = Mock(return_value=('example.test', None, 'remote', 'TCP/UDP', action) if action else None)
+            a.add_global_rule_dialog()
             if action:
-                a.add_global_rule.assert_called_once_with('example.test', action == 'allow',
-                                                         direction='both' if action == 'allow' else action)
+                entry = a._apply_rule_batch.call_args.kwargs['port_updates'][0]
+                self.assertEqual(entry['action'], 'Allow' if action == 'Allow' else 'Block')
+                self.assertEqual(entry.get('direction', 'Both'), 'Inbound' if action == 'Block Incoming' else 'Both')
+                self.assertIsNone(entry['port'])
             else:
-                a.add_global_rule.assert_not_called()
-        for target in (None, '', '  '):
-            a._choose_option = Mock(return_value='ip')
-            with patch.object(NS['simpledialog'], 'askstring', return_value=target):
-                a.add_global_rule_dialog()
-            self.assertEqual(a._choose_option.call_count, 1)
+                a._apply_rule_batch.assert_not_called()
+        a._choose_option.assert_not_called()
 
     def test_incoming_global_block_retains_yellow_and_direction(self):
         a = self.a
@@ -96,11 +93,10 @@ class ColumnAndDialogTests(unittest.TestCase):
         self.assertTrue(all(not r.get('is_port') for r in planned))
         self.assertTrue(all('__P' not in r['name'] and '__Txn' not in r['name'] for r in planned))
 
-    def test_defaults_and_row_values_match_both_trees(self):
+    def test_defaults_and_row_values_match_monitor(self):
         expected = ('#', 'Process Name', 'Status', 'Direction', 'Remote IP', 'Remote Host', 'Protocol',
                     'Remote Port', 'Local Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'PID', 'Exe Path')
         self.assertEqual(App.DEFAULT_COLUMN_ORDERS['monitor'], expected)
-        self.assertEqual(App.DEFAULT_COLUMN_ORDERS['active'], expected)
         row = dict(number=1, name='demo', pid=5, direction='Incoming', protocol='UDP', lport=53,
                    dst_ip='192.0.2.1', dport=50000, exe='C:\\demo.exe')
         mapping = dict(zip(expected, self.a.connection_values(row)))
@@ -255,9 +251,9 @@ class TkHeaderTests(unittest.TestCase):
                         self.assertEqual(a.check_updates_on_startup_var.get(), legacy_value is None)
                     a.chk_updates.invoke()
                     settings_errors.assert_not_called()
-                    for tree in (a.tree, a.active_tree):
+                    for tree in (a.tree,):
                         self.assertEqual(tuple(tree['displaycolumns']), App.MONITOR_COLUMNS)
-                    a._hide_column(a.active_tree, 'PID')
+                    a._hide_column(a.tree, 'PID')
                     self.assertTrue(a.save_settings())
                     legacy = json.loads(config.read_text())
                     legacy['global_port_rules'] = [{'scope': 'remote', 'port': 443, 'action': 'Allow'}]
@@ -265,7 +261,7 @@ class TkHeaderTests(unittest.TestCase):
                     a.hidden_columns.clear()
                     a.load_settings()
                     self.assertTrue(a.check_updates_on_startup_var.get())
-                    self.assertEqual(a.hidden_columns['active'], ['PID'])
+                    self.assertEqual(a.hidden_columns['monitor'], ['PID'])
                     self.assertEqual(a.global_ports, {'remote:443': {'scope': 'remote', 'port': 443, 'action': 'Allow'}})
                     self.assertTrue(a.save_settings())
                     self.assertEqual(json.loads(config.read_text())['global_port_rules'], legacy['global_port_rules'])
@@ -277,7 +273,7 @@ class TkHeaderTests(unittest.TestCase):
                     self.assertFalse(a.check_updates_on_startup)
                     a.dark_mode_var.set(False)
                     a.on_theme_changed()
-                    for variable in (a.search_var, a.active_search_var, a.rule_search_var, a.alert_search_var):
+                    for variable in (a.search_var, a.rule_search_var, a.alert_search_var):
                         variable.set('test filter')
                     with patch.object(NS['messagebox'], 'askyesno', return_value=True), \
                          patch.object(NS['messagebox'], 'showinfo'), patch.object(NS['messagebox'], 'showerror') as errors:
@@ -285,13 +281,13 @@ class TkHeaderTests(unittest.TestCase):
                     errors.assert_not_called()
                     self.assertEqual(fit_window.call_count, 2)  # Initial launch and reset.
                     self.assertFalse(a.hidden_columns)
-                    self.assertEqual(tuple(a.active_tree['displaycolumns']), App.MONITOR_COLUMNS)
+                    self.assertEqual(tuple(a.tree['displaycolumns']), App.MONITOR_COLUMNS)
                     saved = json.loads(config.read_text())
                     self.assertTrue(a.check_updates_on_startup_var.get())
                     self.assertTrue(saved['check_updates_on_startup'])
                     self.assertTrue(saved['dark_mode'])
                     self.assertTrue(a.dark_mode_var.get())
-                    for variable in (a.search_var, a.active_search_var, a.rule_search_var, a.alert_search_var):
+                    for variable in (a.search_var, a.rule_search_var, a.alert_search_var):
                         self.assertEqual(variable.get(), '')
                     self.assertEqual(saved['global_port_rules'], [])
                     self.assertEqual(saved['column_orders']['monitor'], list(App.MONITOR_COLUMNS))

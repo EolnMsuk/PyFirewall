@@ -56,7 +56,6 @@ class GlobalTrafficTests(unittest.TestCase):
         a.global_allows = {'example.test': {'addresses': ('192.0.2.1/32', '192.0.2.2/32')}}
         a.render_rules = Mock()
         a.render_monitor = Mock()
-        a.render_active = Mock()
         a._finish_rule_refresh(1, {}, set(), {}, a.global_allows)
         self.assertEqual((a.rule_rows[0]['download'], a.rule_rows[0]['upload']), (350, 100))
         a.ip_traffic['192.0.2.1']['upload'] += 1024 * 1024
@@ -69,7 +68,7 @@ class GlobalTrafficTests(unittest.TestCase):
         a.rule_search_var.get.return_value = ''
         a.rule_sort = [None, False]
         App.render_rules(a)
-        self.assertEqual(a.rules_tree.insert.call_args.kwargs['values'][4], '1.00 MB')
+        self.assertEqual(a.rules_tree.insert.call_args.kwargs['values'][App.RULE_COLUMNS.index('Upload (MB)')], '1.00 MB')
 
 
 class UninstallTests(unittest.TestCase):
@@ -125,7 +124,7 @@ class SettingsInteractionTests(unittest.TestCase):
                 buttons = [w for w in descendants(root) if isinstance(w, tk.Button)]
                 by_text = lambda text: [w for w in buttons if w.cget('text') == text]
                 sizes = []
-                for tab in (a.tab_monitor, a.tab_active, a.tab_rules, a.tab_alerts):
+                for tab in (a.tab_monitor, a.tab_rules, a.tab_alerts):
                     a.notebook.select(tab)
                     root.update()
                     entry = next(w for w in descendants(tab) if isinstance(w, NS['ttk'].Entry))
@@ -136,7 +135,7 @@ class SettingsInteractionTests(unittest.TestCase):
                 support = next(w for w in descendants(a.tab_settings)
                                if isinstance(w, tk.LabelFrame) and w.cget('text') == 'Support PyFirewall')
                 links = [support.grid_slaves(row=i, column=1)[0] for i in range(3)]
-                self.assertEqual(links[1].cget('text'), 'Donate via Crypto • Support the dev (EolnMsuk)')
+                self.assertEqual(links[1].cget('text'), 'Donate via Crypto')
                 for dark in (False, True):
                     a.dark_mode_var.set(dark)
                     a.apply_theme()
@@ -182,9 +181,9 @@ class SettingsInteractionTests(unittest.TestCase):
                     a.dark_mode_var.set(dark)
                     a.apply_theme()
                     self.assertEqual(dialog.cget('bg'), a.colors['frame'])
-                    self.assertEqual(rows[0].winfo_children()[1].cget('fg'), '#bdbdbd')
+                    self.assertEqual(rows[0].winfo_children()[1].cget('fg'), a.colors['wallet'])
                     self.assertEqual(rows[0].winfo_children()[0].cget('fg'), a.colors['select'])
-                    self.assertEqual(body.pack_slaves()[0].cget('fg'), a.colors['select'])
+                    self.assertEqual(body.pack_slaves()[0].cget('fg'), a.colors['fg'])
                     self.assertEqual(body.pack_slaves()[0].cget('text'),
                                      'Support EolnMsuk - Click any wallet to copy its address')
                 a.show_crypto_wallets()

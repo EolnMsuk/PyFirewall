@@ -257,6 +257,7 @@ class TreeAndPopupTests(unittest.TestCase):
         a.dark_mode = False
         a.dark_mode_var = NS['tk'].BooleanVar(self.root, value=False)
         a.update_filter_ui = a.update_status = Mock()
+        a.apply_theme()
         source_colors = ('#f44336', '#4CAF50', '#2196F3', NS['GLOBAL_PURPLE'], NS['GLOBAL_TEAL'], '#757575', '#9E9E9E')
         with patch_dependencies(add_tooltip=Mock()):
             buttons = [a._button(self.root, 'Action', Mock(), color) for color in source_colors]
@@ -270,22 +271,22 @@ class TreeAndPopupTests(unittest.TestCase):
         light_colors = [button.cget('bg') for button in buttons]
         for button, source in zip(buttons, source_colors):
             self.assertNotEqual(button.cget('bg'), source)
-            self.assertEqual(button.cget('fg'), '#000000')
-            self.assertEqual(button.cget('activeforeground'), '#000000')
+            self.assertEqual(button.cget('fg'), '#333333')
+            self.assertEqual(button.cget('activeforeground'), '#333333')
             self.assertTrue(all(channel >= 178 * 257 for channel in button.winfo_rgb(button.cget('bg'))))
             normal = button.cget('bg')
             button.event_generate('<Enter>')
             self.assertNotEqual(button.cget('bg'), normal)
             if button is not dialog_button:
-                self.assertEqual(button.master.cget('bg'), '#555555')
+                self.assertEqual(button.master.cget('bg'), '#333333')
             self.assertTrue(all(channel >= 165 * 257 for channel in button.winfo_rgb(button.cget('bg'))))
             button.event_generate('<Leave>')
             self.assertEqual(button.cget('bg'), normal)
             if button is not dialog_button:
-                self.assertEqual(button.master.cget('bg'), '#555555')
+                self.assertEqual(button.master.cget('bg'), '#333333')
         self.assertEqual(int(dialog_button.cget('highlightthickness')), 1)
-        self.assertEqual(dialog_button.cget('highlightbackground'), '#555555')
-        self.assertEqual(dialog_button.cget('highlightcolor'), '#555555')
+        self.assertEqual(dialog_button.cget('highlightbackground'), '#333333')
+        self.assertEqual(dialog_button.cget('highlightcolor'), '#333333')
         dark_colors = None
         for dark in (True, False, True, False):
             a.dark_mode_var.set(dark)
@@ -301,12 +302,12 @@ class TreeAndPopupTests(unittest.TestCase):
             else:
                 self.assertEqual([b.cget('bg') for b in buttons], light_colors)
             for button in buttons:
-                self.assertEqual(button.cget('fg'), '#ffffff' if dark else '#000000')
-                self.assertEqual(button.cget('activeforeground'), '#ffffff' if dark else '#000000')
+                self.assertEqual(button.cget('fg'), '#ffffff' if dark else '#333333')
+                self.assertEqual(button.cget('activeforeground'), '#ffffff' if dark else '#333333')
         a._set_button_colors(buttons[0], buttons[0].master, '#9E9E9E', state=NS['tk'].DISABLED)
         self.assertEqual(buttons[0].cget('state'), 'disabled')
-        self.assertEqual(buttons[0].cget('fg'), '#000000')
-        self.assertEqual(buttons[0].master.cget('bg'), '#555555')
+        self.assertEqual(buttons[0].cget('fg'), '#333333')
+        self.assertEqual(buttons[0].master.cget('bg'), '#333333')
 
     def test_context_menu_has_no_grab_and_does_not_swallow_outside_click(self):
         self.root.update()

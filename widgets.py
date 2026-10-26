@@ -1,15 +1,44 @@
 """Shared themed widgets, button feedback, table layout and selection behavior."""
 
+import ctypes
 import tkinter as tk
+from ctypes import wintypes
 from tkinter import font as tkfont, messagebox, ttk
 
 from constants import GLOBAL_PURPLE, GLOBAL_TEAL, GLOBAL_YELLOW
 
+
+def screen_work_area(widget, x, y):
+    """Find the pointer's monitor, excluding its taskbar and other app bars."""
+    class MonitorInfo(ctypes.Structure):
+        _fields_ = [('size', wintypes.DWORD), ('monitor', wintypes.RECT),
+                    ('work', wintypes.RECT), ('flags', wintypes.DWORD)]
+
+    try:
+        user32 = ctypes.windll.user32
+        monitor_from_point = user32.MonitorFromPoint
+        monitor_from_point.argtypes = [wintypes.POINT, wintypes.DWORD]
+        monitor_from_point.restype = wintypes.HANDLE
+        get_monitor_info = user32.GetMonitorInfoW
+        get_monitor_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
+        get_monitor_info.restype = wintypes.BOOL
+        monitor = monitor_from_point(wintypes.POINT(int(x), int(y)), 2)
+        info = MonitorInfo()
+        info.size = ctypes.sizeof(info)
+        if get_monitor_info(monitor, ctypes.byref(info)):
+            return info.work.left, info.work.top, info.work.right, info.work.bottom
+    except (AttributeError, OSError):
+        pass
+    return 0, 0, widget.winfo_screenwidth(), widget.winfo_screenheight()
+
+
 class ThemedContextMenu:
     """Borderless popup with a one-pixel theme border, including on Windows."""
 
-    def __init__(self, root, colors):
+    def __init__(self, root, colors, invoke_command=None):
         self.root, self.colors = root, colors
+        self.invoke_command = invoke_command
+        self.origin = None
         self.window = tk.Toplevel(root, bg=colors['head'], bd=0, highlightthickness=0)
         self.window.withdraw()
         self.window.overrideredirect(True)
@@ -30,10 +59,12 @@ class ThemedContextMenu:
         self.window.bind('<Return>', self._invoke)
         self.window.bind('<space>', self._invoke)
 
-    def add_command(self, label, command, foreground=None, activeforeground='#ffffff'):
+    def add_command(self, label, command, foreground=None, activeforeground='#ffffff', background=None, activebackground=None):
         color = foreground or self.colors['fg']
-        widget = tk.Label(self.body, text=label, anchor='w', bg=self.colors['sub'],
+        widget = tk.Label(self.body, text=label, anchor='w', bg=background or self.colors['sub'],
                           fg=color, font=('Segoe UI', 9), padx=12, pady=5, bd=0)
+        widget._menu_background = background or self.colors['sub']
+        widget._menu_activebackground = activebackground or self.colors['select']
         widget.pack(fill=tk.X)
         index = len(self.items)
         self.items.append((widget, command, color, activeforeground))
@@ -49,10 +80,10 @@ class ThemedContextMenu:
             return 'break'
         if self.active >= 0:
             widget, _, color, _ = self.items[self.active]
-            widget.configure(bg=self.colors['sub'], fg=color)
+            widget.configure(bg=widget._menu_background, fg=color)
         self.active = index % len(self.items)
         widget, _, _, color = self.items[self.active]
-        widget.configure(bg=self.colors['select'], fg=color)
+        widget.configure(bg=widget._menu_activebackground, fg=color)
         return 'break'
 
     def _move(self, step):
@@ -64,7 +95,10 @@ class ThemedContextMenu:
         if 0 <= index < len(self.items):
             command = self.items[index][1]
             self._close()
-            command()
+            if self.invoke_command is None:
+                command()
+            else:
+                self.invoke_command(command, self.origin)
         return 'break'
 
     def _outside_click(self, event):
@@ -87,11 +121,13 @@ class ThemedContextMenu:
         return 'break'
 
     def post(self, x, y):
+        self.origin = (x, y)
         self.previous_focus = self.root.focus_get()
         self.window.update_idletasks()
         width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
-        x = max(0, min(x, self.window.winfo_screenwidth() - width))
-        y = max(0, min(y, self.window.winfo_screenheight() - height))
+        left, top, right, bottom = screen_work_area(self.window, x, y)
+        x = max(left, min(x, right - width))
+        y = max(top, min(y, bottom - height))
         self.window.geometry(f'+{x}+{y}')
         self.window.deiconify()
         self.window.lift()
@@ -162,7 +198,7 @@ class ToolTip:
 def add_tooltip(widget, text, delay=400):
     widget._tooltip = ToolTip(widget, text, delay)
     return widget._tooltip
-BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global IP/domain or local/remote port rule.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
+BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for a domain/IP, a local/remote port, or both.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
 
 
 class WidgetsMixin:
@@ -173,9 +209,10 @@ class WidgetsMixin:
     def apply_theme(self):
         dark = self.dark_mode_var.get()
         self.dark_mode = bool(dark)
-        self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#8b1e1e' if dark else '#ffcaca', 'blocked_in': '#7a4b11' if dark else '#ffcc99', 'global_block': '#381b4b' if dark else '#eadcf4', 'global_allow': '#17665f' if dark else '#c3eee7', 'global_block_in': '#71630f' if dark else '#fff1a8', 'allowed': '#294f31' if dark else '#cce8d2', 'watch': '#5b4a16' if dark else '#fff3cd'}
+        self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#801a1a' if dark else '#ffcaca', 'blocked_in': '#7a4b11' if dark else '#ffcc99', 'global_block': '#593570' if dark else '#dfcdeb', 'global_allow': '#17665f' if dark else '#c3eee7', 'global_block_in': '#71630f' if dark else '#fff1a8', 'allowed': '#294f31' if dark else '#cce8d2', 'watch': '#5b4a16' if dark else '#fff3cd'}
         self.colors['global_rule_button'] = '#704090'
-        self.colors['wallet'] = '#bdbdbd'
+        self.colors['wallet'] = '#bdbdbd' if dark else '#555555'
+        self.colors['text'] = self.colors['fg'] if dark else '#202020'
         self.root.configure(bg=self.colors['bg'])
         style = ttk.Style(self.root)
         try:
@@ -195,20 +232,44 @@ class WidgetsMixin:
         style.configure('Treeview.Heading', background=self.colors['head'], foreground=self.colors['fg'], font=('Segoe UI', 9, 'bold'))
         style.map('Treeview.Heading', background=[('active', '#d8d8d8'), ('pressed', '#c8c8c8')], foreground=[('active', '#000000'), ('pressed', '#000000')])
         style.map('Treeview', background=[('selected', self.colors['select'])], foreground=[('selected', '#ffffff')])
-        style.configure('TEntry', fieldbackground=self.colors['entry'], foreground=self.colors['fg'])
+        style.configure('TEntry', fieldbackground=self.colors['entry'], foreground=self.colors['fg'],
+                        insertcolor='#ffffff' if dark else self.colors['fg'])
         style.map('TEntry', fieldbackground=[('disabled', self.colors['head'])], foreground=[('disabled', self.colors['muted'])])
+        style.configure('Settings.TLabel', foreground=self.colors['text'])
+        style.configure('Settings.TEntry', foreground=self.colors['text'])
+        style.map('Settings.TEntry', foreground=[('disabled', self.colors['muted'] if dark else self.colors['text'])])
+        style.configure('Settings.TCheckbutton', foreground=self.colors['text'])
+        style.map('Settings.TCheckbutton', foreground=[('disabled', self.colors['muted'] if dark else self.colors['text']), ('active', self.colors['text'])])
+        if not hasattr(self, '_original_tbutton_theme'):
+            self._original_tbutton_theme = (
+                {key: style.lookup('TButton', key) for key in ('foreground', 'bordercolor')},
+                {key: style.map('TButton', key) for key in ('foreground', 'bordercolor')})
+        if dark:
+            style.configure('TButton', **self._original_tbutton_theme[0])
+            style.map('TButton', **self._original_tbutton_theme[1])
+        else:
+            style.configure('TButton', foreground=self.colors['fg'], bordercolor=self.colors['fg'])
+            style.map('TButton', foreground=[('disabled', self.colors['muted']), ('active', self.colors['fg'])],
+                      bordercolor=[('active', self.colors['fg']), ('!disabled', self.colors['fg'])])
 
-        def repaint(parent):
+        def repaint(parent, settings=False):
+            settings = settings or parent is getattr(self, 'tab_settings', None)
             for widget in parent.winfo_children():
                 try:
                     if isinstance(widget, tk.Toplevel) and getattr(widget, '_crypto_dialog', False):
                         self._theme_dialog(widget)
                     elif isinstance(widget, tk.LabelFrame):
-                        widget.configure(bg=self.colors['frame'], fg=self.colors['fg'])
+                        widget.configure(bg=self.colors['frame'], fg=self.colors['text'] if settings else self.colors['fg'])
                     elif isinstance(widget, tk.Frame):
-                        widget.configure(bg='#555555' if getattr(widget, '_button_border_frame', False) else self.colors['frame'])
+                        widget.configure(bg=self.colors['fg'] if getattr(widget, '_button_border_frame', False) else self.colors['frame'])
                     elif isinstance(widget, tk.Label):
-                        widget.configure(bg=self.colors['frame'], fg=self.colors[getattr(widget, '_theme_foreground_key', 'fg')])
+                        widget.configure(bg=self.colors['frame'], fg=self.colors[getattr(widget, '_theme_foreground_key', 'text' if settings else 'fg')])
+                    elif settings and isinstance(widget, ttk.Checkbutton):
+                        widget.configure(style='Settings.TCheckbutton')
+                    elif settings and isinstance(widget, ttk.Label):
+                        widget.configure(style='Settings.TLabel')
+                    elif settings and isinstance(widget, ttk.Entry):
+                        widget.configure(style='Settings.TEntry')
                     elif isinstance(widget, tk.Entry):
                         widget.configure(bg=self.colors['entry'], fg=self.colors['fg'], insertbackground=self.colors['fg'])
                     elif isinstance(widget, tk.Checkbutton):
@@ -217,7 +278,7 @@ class WidgetsMixin:
                         self._apply_button_theme(widget)
                 except tk.TclError:
                     pass
-                repaint(widget)
+                repaint(widget, settings)
         repaint(self.root)
         if hasattr(self, 'settings_canvas'):
             self.settings_canvas.configure(bg=self.colors['frame'])
@@ -226,7 +287,7 @@ class WidgetsMixin:
         self.update_status()
 
     def configure_tags(self):
-        for name in ('tree', 'active_tree', 'rules_tree', 'alerts_tree'):
+        for name in ('tree', 'rules_tree', 'alerts_tree'):
             tree = getattr(self, name, None)
             if tree is None:
                 continue
@@ -284,7 +345,7 @@ class WidgetsMixin:
                 hover = self._hover_color(normal_bg, self.dark_mode)
                 button.configure(bg=hover, activebackground=hover, cursor='hand2')
                 if border is not None:
-                    border.configure(bg=hover if self.dark_mode else '#555555')
+                    border.configure(bg=hover if self.dark_mode else self.colors['fg'])
             except tk.TclError:
                 pass
 
@@ -294,7 +355,7 @@ class WidgetsMixin:
                 normal_active_bg = getattr(button, '_pyfirewall_base_active_bg', normal_bg)
                 button.configure(bg=normal_bg, activebackground=normal_active_bg, cursor='')
                 if border is not None:
-                    border.configure(bg=normal_bg if self.dark_mode else '#555555')
+                    border.configure(bg=normal_bg if self.dark_mode else self.colors['fg'])
             except tk.TclError:
                 pass
 
@@ -324,7 +385,7 @@ class WidgetsMixin:
         try:
             color = button._pyfirewall_source_bg
             active = button._pyfirewall_source_active_bg
-            fg = '#ffffff' if self.dark_mode else '#000000'
+            fg = '#ffffff' if self.dark_mode else self.colors['fg']
             border = button._pyfirewall_border
             dark_color_key = getattr(button, '_pyfirewall_dark_color_key', None)
             if self.dark_mode and dark_color_key:
@@ -349,7 +410,7 @@ class WidgetsMixin:
                 button._pyfirewall_base_bg = color
                 button._pyfirewall_base_active_bg = active
             if border is not None:
-                border_color = color if self.dark_mode else '#555555'
+                border_color = color if self.dark_mode else self.colors['fg']
                 border.configure(bg=border_color)
                 border._pyfirewall_base_bg = border_color
             else:
@@ -358,7 +419,7 @@ class WidgetsMixin:
                 button.configure(highlightthickness=(
                     getattr(button, '_pyfirewall_original_highlightthickness', 0)
                     if self.dark_mode else 1),
-                    highlightbackground='#555555', highlightcolor='#555555')
+                    highlightbackground=self.colors['fg'], highlightcolor=self.colors['fg'])
         except tk.TclError:
             pass
 
@@ -386,8 +447,11 @@ class WidgetsMixin:
         frame.columnconfigure(0, weight=1)
         tree = ttk.Treeview(frame, columns=columns, show='headings', selectmode='extended')
         tree._column_order_key = order_key
+        tree._default_column_widths = {}
         for column in columns:
             width, anchor, stretch = widths.get(column, (180, tk.W, True))
+            tree._default_column_widths[column] = width
+            width = getattr(self, 'column_widths', {}).get(order_key, {}).get(column, width)
             tree.heading(column, text=column)
             tree.column(column, width=width, anchor=anchor, stretch=False)
         order = self._normalized_column_order(order_key, columns)
@@ -685,7 +749,32 @@ class WidgetsMixin:
     # Menu and dialog presentation
 
     def _context_menu(self):
-        return ThemedContextMenu(self.root, self.colors)
+        return ThemedContextMenu(self.root, self.colors, self._invoke_near_pointer)
+
+    def _invoke_near_pointer(self, command, origin=None):
+        """Keep a whole dialog sequence at its original activation point."""
+        previous = getattr(self, '_dialog_origin', None)
+        self._dialog_origin = origin or self.root.winfo_pointerxy()
+        try:
+            return command()
+        finally:
+            self._dialog_origin = previous
+
+    def _position_dialog_near_pointer(self, dialog, width=None, height=None):
+        dialog.update_idletasks()
+        width = max(1, int(width or dialog.winfo_reqwidth()))
+        height = max(1, int(height or dialog.winfo_reqheight()))
+        x, y = getattr(self, '_dialog_origin', None) or self.root.winfo_pointerxy()
+        left, top, right, bottom = screen_work_area(dialog, x, y)
+        user32 = ctypes.windll.user32
+        frame_x = user32.GetSystemMetrics(32) + user32.GetSystemMetrics(92)
+        frame_y = user32.GetSystemMetrics(33) + user32.GetSystemMetrics(92)
+        caption = user32.GetSystemMetrics(4)
+        width = min(width, max(1, right - left - 2 * frame_x))
+        height = min(height, max(1, bottom - top - 2 * frame_y - caption))
+        x = max(left, min(x, right - width - 2 * frame_x))
+        y = max(top, min(y, bottom - height - 2 * frame_y - caption))
+        dialog.geometry(f'{width}x{height}+{x}+{y}')
 
     def _menu_rule_command(self, menu, label, command, rule_tag):
         rule_colors = {'allowed': '#4CAF50', 'blocked': '#f44336', 'blocked_in': '#ff9800', 'global_allow': GLOBAL_TEAL, 'global_block': GLOBAL_PURPLE, 'global_block_in': GLOBAL_YELLOW}
@@ -694,7 +783,17 @@ class WidgetsMixin:
             rule_colors.update(allowed='#26732b', blocked='#c62828', blocked_in='#995900',
                                global_allow='#17665f', global_block='#7040a0', global_block_in='#776400')
         color = rule_colors.get(rule_tag, self.colors['fg'])
-        menu.add_command(label=label, command=command, foreground=color, activeforeground='#ffffff')
+        options = {}
+        tags = getattr(menu, 'rule_tags', None)
+        if getattr(menu, 'rule_tag', None) == rule_tag or (isinstance(tags, set) and rule_tag in tags):
+            base = self.colors.get(rule_tag, color)
+            def shade(factor):
+                return '#' + ''.join(f'{int(int(base[i:i + 2], 16) * factor):02x}' for i in (1, 3, 5))
+            options = {'background': shade(0.85 if self.dark_mode else 0.93),
+                       'activebackground': shade(0.72 if self.dark_mode else 0.86)}
+            color = '#ffffff' if self.dark_mode else '#000000'
+        active_color = color if options else '#e8e8e8'
+        menu.add_command(label=label, command=command, foreground=color, activeforeground=active_color, **options)
 
     def _center_dialog(self, dialog, width=None, height=None):
         dialog.update_idletasks()
@@ -709,7 +808,7 @@ class WidgetsMixin:
     def _theme_dialog(self, dialog):
         dialog.configure(bg=self.colors['frame'])
 
-    def _show_details_dialog(self, title, text, tooltip):
+    def _show_details_dialog(self, title, text, tooltip, actions=()):
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.resizable(False, False)
@@ -718,22 +817,45 @@ class WidgetsMixin:
         self._theme_dialog(dialog)
         body = tk.Frame(dialog, bg=self.colors['frame'])
         body.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-        label = tk.Label(body, text=text, justify=tk.LEFT, anchor=tk.NW, bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10), padx=14, pady=12)
-        label.pack(fill=tk.X)
-        button = tk.Button(body, text='Close', command=dialog.destroy, bg=self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=12, pady=4)
-        self._bind_button_hover(button)
-        button.pack(pady=(2, 8))
+        x, y = getattr(self, '_dialog_origin', None) or self.root.winfo_pointerxy()
+        left, top, right, bottom = screen_work_area(dialog, x, y)
+        content = tk.Frame(body, bg=self.colors['frame'])
+        content.pack(fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(content, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        detail_text = tk.Text(content, wrap=tk.WORD, width=85, height=1, bd=0,
+                              bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10),
+                              padx=14, pady=12, yscrollcommand=scrollbar.set)
+        detail_text.insert('1.0', text)
+        detail_text.configure(state=tk.DISABLED)
+        detail_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.configure(command=detail_text.yview)
+        buttons = tk.Frame(body, bg=self.colors['frame'])
+        buttons.pack(pady=(2, 8))
+        for caption, callback, color in (*actions, ('Close', dialog.destroy, None)):
+            button = tk.Button(buttons, text=caption, command=callback, bg=color or self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=12, pady=4)
+            self._bind_button_hover(button)
+            button.pack(side=tk.LEFT, padx=4)
         add_tooltip(button, tooltip)
         dialog.protocol('WM_DELETE_WINDOW', dialog.destroy)
         dialog.update_idletasks()
-        max_width = max(520, int(dialog.winfo_screenwidth() * 0.85))
-        requested_width = dialog.winfo_reqwidth()
-        target_width = min(max(requested_width, 650), max_width)
-        if requested_width > max_width:
-            label.configure(wraplength=max_width - 60)
-            dialog.update_idletasks()
-            target_width = max_width
-        self._center_dialog(dialog, target_width, dialog.winfo_reqheight())
+        target_width = min(max(dialog.winfo_reqwidth(), 650), int((right - left) * 0.85))
+        self._position_dialog_near_pointer(dialog, target_width, dialog.winfo_reqheight())
         dialog.deiconify()
+        dialog.update_idletasks()
+        line_height = tkfont.Font(family='Segoe UI', size=10).metrics('linespace')
+        text_font = tkfont.Font(font=detail_text.cget('font'))
+        text_width = detail_text.winfo_width() - 28  # Text padding on each side.
+        if text_width <= 1:
+            text_width = text_font.measure('0' * 80)
+        displayed = sum(max(1, (text_font.measure(line) + text_width - 1) // text_width)
+                        for line in text.splitlines() or [''])
+        max_lines = max(1, (bottom - top - 150) // line_height)
+        needs_scroll = displayed > max_lines
+        detail_text.configure(height=min(max(1, displayed), max_lines))
+        if not needs_scroll:
+            scrollbar.pack_forget()
+        dialog.update_idletasks()
+        self._position_dialog_near_pointer(dialog, target_width, dialog.winfo_reqheight())
         dialog.lift()
         dialog.focus_force()

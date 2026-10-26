@@ -36,6 +36,8 @@ class MemoryFirewall:
         a.get_firewall_rules = Mock(side_effect=lambda: copy.deepcopy(list(self.rules.values())))
         a.delete_rule_names = Mock(side_effect=self.delete)
         a._create_rule_batch = Mock(side_effect=self.create)
+        a.run_ps = Mock(side_effect=AssertionError('Native firewall calls are forbidden in memory tests'))
+        a.run_netsh = Mock(side_effect=AssertionError('Native firewall calls are forbidden in memory tests'))
         self.fail_once = False
 
     def delete(self, names):
@@ -213,34 +215,30 @@ class PortDisplayTests(unittest.TestCase):
     def test_context_uses_remote_port_and_deduplicates_multiple_connections(self):
         a = app()
         a.selected_connection_data = Mock(return_value=[connection(), connection(protocol='UDP'), connection(dport=80)])
-        a.apply_global_port_rules = Mock()
+        a._apply_rule_batch = Mock()
         a.bulk_remote_ports(object(), False)
-        a.apply_global_port_rules.assert_called_once_with([port(number=80, action='Block'), port(action='Block')])
+        a._apply_rule_batch.assert_called_once_with([], port_updates=[port(number=80, action='Block'), port(action='Block')], report=True)
 
     def test_dialog_local_remote_and_cancel_paths(self):
         a = app()
         a.root = Mock()
-        a.apply_global_port_rules = Mock()
+        a._apply_rule_batch = Mock()
         for scope in ('local', 'remote'):
-            for action in ('Allow', 'Block', None):
-                a.apply_global_port_rules.reset_mock()
-                a._choose_option = Mock(side_effect=['port', scope, action])
-                with patch.object(NS['simpledialog'], 'askinteger', return_value=53):
-                    a.add_global_rule_dialog()
-                if action:
-                    a.apply_global_port_rules.assert_called_once_with([port(scope, 53, action)])
-                else:
-                    a.apply_global_port_rules.assert_not_called()
-        for choices in ([None], ['port', None]):
-            a._choose_option = Mock(side_effect=choices)
-            with patch.object(NS['simpledialog'], 'askinteger') as prompt:
+            for action in ('Allow', 'Block', 'Block Incoming', None):
+                a._apply_rule_batch.reset_mock()
+                a._ask_global_rule_fields = Mock(return_value=('', 53, scope, 'TCP/UDP', action) if action else None)
                 a.add_global_rule_dialog()
-            prompt.assert_not_called()
-        a._choose_option = Mock(side_effect=['port', 'remote'])
-        a.apply_global_port_rules.reset_mock()
-        with patch.object(NS['simpledialog'], 'askinteger', return_value=None):
-            a.add_global_rule_dialog()
-        a.apply_global_port_rules.assert_not_called()
+                if action:
+                    expected = dict(port(scope, 53, 'Allow' if action == 'Allow' else 'Block'), target='', protocol='TCP/UDP', addresses=[])
+                    if action == 'Block Incoming':
+                        expected['direction'] = 'Inbound'
+                    a._apply_rule_batch.assert_called_once_with([], port_updates=[expected], replace_rule=None, report=True)
+                else:
+                    a._apply_rule_batch.assert_not_called()
+        a._ask_global_rule_fields = Mock(return_value=None)
+        a._apply_rule_batch.reset_mock()
+        a.add_global_rule_dialog()
+        a._apply_rule_batch.assert_not_called()
 
 
 class NativePortPowerShellTests(unittest.TestCase):
@@ -279,13 +277,20 @@ function Get-NetFirewallPortFilter {
     $AssociatedNetFirewallRule
 }
 '''
-        for scope, action in (('local', 'Allow'), ('remote', 'Block')):
-            with self.subTest(scope=scope, action=action):
-                a._create_rule_batch(a._port_firewall_rules(a._parse_port_rules([port(scope, 53, action)])))
+        cases = [port('local', 53), port('remote', 53, 'Block'),
+                 dict(port('local', 53, 'Block'), direction='Inbound'),
+                 dict(port('remote', 53, 'Block'), target='example.test',
+                      addresses=['192.0.2.1', '2001:db8::1'], direction='Inbound'),
+                 dict(port('local', 53), target='192.0.2.0/24', addresses=['192.0.2.0/24'])]
+        for entry in cases:
+            scope, action = entry['scope'], entry['action']
+            count = 2 if entry.get('direction') == 'Inbound' else 4
+            with self.subTest(entry=entry):
+                a._create_rule_batch(a._port_firewall_rules(a._parse_port_rules([entry])))
                 creation = a.run_ps.call_args.args[0]
                 a.get_firewall_rules()
                 enumeration = a.run_ps.call_args.args[0]
-                script = stub + creation + "\nif ($script:store.Count -ne 4) { throw 'Wrong native rule count' }\n" + enumeration
+                script = stub + creation + f"\nif ($script:store.Count -ne {count}) {{ throw 'Wrong native rule count' }}\n" + enumeration
                 with tempfile.TemporaryDirectory() as directory:
                     path = pathlib.Path(directory) / 'verify.ps1'
                     path.write_text(script, encoding='utf-8-sig')
@@ -294,8 +299,11 @@ function Get-NetFirewallPortFilter {
                                                   creationflags=NS['CREATE_NO_WINDOW'])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 snapshot = json.loads(result.stdout)
-                self.assertEqual(len(snapshot), 4)
+                self.assertEqual(len(snapshot), count)
                 self.assertTrue(all(r['Program'] == 'Any' and r['Action'] == action for r in snapshot))
+                self.assertTrue(all(r['Addresses'] == entry.get('addresses', ['Any']) for r in snapshot))
+                if count == 2:
+                    self.assertTrue(all(r['Direction'] == 'Inbound' for r in snapshot))
                 a.run_ps.return_value.stdout = result.stdout
                 records = a.get_firewall_rules()
                 self.assertTrue(all(r['is_port'] and r['is_global'] and r['path'] == '' for r in records))

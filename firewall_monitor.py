@@ -3,12 +3,23 @@
 import ctypes
 import hashlib
 import os
+import socket
 import subprocess
 import sys
+import time
 
 from constants import __version__
 
 _MUTEX_HANDLE = None
+
+
+def instance_key():
+    return hashlib.sha1(os.path.normcase(os.path.abspath(__file__)).encode()).hexdigest()
+
+
+def instance_activation_port():
+    """Give each installed copy a stable loopback port for window activation."""
+    return 35000 + (int(instance_key()[:8], 16) % 20000)
 
 
 def hide_console():
@@ -42,14 +53,28 @@ def elevate():
 
 def acquire_single_instance():
     global _MUTEX_HANDLE
-    name = 'Local\\PyFirewall_' + hashlib.sha1(os.path.normcase(os.path.abspath(__file__)).encode()).hexdigest()
+    name = 'Local\\PyFirewall_' + instance_key()
     _MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, False, name)
     if not _MUTEX_HANDLE:
         return True
     if ctypes.windll.kernel32.GetLastError() == 183:
-        ctypes.windll.user32.MessageBoxW(None, 'Python Personal Firewall & Network Monitor is already running.', 'Already Running', 48)
+        activate_existing_instance()
         return False
     return True
+
+
+def activate_existing_instance():
+    """Ask the running copy to restore and foreground its main window."""
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            with socket.create_connection(('127.0.0.1', instance_activation_port()), timeout=0.25) as connection:
+                connection.sendall(b'SHOW')
+                return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
 
 
 def main():
@@ -76,7 +101,7 @@ def main():
             root.iconbitmap(default=ICON_FILE)
         except tk.TclError:
             pass
-    application = FirewallMonitorApp(root)
+    application = FirewallMonitorApp(root, activation_port=instance_activation_port())
     root.mainloop()
 
 

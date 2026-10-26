@@ -84,7 +84,7 @@ class UpdatesMixin:
             self._show_update_prompt(result[0])
         elif manual:
             messagebox.showinfo('Check for Updates',
-                                f'You are already on the latest version of PyFirewall ({__version__}); no newer release is available.',
+                                f'You are already on the latest version of PyFirewall v{__version__}',
                                 parent=self.root)
 
     def _show_update_prompt(self, version):

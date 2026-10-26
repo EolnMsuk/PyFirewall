@@ -20,7 +20,7 @@ class AutoBlockMixin:
             # A matching port is already managed; do not add a new application
             # hold because of this connection. Existing application blocks stay.
             self.queue_alert('High', proc_name, pid, remote_ip,
-                             f'{reason.title()} threshold reached; a global port rule applies. Existing application and IP blocks remain in effect.')
+                             f'{reason.title()} threshold reached; a global port rule applies. Existing application and IP blocks remain in effect.', connection=row)
             return
         app_rule_exists = self.application_has_rule(exe)
         globally_blocked = self.is_globally_blocked(remote_ip, domain, direction)
@@ -38,7 +38,7 @@ class AutoBlockMixin:
                 text = f'{reason.title()} threshold reached for {remote_ip}; Auto-Block Protection is disabled.'
             else:
                 text = f"{reason.title()} threshold reached for {remote_ip}{(f' ({detail})' if detail else '')}; the process was blocked pending your decision."
-        self.queue_alert('High', proc_name, pid, remote_ip, text)
+        self.queue_alert('High', proc_name, pid, remote_ip, text, connection=row)
         with self.lock:
             active = self.log_alerts_only and self.auto_block_enabled and (not self.is_paused)
         if active and not globally_blocked and not globally_allowed and not app_rule_exists:
@@ -307,7 +307,7 @@ class AutoBlockMixin:
         def release_topmost():
             try:
                 if dialog.winfo_exists():
-                    dialog.attributes('-topmost', False)
+                    dialog.attributes('-topmost', getattr(self, 'keep_notification_foreground', True))
             except tk.TclError:
                 pass
         dialog.after(250, release_topmost)

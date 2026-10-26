@@ -48,6 +48,7 @@ class SettingsMixin:
             self.alerts = deque(self.alerts, maxlen=self.max_connections_alerts)
             self.log_alerts_only = bool(config.get('log_alerts_only_enabled', DEFAULT_LOG_ALERTS_ONLY))
             self.auto_block_enabled = self.log_alerts_only and bool(config.get('auto_block_enabled', True))
+            self.keep_notification_foreground = bool(config.get('keep_notification_foreground', True))
             saved_filter_alerts = config.get('filter_all_saved_alerts')
             saved_filter_auto = config.get('filter_all_saved_auto_block')
             if self.filter_all_enabled:
@@ -67,6 +68,14 @@ class SettingsMixin:
             self.dark_mode = bool(config.get('dark_mode', DEFAULT_DARK_MODE))
             self.check_updates_on_startup = config.get('check_updates_on_startup', DEFAULT_CHECK_UPDATES_ON_STARTUP) is True
             self.firewall_initialized = bool(config.get('firewall_initialized', False))
+            for preference in ('column_orders', 'hidden_columns', 'column_widths'):
+                layouts = config.get(preference, {})
+                saved_rules = layouts.get('rules') if isinstance(layouts, dict) else None
+                if isinstance(saved_rules, dict) and 'Rule / Application' in saved_rules:
+                    saved_rules['Application / Domain IP'] = saved_rules.pop('Rule / Application')
+                elif isinstance(saved_rules, (list, tuple)):
+                    layouts['rules'] = ['Application / Domain IP' if c == 'Rule / Application' else c
+                                        for c in saved_rules]
             saved_column_orders = config.get('column_orders', {})
             if isinstance(saved_column_orders, dict):
                 for key, default in self.default_column_orders.items():
@@ -74,7 +83,7 @@ class SettingsMixin:
                     if not isinstance(saved, (list, tuple)):
                         continue
                     valid = [column for column in saved if column in default]
-                    if key in {'monitor', 'active'} and 'Status' not in valid:
+                    if key == 'monitor' and 'Status' not in valid:
                         if 'Process Name' in valid:
                             valid.insert(valid.index('Process Name') + 1, 'Status')
                         else:
@@ -85,6 +94,21 @@ class SettingsMixin:
             self.hidden_columns = {key: [c for c in hidden.get(key, []) if c in default]
                                    for key, default in self.default_column_orders.items()
                                    if isinstance(hidden, dict) and isinstance(hidden.get(key, []), list)}
+            widths = config.get('column_widths', {})
+            self.column_widths = {}
+            if isinstance(widths, dict):
+                for key, columns in self.default_column_orders.items():
+                    saved = widths.get(key, {})
+                    if isinstance(saved, dict):
+                        self.column_widths[key] = {c: w for c, w in saved.items()
+                                                   if c in columns and type(w) is int and 1 <= w <= 10000}
+            size = config.get('window_size')
+            self.window_size = (list(size) if isinstance(size, (list, tuple)) and len(size) == 2
+                                and all(type(n) is int and 1 < n <= 30000 for n in size) else None)
+            self.window_maximized = config.get('window_maximized', False) is True
+            position = config.get('window_position')
+            self.window_position = (list(position) if isinstance(position, (list, tuple)) and len(position) == 2
+                                    and all(type(n) is int and -100000 <= n <= 100000 for n in position) else None)
             self.allowed_apps = {normalize_path(p) for p in config.get('allowed_apps', []) if normalize_path(p)}
             self.global_ports = self._parse_port_rules(config.get('global_port_rules', []))
             self.pending_rules = []
@@ -118,6 +142,7 @@ class SettingsMixin:
         self.max_connections_alerts_var.set(str(self.max_connections_alerts))
         self.log_alerts_var.set(self.log_alerts_only)
         self.auto_block_var.set(self.auto_block_enabled)
+        self.keep_notification_foreground_var.set(self.keep_notification_foreground)
         self.dark_mode_var.set(self.dark_mode)
         self.check_updates_on_startup_var.set(self.check_updates_on_startup)
 
@@ -130,6 +155,11 @@ class SettingsMixin:
                     managed += [{'action': 'Block', 'direction': self._direction_from_flags(data), 'path': data.get('path', normalized)} for normalized, data in sorted(self.blocked_paths.items())]
                     config = {'filter_all_enabled': self.filter_all_enabled, 'filter_all_saved_alerts': self.filter_all_saved_alerts, 'filter_all_saved_auto_block': self.filter_all_saved_auto_block, 'saved_rate_threshold': self.saved_rate_threshold, 'rate_threshold': self.rate_threshold, 'rate_window': self.rate_window, 'upload_threshold_mb': self.upload_threshold_mb, 'max_connections_alerts': self.max_connections_alerts, 'log_alerts_only_enabled': self.log_alerts_only, 'auto_block_enabled': self.auto_block_enabled, 'allowed_apps': sorted(self.allowed_apps), 'managed_rules': managed, 'global_ip_blocks': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_blocks.items())], 'global_ip_allows': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_allows.items())], 'global_port_rules': list(getattr(self, 'global_ports', {}).values()), 'hidden_columns': getattr(self, 'hidden_columns', {}), 'dark_mode': bool(self.dark_mode), 'firewall_initialized': self.firewall_initialized, 'column_orders': {key: list(order) for key, order in self.column_orders.items()}}
                     config['check_updates_on_startup'] = self.check_updates_on_startup
+                    config['keep_notification_foreground'] = getattr(self, 'keep_notification_foreground', True)
+                    config['column_widths'] = getattr(self, 'column_widths', {})
+                    config['window_size'] = getattr(self, 'window_size', None)
+                    config['window_position'] = getattr(self, 'window_position', None)
+                    config['window_maximized'] = getattr(self, 'window_maximized', False)
                 with open(temp, 'w', encoding='utf-8') as f:
                     json.dump(config, f, indent=2)
                     f.flush()
@@ -202,6 +232,10 @@ class SettingsMixin:
         self.chk_alerts.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=5)
         self.chk_auto = ttk.Checkbutton(frame, text='Enable Auto-Block Protection', variable=self.auto_block_var, command=self.on_auto_block_changed)
         self.chk_auto.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
+        self.chk_foreground = ttk.Checkbutton(frame, text='Enable Keep Notification in Foreground',
+                                            variable=self.keep_notification_foreground_var,
+                                            command=self.on_notification_foreground_changed)
+        self.chk_foreground.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=5)
         fields = (('Max Connections Threshold', self.rate_threshold_var, 'connections / process / target'), ('Time Window', self.rate_window_var, 'seconds'), ('Max Upload Threshold', self.upload_threshold_var, 'MB / process / target IP'))
         for row, (label, variable, suffix) in enumerate(fields, 3):
             tk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=6)
@@ -651,6 +685,19 @@ class SettingsMixin:
         self.root.update_idletasks()
         self._queue_settings_change(release_auto_holds=not actual_enabled)
 
+    def on_notification_foreground_changed(self):
+        with self.lock:
+            self.keep_notification_foreground = bool(self.keep_notification_foreground_var.get())
+        dialog = self.auto_prompt_dialog
+        if dialog is not None:
+            try:
+                dialog.attributes('-topmost', self.keep_notification_foreground)
+                if self.keep_notification_foreground:
+                    dialog.lift()
+            except tk.TclError:
+                pass
+        self.save_settings()
+
     # History limits, applying settings and reset
 
     def _prune_connection_and_alert_history_locked(self):
@@ -699,7 +746,6 @@ class SettingsMixin:
         self.save_settings()
         if self.startup_complete:
             self.render_monitor()
-            self.render_active()
             self.render_alerts()
         self.update_status()
         return True
@@ -728,6 +774,7 @@ class SettingsMixin:
                 self.max_connections_alerts = DEFAULT_MAX_CONNECTIONS_ALERTS
                 self.log_alerts_only = DEFAULT_LOG_ALERTS_ONLY
                 self.auto_block_enabled = True
+                self.keep_notification_foreground = True
                 self.dark_mode = DEFAULT_DARK_MODE
                 self.check_updates_on_startup = DEFAULT_CHECK_UPDATES_ON_STARTUP
                 self.allowed_apps.clear()
@@ -736,6 +783,10 @@ class SettingsMixin:
                 self.global_allows.clear()
                 self.global_ports.clear()
                 self.hidden_columns.clear()
+                self.column_widths = {}
+                self.window_size = None
+                self.window_position = None
+                self.window_maximized = False
                 self.active_connections.clear()
                 self.connection_rates.clear()
                 self.proc_ip_upload.clear()
@@ -748,19 +799,23 @@ class SettingsMixin:
                 self.total_download = self.total_upload = 0
                 self.firewall_initialized = True
                 self.column_orders = {key: list(order) for key, order in self.default_column_orders.items()}
-            for tree_name, order_key in (('tree', 'monitor'), ('active_tree', 'active'), ('rules_tree', 'rules'), ('alerts_tree', 'alerts')):
+            for tree_name, order_key in (('tree', 'monitor'), ('rules_tree', 'rules'), ('alerts_tree', 'alerts')):
                 tree = getattr(self, tree_name, None)
                 if tree is not None:
                     tree['displaycolumns'] = tuple(self.column_orders[order_key])
+                    for column, width in getattr(tree, '_default_column_widths', {}).items():
+                        tree.column(column, width=width)
+                    tree._fill_column = None
             self.rate_threshold_var.set(str(self.rate_threshold))
             self.rate_window_var.set(str(DEFAULT_RATE_WINDOW))
             self.upload_threshold_var.set(str(DEFAULT_UPLOAD_THRESHOLD_MB))
             self.max_connections_alerts_var.set(str(DEFAULT_MAX_CONNECTIONS_ALERTS))
             self.log_alerts_var.set(DEFAULT_LOG_ALERTS_ONLY)
             self.auto_block_var.set(True)
+            self.keep_notification_foreground_var.set(True)
             self.dark_mode_var.set(DEFAULT_DARK_MODE)
             self.apply_theme()
-            for variable in (self.search_var, self.active_search_var, self.rule_search_var, self.alert_search_var):
+            for variable in (self.search_var, self.rule_search_var, self.alert_search_var):
                 variable.set('')
             self.check_updates_on_startup_var.set(DEFAULT_CHECK_UPDATES_ON_STARTUP)
             self.clear_alerts()

@@ -48,16 +48,56 @@ def display_path(path):
 
 
 def normalize_target(target):
-    value = str(target or '').strip().strip('[]').casefold().rstrip('.')
+    value = str(target or '').strip()
+    if ',' in value:
+        return ', '.join(dict.fromkeys(normalize_target(part) for part in value.split(',')))
+    value = value.strip('[]').casefold().rstrip('.')
+    try:
+        start, end = ip_range(value)
+        return f'{start}-{end}'
+    except ValueError:
+        pass
     try:
         return str(ipaddress.ip_network(value, strict=False)) if '/' in value else str(ipaddress.ip_address(value))
     except ValueError:
         return value
 
 
+def ip_range(value):
+    """Parse an inclusive native firewall range without expanding its addresses."""
+    parts = str(value).split('-')
+    if len(parts) != 2:
+        raise ValueError('Expected an IP range.')
+    start, end = (ipaddress.ip_address(part.strip().strip('[]')) for part in parts)
+    if start.version != end.version or int(start) > int(end):
+        raise ValueError('IP ranges must use one address family and ascending endpoints.')
+    return start, end
+
+
+def address_networks(value):
+    try:
+        return tuple(ipaddress.summarize_address_range(*ip_range(value)))
+    except ValueError:
+        return (ipaddress.ip_network(value, strict=False),)
+
+
+def normalize_address(value):
+    """Validate firewall address filters; hostnames are never accepted here."""
+    value = normalize_target(value)
+    address_networks(value)
+    return value
+
+
+def global_targets(value):
+    targets = list(dict.fromkeys(normalize_target(part) for part in str(value).split(',')))
+    if not all(is_global_target(part) for part in targets):
+        raise ValueError('Enter valid domains, IP addresses, CIDRs or ascending IP ranges.')
+    return targets
+
+
 def is_ip(target):
     try:
-        ipaddress.ip_address(str(target).strip().strip('[]').split('/', 1)[0].split(' (', 1)[0])
+        address_networks(normalize_target(str(target).split(' (', 1)[0]))
         return True
     except ValueError:
         return False
@@ -69,10 +109,13 @@ def is_global_target(target):
     if value in {'', '\u2014', '-'}:
         return False
     try:
-        ipaddress.ip_network(value, strict=False)
+        address_networks(value)
         return True
     except ValueError:
         pass
+    if '-' in value and (':' in value or re.match(r'^\d+(?:\.\d+){3}\s*-', value)):
+        # Do not mistake malformed/reversed numeric ranges for DNS hostnames.
+        return False
     try:
         hostname = value.encode('idna').decode('ascii')
     except UnicodeError:

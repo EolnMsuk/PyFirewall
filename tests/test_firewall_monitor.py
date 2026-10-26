@@ -25,6 +25,12 @@ def app():
     a.update_check_running = a.update_check_manual = False
     a.update_dialog = None
     a.log_alerts_only = a.auto_block_enabled = True
+    a.keep_notification_foreground = True
+    a.keep_notification_foreground_var = Mock()
+    a.column_widths = {}
+    a.window_size = None
+    a.window_maximized = False
+    a.alert_connections = {}
     a.auto_prompt_generation = 0
     a.auto_prompt_keys = set()
     a.auto_prompt_dialog = a.auto_prompt_key = None
@@ -40,6 +46,8 @@ def app():
     a.queue_alert = Mock()
     a.save_settings = Mock(return_value=True)
     a.rules_changed = Mock()
+    a.root = Mock()
+    a._show_rule_result = Mock()
     a.capture_error = None
     a.capture_healthy = False
     return a
@@ -676,7 +684,7 @@ class BulkOperationTests(unittest.TestCase):
             (NS['display_path']('C:/two.exe'), True, 'Both', False),
             ('192.0.2.1', False, 'both', True), ('2001:db8::1', True, 'both', True)], quiet=True)
         messages.showerror.assert_not_called()
-        messages.showinfo.assert_called_once()
+        messages.showinfo.assert_not_called()
 
     def test_large_scripts_use_temporary_file_and_clean_up_on_failure(self):
         a = app()
@@ -1089,7 +1097,7 @@ class DuplicateRuleTests(unittest.TestCase):
         a.allowed_apps.add(self.path)
         with patch_dependencies(messagebox=self.messages):
             self.assertTrue(a.allow_executable('C:/Apps/./Test.exe'))
-        self.assertEqual(self.messages.showwarning.call_count, 4)
+        self.messages.showwarning.assert_not_called()
         a.get_firewall_rules.assert_not_called()
         a.run_ps.assert_not_called()
         a.run_netsh.assert_not_called()
@@ -1103,7 +1111,7 @@ class DuplicateRuleTests(unittest.TestCase):
         with patch_dependencies(messagebox=self.messages):
             self.assertTrue(a.allow_executable(self.path))
         self.messages.showerror.assert_not_called()
-        self.messages.showwarning.assert_called_once()
+        self.messages.showwarning.assert_not_called()
 
     def test_duplicate_is_rechecked_after_serializing_with_another_writer(self):
         a = self.a
@@ -1117,7 +1125,7 @@ class DuplicateRuleTests(unittest.TestCase):
         with patch_dependencies(messagebox=self.messages):
             self.assertTrue(a.block_executable(path))
         a.get_firewall_rules.assert_not_called()
-        self.messages.showwarning.assert_called_once()
+        self.messages.showwarning.assert_not_called()
 
     def test_direction_change_and_opposite_action_are_not_duplicates(self):
         a = self.a
@@ -1129,7 +1137,7 @@ class DuplicateRuleTests(unittest.TestCase):
         a.blocked_paths.clear()  # Temporary auto-holds are not permanent blocks.
         self.assertFalse(a._rule_is_duplicate(self.path))
 
-    def test_batch_warns_once_without_refresh_for_all_duplicates(self):
+    def test_batch_is_silent_without_refresh_for_all_duplicates(self):
         a = self.a
         a.blocked_paths[self.path] = {'in': True, 'out': True}
         other = NS['normalize_path']('C:/other.exe')
@@ -1138,8 +1146,7 @@ class DuplicateRuleTests(unittest.TestCase):
         with patch_dependencies(messagebox=self.messages):
             a._apply_rule_batch([(self.path, False, 'both', False),
                                  (other, False, 'both', False), (self.path.upper(), False, 'both', False)])
-        self.messages.showwarning.assert_called_once()
-        self.assertIn('Skipped 2', self.messages.showwarning.call_args.args[1])
+        self.messages.showwarning.assert_not_called()
         a.block_executable.assert_not_called()
         a.rules_changed.assert_not_called()
 
@@ -1156,11 +1163,11 @@ class DuplicateRuleTests(unittest.TestCase):
     def test_custom_app_rule_uses_duplicate_fast_path(self):
         a = self.a
         a.allowed_apps.add(self.path)
-        a.ask_direction = Mock(return_value='allow')
+        a._choose_option = Mock(return_value='allow')
         with patch_dependencies(messagebox=self.messages, filedialog=types.SimpleNamespace(
                 askopenfilename=lambda **kw: self.path)):
             a.add_custom_rule()
-        self.messages.showwarning.assert_called_once()
+        a._show_rule_result.assert_not_called()
         a.get_firewall_rules.assert_not_called()
 
     def test_connection_context_menu_uses_duplicate_preflight(self):
@@ -1170,7 +1177,7 @@ class DuplicateRuleTests(unittest.TestCase):
         a.blocked_paths[self.path] = {'in': True, 'out': True}
         with patch_dependencies(messagebox=self.messages):
             a.block_process(direction='both')
-        self.messages.showwarning.assert_called_once()
+        a._show_rule_result.assert_not_called()
         a.get_firewall_rules.assert_not_called()
         a.rules_changed.assert_not_called()
 
@@ -1235,7 +1242,7 @@ class ContextGlobalRuleTests(unittest.TestCase):
         a.ask_direction.assert_not_called()
         a.add_global_rule.assert_called_once_with('example.test', True, direction='both')
 
-    def test_live_and_active_columns_group_domain_and_observed_ip(self):
+    def test_live_columns_group_domain_and_observed_ip(self):
         for status_column in (False, True):
             for domain in ('example.test', '', '\u2014'):
                 with self.subTest(status_column=status_column, domain=domain):
@@ -1265,15 +1272,18 @@ class ContextGlobalRuleTests(unittest.TestCase):
                                     ('2001:db8::1', '2001:db8::1')]:
             with self.subTest(remote=remote):
                 self.a.selected_rows = Mock(return_value=[('alert', ['', '', 'App', 42, remote, 'example.test'])])
-                self.a._apply_rule_batch = lambda requests: setattr(self, 'requests', list(requests))
+                def capture(requests, **options):
+                    self.requests = list(requests)
+                    self.observed = options['observed_addresses']
+                self.a._apply_rule_batch = capture
                 self.a.alert_action(False, True, 'in')
-                self.assertEqual(set(self.requests), {(expected_ip, False, 'in', True),
-                                                     ('example.test', False, 'in', True)})
+                self.assertEqual(self.requests, [('example.test', False, 'in', True)])
+                self.assertEqual(self.observed, {'example.test': {expected_ip}})
 
     def test_expired_ip_only_alert_still_allows_ip(self):
         self.a.alerts_tree = object()
         self.a.selected_rows = Mock(return_value=[('alert', ['', '', 'App', 42, '192.0.2.1', '\u2014'])])
-        self.a._apply_rule_batch = lambda requests: setattr(self, 'requests', list(requests))
+        self.a._apply_rule_batch = lambda requests, **options: setattr(self, 'requests', list(requests))
         self.a.alert_global_domain(True)
         self.assertEqual(self.requests, [('192.0.2.1', True, 'both', True)])
 
@@ -1284,11 +1294,11 @@ class ContextGlobalRuleTests(unittest.TestCase):
             ('global', ('Global Block', 'IP', 'Both', 0, 0, 'example.test (192.0.2.1)'))])
         self.a._apply_rule_batch = Mock()
         self.a.bulk_rule_global(True)
-        self.a._apply_rule_batch.assert_called_once_with([('example.test', True, 'both', True)])
+        self.a._apply_rule_batch.assert_called_once_with([('example.test', True, 'both', True)], report=True)
         self.assertIn('not global IP/Domain rules', self.messages.showwarning.call_args.args[1])
         self.a._apply_rule_batch.reset_mock()
         self.a.rules_menu_block('in')
-        self.a._apply_rule_batch.assert_called_once_with([('C:/app.exe', False, 'in', False)])
+        self.a._apply_rule_batch.assert_called_once_with([('C:/app.exe', False, 'in', False)], report=True)
         self.assertIn('not application rules', self.messages.showwarning.call_args.args[1])
 
     def test_batch_rejects_wrong_target_types_before_dns_but_applies_valid_items(self):
@@ -1377,26 +1387,29 @@ class ContextGlobalRuleTests(unittest.TestCase):
     def test_menus_group_combined_global_actions_and_removal(self):
         a = self.a
         a.colors = {'fg': '#eee'}
-        a.tree = a.active_tree = a.alerts_tree = object()
+        a.tree = object()
+        a.alerts_tree = Mock()
+        a.alerts_tree.item.return_value = ('', '', 'demo', 1, '192.0.2.1', '')
+        a.selected_rows = Mock(return_value=[('selected', a.alerts_tree.item.return_value)])
+        a.alert_connection_row = Mock(return_value={'exe': 'C:\\demo.exe'})
         a._focus_menu_row = Mock(return_value='selected')
         a._show_header_menu = Mock(return_value=False)
+        a.selected_connection_data = Mock(return_value=[{'exe': 'C:\\demo.exe'}])
+        a.allowed_apps.add(NS['normalize_path']('C:\\demo.exe'))
         event = types.SimpleNamespace(x_root=10, y_root=20)
-        for show in (lambda: a.show_connection_menu(event, a.tree),
-                     lambda: a.show_connection_menu(event, a.active_tree),
-                     lambda: a.show_alert_menu(event)):
+        for show, details in ((lambda: a.show_connection_menu(event, a.tree), 'Connection details'),
+                              (lambda: a.show_alert_menu(event), 'Alert Details')):
             entries = []
             menu = Mock()
             menu.add_command.side_effect = lambda **kwargs: entries.append(kwargs['label'])
             menu.add_separator.side_effect = lambda: entries.append('|')
             a._context_menu = Mock(return_value=menu)
             show()
-            self.assertEqual(entries[3:8], ['|', 'Allow IP Domain (Global)', 'Block IP Domain (Global)',
-                                            'Block IP Domain (Global) Incoming', '|'])
-            self.assertEqual(entries[-2:], ['|', 'Remove App Rule'])
-            if 'Connection Details' in entries:
-                self.assertEqual(entries[8:11], ['Allow Remote Port (Global)', 'Block Remote Port (Global)', '|'])
-            else:
-                self.assertFalse(any('Port (Global)' in label for label in entries))
+            self.assertEqual(entries[4:9], ['|', 'Allow Connection', 'Block Incoming',
+                                            'Block Connection', '|'])
+            self.assertLess(entries.index('Remove App Rule'), entries.index('Open file location'))
+            self.assertEqual(entries[-4:], ['Copy IP Domain', 'Copy details', 'Connection details', 'Open file location'])
+            self.assertFalse(any('Port (Global)' in label for label in entries))
 
 
 if __name__ == '__main__':

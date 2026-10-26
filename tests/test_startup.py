@@ -2,8 +2,9 @@
 
 import importlib.util
 from pathlib import Path
+import queue
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import app as app_module
 import constants
@@ -33,7 +34,7 @@ class StartupTests(unittest.TestCase):
              patch.object(entry, 'elevate', side_effect=lambda: events.append('elevate')), \
              patch.object(entry, 'acquire_single_instance', side_effect=lambda: events.append('mutex') or True), \
              patch.object(tk, 'Tk', side_effect=lambda: events.append('window') or root), \
-             patch.object(app_module, 'FirewallMonitorApp', side_effect=lambda _: events.append('application')):
+             patch.object(app_module, 'FirewallMonitorApp', side_effect=lambda *_args, **_kwargs: events.append('application')):
             entry.main()
         self.assertEqual(events, ['hide', 'elevate', 'mutex', 'window', 'application', 'mainloop'])
         root.iconbitmap.assert_called_once_with(default=constants.ICON_FILE)
@@ -46,6 +47,39 @@ class StartupTests(unittest.TestCase):
             entry.main()
         window.assert_not_called()
         application.assert_not_called()
+
+    def test_duplicate_instance_signals_the_running_copy_without_a_message_box(self):
+        kernel32 = Mock()
+        kernel32.CreateMutexW.return_value = 1
+        kernel32.GetLastError.return_value = 183
+        native = MagicMock()
+        native.kernel32 = kernel32
+        with patch.object(entry.ctypes, 'windll', native), \
+             patch.object(entry, 'activate_existing_instance', return_value=True) as activate:
+            self.assertFalse(entry.acquire_single_instance())
+        activate.assert_called_once_with()
+        self.assertFalse(hasattr(native.user32, 'MessageBoxW') and native.user32.MessageBoxW.called)
+
+    def test_activation_request_retries_until_the_listener_is_ready(self):
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        with patch.object(entry, 'instance_activation_port', return_value=40123), \
+             patch.object(entry.socket, 'create_connection', side_effect=[OSError('not ready'), connection]) as connect, \
+             patch.object(entry.time, 'monotonic', side_effect=[0, 0, 0.1]), \
+             patch.object(entry.time, 'sleep') as sleep:
+            self.assertTrue(entry.activate_existing_instance())
+        self.assertEqual(connect.call_args_list[0].args, (('127.0.0.1', 40123),))
+        connection.sendall.assert_called_once_with(b'SHOW')
+        sleep.assert_called_once_with(0.1)
+
+    def test_running_app_queues_show_request_from_loopback(self):
+        application = app_module.FirewallMonitorApp.__new__(app_module.FirewallMonitorApp)
+        application.tray_command_queue = queue.Queue()
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.return_value = b'SHOW'
+        application._handle_instance_activation(connection)
+        self.assertEqual(application.tray_command_queue.get_nowait(), 'show')
 
     def test_elevation_exit_stops_startup(self):
         with patch.object(entry, 'hide_console'), \
