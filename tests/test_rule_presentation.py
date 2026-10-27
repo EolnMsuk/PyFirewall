@@ -87,14 +87,24 @@ class RuleTableTests(unittest.TestCase):
         self.assertEqual([application[k] for k in ('Remote Port', 'Local Port', 'Protocol')],
                          ['All', 'All', 'TCP/UDP'])
         self.assertEqual([v['Remote Port'] for v in values if v['Remote Port'].isdigit()], ['80', '443'])
+        self.assertIn('Local Port 53 (UDP)', [v['Application & Global Rules'] for v in values])
+        self.assertIn('Remote Port 80 (TCP)', [v['Application & Global Rules'] for v in values])
+        no_port = next(v for v in values if v['Application & Global Rules'] == '198.51.100.1')
+        self.assertEqual((no_port['Remote Port'], no_port['Local Port']), ('All', 'All'))
+        self.assertEqual(no_port['Program Path'], 'remote:All:198.51.100.1')
+        a.rules_tree.selection_set('port:remote:None:198.51.100.1')
+        a._remove_rules_with_feedback = Mock()
+        a.remove_selected_rule()
+        self.assertEqual(list(a._remove_rules_with_feedback.call_args.args[0]),
+                         [('Allowed (Global)', 'remote:None:198.51.100.1')])
         a.rule_search_var.set('example.test')
         a.render_rules()
         iid, = a.rules_tree.get_children()
         a.rules_tree.selection_set(iid)
         mapping = dict(zip(App.RULE_COLUMNS, a.rules_tree.item(iid, 'values')))
-        self.assertEqual(mapping['Application / Domain IP'], 'example.test (192.0.2.1)')
+        self.assertEqual(mapping['Application & Global Rules'], 'example.test (192.0.2.1)')
         self.assertEqual(mapping['Remote Port'], '443')
-        self.assertEqual(mapping['Local Port'], '')
+        self.assertEqual(mapping['Local Port'], 'All')
         self.assertIn('Remote Port: 443', a._rule_details_text(a.rules_tree))
         self.assertIn('Protocol: TCP', a._rule_details_text(a.rules_tree))
         a.copy_text = Mock()
@@ -110,12 +120,12 @@ class RuleTableTests(unittest.TestCase):
     def test_saved_column_preferences_migrate_and_caret_tracks_theme(self):
         self.config.write_text(json.dumps({
             'column_orders': {'rules': ['Direction', 'Rule / Application', 'Status', 'Program Path']},
-            'column_widths': {'rules': {'Rule / Application': 321}},
+            'column_widths': {'rules': {'Application / Domain IP': 321}},
             'hidden_columns': {'rules': ['Rule / Application']}}))
         self.a.load_settings()
-        self.assertEqual(self.a.column_orders['rules'][1], 'Application / Domain IP')
-        self.assertEqual(self.a.column_widths['rules']['Application / Domain IP'], 321)
-        self.assertIn('Application / Domain IP', self.a.hidden_columns['rules'])
+        self.assertEqual(self.a.column_orders['rules'][1], 'Application & Global Rules')
+        self.assertEqual(self.a.column_widths['rules']['Application & Global Rules'], 321)
+        self.assertIn('Application & Global Rules', self.a.hidden_columns['rules'])
         style = NS['ttk'].Style(self.root)
         for dark in (True, False, True):
             self.a.dark_mode_var.set(dark)

@@ -37,7 +37,7 @@ class FirewallMonitorApp(
 ):
     """Owns shared application state; feature mixins use the same locks and queues."""
     MONITOR_COLUMNS = ('#', 'Process Name', 'Status', 'Direction', 'Remote IP', 'Remote Host', 'Protocol', 'Remote Port', 'Local Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'PID', 'Exe Path')
-    RULE_COLUMNS = ('Status', 'Application / Domain IP', 'Direction', 'Remote Port', 'Local Port', 'Protocol', 'Download (MB)', 'Upload (MB)', 'Program Path')
+    RULE_COLUMNS = ('Status', 'Application & Global Rules', 'Direction', 'Remote Port', 'Local Port', 'Protocol', 'Download (MB)', 'Upload (MB)', 'Program Path')
     ALERT_COLUMNS = ('Time', 'Severity', 'Process', 'PID', 'Remote IP', 'Remote Host', 'Reason')
     DEFAULT_COLUMN_ORDERS = {'monitor': MONITOR_COLUMNS, 'rules': RULE_COLUMNS, 'alerts': ALERT_COLUMNS}
 
@@ -88,6 +88,7 @@ class FirewallMonitorApp(
         self.proc_traffic = {}
         self.ip_traffic = {}
         self.pruned_target_traffic = {}
+        self.global_port_traffic = {}
         self.proc_ip_upload = {}
         self.ip_traffic_last_seen = {}
         self.proc_ip_upload_last_seen = {}
@@ -481,7 +482,7 @@ class FirewallMonitorApp(
         self._button(bar, 'Windows Firewall', self.open_windows_firewall)
         self._setup_search(bar, self.rule_search_var, self.render_rules)
         status_width = max(155, tkfont.nametofont('TkDefaultFont').measure('Blocked (in) (Global)') + 28)
-        self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'Status': (status_width, tk.CENTER, False), 'Application / Domain IP': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Remote Port': (100, tk.CENTER, False), 'Local Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
+        self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'Status': (status_width, tk.CENTER, False), 'Application & Global Rules': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Remote Port': (100, tk.CENTER, False), 'Local Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
         self.rules_tree.bind('<Double-1>', lambda e: self.rule_details_from_event(e))
         self.rules_tree.bind('<Delete>', self._on_rules_delete, add='+')
         self.rules_tree.bind('<KP_Delete>', self._on_rules_delete, add='+')

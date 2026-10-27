@@ -1,6 +1,7 @@
 """UI and accounting regressions without live capture or firewall changes."""
 import pathlib
 import tempfile
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -69,6 +70,148 @@ class GlobalTrafficTests(unittest.TestCase):
         a.rule_sort = [None, False]
         App.render_rules(a)
         self.assertEqual(a.rules_tree.insert.call_args.kwargs['values'][App.RULE_COLUMNS.index('Upload (MB)')], '1.00 MB')
+
+
+class GlobalPortTrafficTests(unittest.TestCase):
+    def setUp(self):
+        a = self.a = app()
+        a.sniffing = True
+        a.log_alerts_only = False
+        a.rate_threshold = a.rate_window = a.upload_threshold_mb = 10
+        a.captured_packets = a.captured_bytes = a.total_upload = a.total_download = 0
+        a.proc_traffic = {}
+        a.ip_traffic = {}
+        a.ip_traffic_last_seen = {}
+        a.pruned_target_traffic = {}
+        a.proc_ip_upload = {}
+        a.proc_ip_upload_last_seen = {}
+        a.active_connections = {}
+        a.next_connection_number = 1
+        a.last_traffic_prune = NS['time'].monotonic()
+        a._prune_connection_and_alert_history_locked = Mock()
+        a.get_cached_dns = Mock(return_value='')
+        a.port_watch_signal = Mock(return_value='')
+        a.global_ports = a._parse_port_rules([
+            {'scope': 'remote', 'port': 443, 'action': 'Allow'},
+            {'scope': 'remote', 'port': 443, 'action': 'Allow', 'protocol': 'TCP',
+             'target': 'example.test, 192.0.2.0/24', 'addresses': ['192.0.2.1', '2001:db8::1']},
+            {'scope': 'local', 'port': 51000, 'action': 'Allow', 'direction': 'Inbound'},
+            {'scope': 'remote', 'port': None, 'action': 'Allow', 'target': '2001:db8::1'},
+        ])
+
+    def capture(self, size, incoming=False, remote='192.0.2.1', port=443,
+                protocol='TCP', exe='C:\\demo.exe', tracked=True, pid=1, local_port=51000):
+        a = self.a
+        local = '2001:db8::2' if ':' in remote else '192.0.2.100'
+        src, dst = (remote, local) if incoming else (local, remote)
+        sport, dport = (port, local_port) if incoming else (local_port, port)
+        layers = {NS['IPv6' if ':' in remote else 'IP']: types.SimpleNamespace(src=src, dst=dst),
+                  NS[protocol]: types.SimpleNamespace(sport=sport, dport=dport)}
+
+        class Packet:
+            def __len__(self):
+                return size
+
+            def __contains__(self, layer):
+                return layer in layers
+
+            def __getitem__(self, layer):
+                return layers[layer]
+
+        a.get_process_info = Mock(side_effect=lambda ip, *args:
+            ('demo', exe, pid) if tracked and ip == local else (None, None, None))
+        with patch_dependencies(log_internal_error=Mock(side_effect=AssertionError('Packet accounting failed'))):
+            a.packet_handler(Packet())
+
+    def test_packets_count_each_matching_rule_and_app_once(self):
+        self.capture(100)
+        self.capture(200, incoming=True)
+        self.capture(300, exe='C:\\second.exe', pid=2)
+        self.capture(400, protocol='UDP')
+        self.capture(500, remote='198.51.100.1')
+        self.capture(600, port=80)
+        self.capture(700, incoming=True, remote='2001:db8::1')
+        self.capture(999, tracked=False)
+        a = self.a
+        self.assertEqual(a.global_port_traffic, {
+            'remote:443': {'download': 900, 'upload': 1300},
+            'remote:443:TCP:example.test, 192.0.2.0/24': {'download': 900, 'upload': 400},
+            'local:51000': {'download': 900, 'upload': 0},
+            'remote:None:2001:db8::1': {'download': 700, 'upload': 0},
+        })
+        self.assertEqual(a.proc_traffic['c:\\demo.exe'], {'download': 900, 'upload': 1600})
+        self.assertEqual(a.proc_traffic['c:\\second.exe'], {'download': 0, 'upload': 300})
+        self.assertEqual(a.captured_packets, 7)
+
+    def test_live_monitor_counts_each_connection_while_app_rules_keep_totals(self):
+        a = self.a
+        mib = 1024 * 1024
+        self.capture(mib)
+        self.capture(2 * mib, incoming=True)
+        self.capture(3 * mib, remote='198.51.100.1')
+        self.capture(4 * mib, protocol='UDP')
+        self.capture(5 * mib, port=80)
+        self.capture(6 * mib, local_port=51001)
+        self.capture(7 * mib, pid=2)
+        a.remote_host = Mock(side_effect=lambda row: row.get('domain', ''))
+        a.connection_status = Mock(return_value='Allowed')
+        a.connection_tag = Mock(return_value='allowed')
+        tree = Mock(spec=NS['ttk'].Treeview)
+        tree.selection.return_value = []
+        tree.get_children.return_value = []
+        search = Mock()
+        search.get.return_value = ''
+        a._render_connections(tree, search, ['Upload (MB)', True])
+        displayed = {call.kwargs['iid']: dict(zip(App.MONITOR_COLUMNS, call.kwargs['values']))
+                     for call in tree.insert.call_args_list}
+        expected = {
+            '1-TCP-51000-192.0.2.1-443': ('2.00 MB', '1.00 MB'),
+            '1-TCP-51000-198.51.100.1-443': ('0.00 MB', '3.00 MB'),
+            '1-UDP-51000-192.0.2.1-443': ('0.00 MB', '4.00 MB'),
+            '1-TCP-51000-192.0.2.1-80': ('0.00 MB', '5.00 MB'),
+            '1-TCP-51001-192.0.2.1-443': ('0.00 MB', '6.00 MB'),
+            '2-TCP-51000-192.0.2.1-443': ('0.00 MB', '7.00 MB'),
+        }
+        self.assertEqual({key: (values['Download (MB)'], values['Upload (MB)'])
+                          for key, values in displayed.items()}, expected)
+        self.assertEqual(next(iter(displayed)), '2-TCP-51000-192.0.2.1-443')
+        a.rule_rows = a._make_rule_rows({}, {'c:\\demo.exe'}, {}, {})
+        a.render_rule_traffic()
+        app_row = next(row for row in a.rule_rows if row['iid'].startswith('app:'))
+        self.assertEqual((app_row['download'], app_row['upload']), (2 * mib, 26 * mib))
+        a.active_connections.clear()
+        self.capture(mib)
+        self.assertEqual(next(iter(a.active_connections.values()))['upload'], mib)
+        self.assertEqual(a.proc_traffic['c:\\demo.exe']['upload'], 27 * mib)
+
+    def test_refresh_display_and_pruning_preserve_totals(self):
+        a = self.a
+        a.rules_generation = 1
+        a.render_rules = Mock()
+        a.render_monitor = Mock()
+        self.capture(1024 * 1024)
+        a._finish_rule_refresh(1, {}, {'c:\\demo.exe'}, {}, {})
+        rows = {row['iid']: row for row in a.rule_rows}
+        self.assertEqual(rows['port:remote:443']['upload'], 1024 * 1024)
+        self.assertEqual(rows['app:allow:c:\\demo.exe']['upload'], 1024 * 1024)
+        a.active_connections.clear()
+        with patch_dependencies(TRAFFIC_MAX_IP_ENTRIES=0):
+            a._prune_traffic_state_locked()
+        a.render_rule_traffic()
+        self.assertEqual(rows['port:remote:443']['upload'], 1024 * 1024)
+        self.capture(2 * 1024 * 1024, incoming=True)
+        a.render_rule_traffic()
+        a.rules_tree = Mock()
+        a.rules_tree.selection.return_value = []
+        a.rules_tree.get_children.return_value = []
+        a.rule_search_var = Mock()
+        a.rule_search_var.get.return_value = ''
+        a.rule_sort = ['Upload (MB)', True]
+        App.render_rules(a)
+        displayed = {call.kwargs['iid']: call.kwargs['values']
+                     for call in a.rules_tree.insert.call_args_list}
+        self.assertEqual(displayed['port:remote:443'][6:8], ('2.00 MB', '1.00 MB'))
+        self.assertEqual(displayed['port:remote:None:2001:db8::1'][6:8], ('0.00 MB', '0.00 MB'))
 
 
 class UninstallTests(unittest.TestCase):

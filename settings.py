@@ -71,10 +71,13 @@ class SettingsMixin:
             for preference in ('column_orders', 'hidden_columns', 'column_widths'):
                 layouts = config.get(preference, {})
                 saved_rules = layouts.get('rules') if isinstance(layouts, dict) else None
-                if isinstance(saved_rules, dict) and 'Rule / Application' in saved_rules:
-                    saved_rules['Application / Domain IP'] = saved_rules.pop('Rule / Application')
+                old_names = ('Rule / Application', 'Application / Domain IP')
+                if isinstance(saved_rules, dict):
+                    for old_name in old_names:
+                        if old_name in saved_rules:
+                            saved_rules.setdefault('Application & Global Rules', saved_rules.pop(old_name))
                 elif isinstance(saved_rules, (list, tuple)):
-                    layouts['rules'] = ['Application / Domain IP' if c == 'Rule / Application' else c
+                    layouts['rules'] = ['Application & Global Rules' if c in old_names else c
                                         for c in saved_rules]
             saved_column_orders = config.get('column_orders', {})
             if isinstance(saved_column_orders, dict):
@@ -796,6 +799,7 @@ class SettingsMixin:
                 self.proc_traffic.clear()
                 self.ip_traffic.clear()
                 self.pruned_target_traffic.clear()
+                self.global_port_traffic.clear()
                 self.total_download = self.total_upload = 0
                 self.firewall_initialized = True
                 self.column_orders = {key: list(order) for key, order in self.default_column_orders.items()}

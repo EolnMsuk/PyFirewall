@@ -41,6 +41,7 @@ def app():
     a.global_blocks = {}
     a.global_allows = {}
     a.global_ports = {}
+    a.global_port_traffic = {}
     a.connection_rates = {}
     a.upload_alerted = set()
     a.queue_alert = Mock()

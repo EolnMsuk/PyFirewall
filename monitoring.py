@@ -216,6 +216,8 @@ class MonitoringMixin:
 
     def _prune_traffic_state_locked(self):
         self.last_traffic_prune = time.monotonic()
+        self.global_port_traffic = {key: stats for key, stats in self.global_port_traffic.items()
+                                    if key in self.global_ports}
         if len(self.ip_traffic) > TRAFFIC_MAX_IP_ENTRIES:
             excess = len(self.ip_traffic) - TRAFFIC_MAX_IP_ENTRIES
             # Keep accumulated rule totals even when the bounded per-IP cache
@@ -316,9 +318,17 @@ class MonitoringMixin:
                 side = 'upload' if direction == 'Outgoing' else 'download'
                 pstats[side] += packet_size
                 istats[side] += packet_size
+                # Match this packet's direction, not the connection's first-seen
+                # direction. Overlapping global/app rules each retain the bytes.
+                endpoint = {'protocol': proto, 'lport': local_port, 'dport': remote_port,
+                            'dst_ip': remote_ip, 'direction': direction}
+                for rule_key in self.matching_global_port_rules(endpoint):
+                    stats = self.global_port_traffic.setdefault(rule_key, {'download': 0, 'upload': 0})
+                    stats[side] += packet_size
                 is_new = key not in self.active_connections
                 if is_new:
-                    self.active_connections[key] = {'key': key, 'number': self.next_connection_number, 'name': proc_name, 'pid': pid, 'direction': direction, 'protocol': proto, 'lport': local_port, 'dst_ip': remote_ip, 'domain': domain, 'dport': remote_port, 'signal': signal, 'exe': exe, 'first_seen': now, 'last_seen': now}
+                    row = {'key': key, 'number': self.next_connection_number, 'name': proc_name, 'pid': pid, 'direction': direction, 'protocol': proto, 'lport': local_port, 'dst_ip': remote_ip, 'domain': domain, 'dport': remote_port, 'signal': signal, 'exe': exe, 'first_seen': now, 'last_seen': now, 'download': 0, 'upload': 0}
+                    self.active_connections[key] = row
                     self.next_connection_number += 1
                     self._prune_connection_and_alert_history_locked()
                 else:
@@ -326,6 +336,9 @@ class MonitoringMixin:
                     row['last_seen'] = now
                     if not row.get('domain') and domain:
                         row['domain'] = domain
+                # Both packet directions share the same connection key, while
+                # process totals above continue to include all its connections.
+                row[side] = row.get(side, 0) + packet_size
                 upload_key = None
                 upload_total = 0
                 if direction == 'Outgoing' and remote_ip not in {'127.0.0.1', '::1'}:

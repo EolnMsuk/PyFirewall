@@ -92,21 +92,24 @@ class ViewsMixin:
             global_text = 'Block' if kind == 'block' else 'Allow'
             for target, data in sorted(collection.items()):
                 addresses = tuple(data.get('addresses', ()))
-                rows.append({'iid': f'global:{kind}:{target}', 'status': 'Blocked (in) (Global)' if kind == 'block' and direction_name(data.get('direction', 'Both')) == 'Inbound' else f'Global {global_text}', 'rule': target, 'action': global_text, 'direction': data.get('direction', 'Both'), 'path': target if not addresses else f"{target} ({', '.join(addresses)})", 'normalized_path': target, 'addresses': addresses, 'global_type': kind, 'remote_port': '', 'local_port': '', 'protocol': 'TCP/UDP', 'download': 0, 'upload': 0})
+                rows.append({'iid': f'global:{kind}:{target}', 'status': 'Blocked (in) (Global)' if kind == 'block' and direction_name(data.get('direction', 'Both')) == 'Inbound' else f'Global {global_text}', 'rule': target, 'action': global_text, 'direction': data.get('direction', 'Both'), 'path': target if not addresses else f"{target} ({', '.join(addresses)})", 'normalized_path': target, 'addresses': addresses, 'global_type': kind, 'remote_port': 'All', 'local_port': 'All', 'protocol': 'TCP/UDP', 'download': 0, 'upload': 0})
         with self.lock:
             for key, rule in sorted(getattr(self, 'global_ports', {}).items()):
                 target = rule.get('target', '')
                 addresses = tuple(rule.get('addresses', ()))
                 target_label = (f"{target} ({', '.join(addresses)})"
                                 if target and not is_ip(target) and addresses else target)
+                if not target_label:
+                    target_label = f"{rule['scope'].title()} Port {rule['port'] or 'All'} ({rule.get('protocol', 'TCP/UDP')})"
                 rows.append({'iid': f'port:{key}',
                              'status': 'Blocked (in) (Global)' if rule['action'] == 'Block' and direction_name(rule.get('direction', 'Both')) == 'Inbound' else f"{rule['action']}ed (Global)",
                              'rule': target_label,
-                             'remote_port': rule['port'] if rule['scope'] == 'remote' and rule['port'] else '',
-                             'local_port': rule['port'] if rule['scope'] == 'local' and rule['port'] else '',
+                             'remote_port': rule['port'] if rule['scope'] == 'remote' and rule['port'] else 'All',
+                             'local_port': rule['port'] if rule['scope'] == 'local' and rule['port'] else 'All',
                              'protocol': rule.get('protocol', 'TCP/UDP'),
                              'action': rule['action'], 'direction': rule.get('direction', 'Both'),
                              'path': key, 'normalized_path': key,
+                             'display_path': key.replace(':None:', ':All:', 1),
                              'global_type': rule['action'].lower(), 'is_port': True, 'download': 0, 'upload': 0})
         return rows
 
@@ -117,16 +120,7 @@ class ViewsMixin:
             self.blocked_paths = {path: {'in': data['in'], 'out': data['out'], 'path': data['path']} for path, data in blocked.items() if path not in self.allowed_apps}
         rows = self._make_rule_rows(blocked, allowed, blocks, allows)
         with self.lock:
-            proc_traffic = {key: dict(value) for key, value in self.proc_traffic.items()}
-            for row in rows:
-                if row.get('global_type'):
-                    down, up = self._target_traffic_locked(row['normalized_path'], row.get('addresses', ()))
-                else:
-                    stats = proc_traffic.get(row['normalized_path'], {})
-                    down = stats.get('download', 0)
-                    up = stats.get('upload', 0)
-                row['download'] = down
-                row['upload'] = up
+            self._update_rule_traffic_locked(rows)
         self.rule_rows = rows
         self.rules_loading = False
         self.render_rules()
@@ -447,12 +441,10 @@ class ViewsMixin:
         search = search_var.get().casefold().strip()
         with self.lock:
             rows = [dict(row) for row in self.active_connections.values()]
-            traffic = {key: dict(value) for key, value in self.proc_traffic.items()}
         for row in rows:
             row['remote_host'] = self.remote_host(row)
-            data = traffic.get(normalize_path(row['exe']) or row['name'].casefold(), {})
-            row['_down'] = data.get('download', 0)
-            row['_up'] = data.get('upload', 0)
+            row['_down'] = row.get('download', 0)
+            row['_up'] = row.get('upload', 0)
         if search:
             rows = [row for row in rows if search in self.search_text(row)]
         self.sort_monitor_rows(rows, sort_state)
@@ -532,10 +524,10 @@ class ViewsMixin:
         search = self.rule_search_var.get().casefold().strip()
         rows = list(self.rule_rows)
         if search:
-            rows = [row for row in rows if search in ' '.join(map(str, (row['status'], row['rule'], row['action'], row['direction'], row['path'], row.get('remote_port', ''), row.get('local_port', ''), row.get('protocol', ''), mb(row.get('download', 0)), mb(row.get('upload', 0))))).casefold()]
+            rows = [row for row in rows if search in ' '.join(map(str, (row['status'], row['rule'], row['action'], row['direction'], row.get('display_path', row['path']), row.get('remote_port', ''), row.get('local_port', ''), row.get('protocol', ''), mb(row.get('download', 0)), mb(row.get('upload', 0))))).casefold()]
         column, reverse = self.rule_sort
         if column:
-            fields = {'Status': lambda r: r['status'].casefold(), 'Application / Domain IP': lambda r: r['rule'].casefold(), 'Direction': lambda r: r['direction'].casefold(), 'Download (MB)': lambda r: r.get('download', 0), 'Upload (MB)': lambda r: r.get('upload', 0), 'Program Path': lambda r: r['path'].casefold()}
+            fields = {'Status': lambda r: r['status'].casefold(), 'Application & Global Rules': lambda r: r['rule'].casefold(), 'Direction': lambda r: r['direction'].casefold(), 'Download (MB)': lambda r: r.get('download', 0), 'Upload (MB)': lambda r: r.get('upload', 0), 'Program Path': lambda r: r.get('display_path', r['path']).casefold()}
             for label, key in (('Remote Port', 'remote_port'), ('Local Port', 'local_port')):
                 fields[label] = lambda r, key=key: int(r[key]) if str(r.get(key, '')).isdecimal() else -1
             fields['Protocol'] = lambda r: r.get('protocol', '').casefold()
@@ -544,9 +536,9 @@ class ViewsMixin:
         self.rules_tree.delete(*self.rules_tree.get_children())
         for row in rows:
             tag = 'global_allow' if row.get('global_type') == 'allow' else ('global_block_in' if row['direction'] == 'Inbound' else 'global_block') if row.get('global_type') == 'block' else 'allowed' if row['status'] == 'Allowed' else 'blocked_in' if row['status'] == 'Blocked (In)' else 'blocked'
-            down = '—' if row.get('is_port') else mb(row.get('download', 0))
-            up = '—' if row.get('is_port') else mb(row.get('upload', 0))
-            self.rules_tree.insert('', tk.END, iid=row['iid'], values=(row['status'], row['rule'], row['direction'], row.get('remote_port') or '—', row.get('local_port') or '—', row.get('protocol', ''), down, up, row['path']), tags=(tag,))
+            down = mb(row.get('download', 0))
+            up = mb(row.get('upload', 0))
+            self.rules_tree.insert('', tk.END, iid=row['iid'], values=(row['status'], row['rule'], row['direction'], row.get('remote_port') or 'All', row.get('local_port') or 'All', row.get('protocol', ''), down, up, row.get('display_path', row['path'])), tags=(tag,))
         if selected:
             self.rules_tree.selection_set([iid for iid in selected if self.rules_tree.exists(iid)])
 
@@ -795,7 +787,17 @@ class ViewsMixin:
         messagebox.showinfo(title, text, parent=self.root)
 
     def selected_rows(self, tree):
-        return [(iid, tree.item(iid, 'values')) for iid in tree.selection() if tree.item(iid, 'values')]
+        rows = [(iid, tree.item(iid, 'values')) for iid in tree.selection() if tree.item(iid, 'values')]
+        if tree is getattr(self, 'rules_tree', None):
+            return [(iid, self._managed_rule_values(iid, values)) for iid, values in rows]
+        return rows
+
+    @staticmethod
+    def _managed_rule_values(iid, values):
+        # Actions use the stable identity; Program Path is only a display label.
+        if str(iid).startswith('port:') and values:
+            return (*values[:-1], str(iid)[5:])
+        return values
 
     def open_file_location_from_tree(self, tree, iid):
         if not iid or not tree.exists(iid):
@@ -812,6 +814,7 @@ class ViewsMixin:
                 mapping = dict(zip(columns, values))
                 path = mapping.get('Exe Path', '')
         elif tree is self.rules_tree:
+            values = self._managed_rule_values(iid, values)
             columns = tuple(tree['columns'])
             mapping = dict(zip(columns, values))
             status = str(mapping.get('Status', '')).casefold()
@@ -910,7 +913,7 @@ class ViewsMixin:
         iid = self._focus_menu_row(self.rules_tree, event)
         if not iid:
             return
-        values = self.rules_tree.item(iid, 'values')
+        values = self._managed_rule_values(iid, self.rules_tree.item(iid, 'values'))
         status = str(values[0]).casefold() if values else ''
         menu = self._context_menu()
         direction = str(values[2]) if len(values) > 2 else 'Both'
@@ -1158,6 +1161,7 @@ class ViewsMixin:
             stats = self.proc_traffic.get(norm, {})
             active_count = sum((normalize_path(item.get('exe')) == norm for item in self.active_connections.values()))
         text = f"Process: {row['name']}\nPID: {row['pid']}\nExecutable: {row['exe']}\n\nProtocol: {row['protocol']} ({row['direction']})\nLocal Port: {row['lport']}\nRemote: {row['dst_ip']}:{row['dport']}\nRemote Host: {self.remote_host(row) or 'Unresolved'}\nSignal: {row.get('signal') or 'None'}\n\nActive Connections: {active_count}\nProcess Download: {mb(stats.get('download', 0))}\nProcess Upload: {mb(stats.get('upload', 0))}"
+        text += f"\nConnection Download: {mb(row.get('download', 0))}\nConnection Upload: {mb(row.get('upload', 0))}"
         text += f'\nDisplayed Status: {self.connection_status(row)}'
         rules = self._connection_rule_descriptions(row)
         text += '\n\nMatching PyFirewall rules:\n'
@@ -1225,6 +1229,8 @@ class ViewsMixin:
             extra = '\nResolved Addresses: ' + (', '.join(data.get('addresses', ())) or 'Unknown')
         if len(values) == len(self.RULE_COLUMNS):
             extra += f'\nRemote Port: {values[3] or "-"}\nLocal Port: {values[4] or "-"}\nProtocol: {values[5]}'
+        if self._managed_rule_category(status, path) == 'port':
+            path = str(path).replace(':None:', ':All:', 1)
         return f'Status: {status}\nRule: {rule}\nDirection: {direction}\nDownload: {down}\nUpload: {up}\nPath/Target: {path}{extra}'
 
     def copy_rule_details(self, tree):
@@ -1416,11 +1422,19 @@ class ViewsMixin:
 
     def render_rule_traffic(self):
         with self.lock:
-            proc_traffic = {key: dict(value) for key, value in self.proc_traffic.items()}
-        for row in self.rule_rows:
-            if row.get('global_type'):
-                row['download'], row['upload'] = self.target_traffic(row['normalized_path'], row.get('addresses', ()))
+            self._update_rule_traffic_locked(self.rule_rows)
+
+    def _update_rule_traffic_locked(self, rows):
+        for row in rows:
+            if row.get('is_port'):
+                stats = self.global_port_traffic.get(row['normalized_path'], {})
+                row['download'] = stats.get('download', 0)
+                row['upload'] = stats.get('upload', 0)
+            elif row.get('global_type'):
+                down, up = self._target_traffic_locked(row['normalized_path'], row.get('addresses', ()))
+                row['download'] = down
+                row['upload'] = 0 if direction_name(row['direction']) == 'Inbound' else up
             else:
-                stats = proc_traffic.get(row['normalized_path'], {})
+                stats = self.proc_traffic.get(row['normalized_path'], {})
                 row['download'] = stats.get('download', 0)
                 row['upload'] = stats.get('upload', 0)
