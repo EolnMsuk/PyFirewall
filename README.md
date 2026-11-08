@@ -16,13 +16,13 @@ PyFirewall is a Windows desktop application for monitoring / filtering network c
 * Auto-Block Protection
 * Per-application allow/block rules
 * Global IP/domain & local/remote port specific rules
-* IPv4 and IPv6 address, CIDR, and inclusive IP range support
+* Managed Rules
 * Connection-rate and upload-threshold alerts
 * CSV export for connection data
 * JSON export/import for managed firewall rules
 * System-tray support and automatic start at Windows login
 * Dark/light theme support
-* Startup update checks and a manual **Check for Updates** button
+* GitHub release update checks
 
 ## Requirements
 
@@ -56,10 +56,6 @@ python firewall_monitor.py
 
 ```
 
-## Usage
-
-The main window can be closed but will remain in the system tray. Use **Close** from the tray menu to fully exit the application. The **Settings** tab controls alert thresholds, Auto-Block Protection, the connection/alert history limit, the UI theme, (auto) update checking, export / import rules, reset to defaults and uninstall option. When a threshold is exceeded, the connection is recorded in **Alerts**, triggering Auto-Block prompting, used for applications that pass the threshold (assuming they do not already have an application rule allowing or blocking it). Enabling **Filter All Connections** will set the threshold to 1, allowing you to live filter any new requests. Double-click a connection in **Live Monitor** or **Alerts** to edit its highest-priority applied rule. Double-click a rule in **Managed Rules** to edit that rule. Global rules accept comma-separated domains, IP addresses, CIDRs, and ranges such as `example.com, 192.168.1.1, 192.168.0.6-192.168.0.110`. Targets submitted together become one Managed Rules entry; existing independent rules stay separate. Right-click selected connections to use **Copy IP Domain** or **Copy Details** for every selected row. Managed Rules offers the same copy actions; application-only rules have no remote IP/domain to copy. **Windows Firewall** opens the Advanced Security console (`wf.msc`); select **Outbound Rules** in its left pane.
-
 ### Default Settings
 
 | Setting | Default |
@@ -77,8 +73,6 @@ The main window can be closed but will remain in the system tray. Use **Close** 
 
 ## Files
 
-* `Install-PyFirewall.cmd` - administrator installer launcher
-* `Uninstall-PyFirewall.cmd` - interactive uninstaller
 * `firewall_monitor.py` - launch entry point, administrator elevation, and single-instance guard
 * `app.py` - main window, shared state, startup, and UI event loop
 * `widgets.py` - themes, button feedback, tooltips, custom menus, and table interactions
@@ -93,6 +87,8 @@ The main window can be closed but will remain in the system tray. Use **Close** 
 * `helpers.py` - normalization, formatting, and error diagnostics
 * `requirements.txt` - Python dependencies
 * `requirements.ps1` - automated prerequisite/setup script
+* `Install-PyFirewall.cmd` - administrator installer launcher
+* `Uninstall-PyFirewall.cmd` - interactive uninstaller
 * `PyFirewall.ico` - application and system-tray icon
 
 PyFirewall stores its configuration in `firewall_config.json` beside the application.
