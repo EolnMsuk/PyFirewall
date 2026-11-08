@@ -271,7 +271,7 @@ class PyFirewallSystemTray:
         try:
             filter_all_enabled, is_paused = self._get_state()
             filter_command_flags = self.MF_STRING | (self.MF_GRAYED if is_paused else 0)
-            filter_text = 'Disable Filter All Connections' if filter_all_enabled else 'Filter All Connections'
+            filter_text = 'Disable Filter' if filter_all_enabled else 'Enable Filter'
             pause_text = 'Resume Monitoring' if is_paused else 'Pause Monitoring'
             user32.AppendMenuW(menu, self.MF_STRING, self.ID_SHOW, 'Show PyFirewall')
             user32.AppendMenuW(menu, self.MF_STRING, self.ID_PAUSE, pause_text)
