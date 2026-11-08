@@ -20,7 +20,6 @@
 
 * **Flexible Global Rules:** Global rules can now apply to a single executable, a group of file paths, or all processes.
 * **Easier Port & Filter Editing:** Global filters now accept comma-separated ports and blank targets/ports, supporting Incoming, Outgoing, and Both directions.
-* **UI Improvements:**
 * Live Monitor now sorts IPv4 and IPv6 addresses numerically.
 * You can now use **Ctrl+C** to copy visible selected values across tables.
 * Improved light-theme contrast for menu text.
