@@ -1,15 +1,106 @@
 """UI and accounting regressions without live capture or firewall changes."""
 import pathlib
+import copy
+import queue
 import tempfile
 import types
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from support import patch_dependencies
-from test_firewall_monitor import App, NS, app
+from support import App, NS, patch_dependencies
+from fixtures import app, MemoryFirewall
 
 
 class GlobalTrafficTests(unittest.TestCase):
+    def test_alert_backlog_and_rate_histories_are_bounded_and_clear_retires_queued_history(self):
+        a = app()
+        a.alert_queue = queue.Queue(maxsize=2)
+        a.alerts = NS['deque'](maxlen=2)
+        a.render_alerts = Mock()
+        a.next_alert_id = 1
+        a.queue_alert = types.MethodType(App.queue_alert, a)
+        for i in range(5):
+            a.queue_alert('Info', 'test', '', '', str(i))
+        self.assertEqual(a.alert_queue.qsize(), 2)
+        self.assertEqual(a.dropped_alerts, 3)
+        a.clear_alerts()
+        a.drain_alerts()
+        self.assertFalse(a.alerts)
+        a.queue_alert('Info', 'test', '', '', 'after clear')
+        a.drain_alerts()
+        self.assertEqual(len(a.alerts), 1)
+        a.rate_window = 5
+        a.proc_traffic = {'lifetime': {'upload': 123}}
+        with patch_dependencies(RATE_MAX_KEYS=2):
+            self.assertFalse(a._rate_hit_locked('one', 10, 2, 5))
+            self.assertFalse(a._rate_hit_locked('two', 10, 2, 5))
+            self.assertFalse(a._rate_hit_locked('three', 10, 2, 5))
+            self.assertEqual(len(a.connection_rates), 2)
+            self.assertEqual(a.untracked_rate_events, 1)
+            self.assertTrue(a._rate_hit_locked('one', 11, 2, 5))
+            a._prune_rates_locked(16)
+            self.assertFalse(a.connection_rates)
+            self.assertFalse(a._rate_hit_locked('three', 16, 2, 5))
+        self.assertEqual(a.proc_traffic['lifetime']['upload'], 123)
+
+    def test_reconciliation_preserves_intent_and_reports_global_and_app_drift(self):
+        a = app()
+        native = MemoryFirewall(a)
+        entries = [dict(scope='remote', port=443, action='Block', exes=[r'C:\one.exe', r'C:\two.exe'])]
+        self.assertTrue(a.apply_global_port_rules(entries))
+        key = next(iter(a.global_ports))
+        expected = a._port_firewall_rules(a.global_ports)
+        with a.firewall_lock:
+            snapshot = a.sync_rule_cache()
+        self.assertEqual(snapshot[-1][key]['_enforcement'], 'Verified')
+        endpoint = dict(exe=r'C:\one.exe', protocol='TCP', dport=443, direction='Outgoing', dst_ip='192.0.2.1')
+        self.assertTrue(a._threshold_has_rule(endpoint))
+        for change, state in (('missing_member', 'Partial'), ('disabled', 'Disabled'),
+                              ('protocol', 'Changed'), ('address', 'Changed'), ('program', 'Changed'), ('missing_all', 'Missing')):
+            native.rules.clear()
+            native.create(expected)
+            first = next(iter(native.rules.values()))
+            if change == 'missing_member':
+                native.rules.pop(expected[-1]['name'])
+            elif change == 'disabled':
+                first['enabled'] = False
+            elif change == 'protocol':
+                first['protocol'] = 'Any'
+            elif change == 'address':
+                first['addresses'] = ['198.51.100.1']
+            elif change == 'program':
+                first['path'] = r'C:\other.exe'
+            else:
+                native.rules.clear()
+            with self.subTest(change=change):
+                snapshot = a.sync_rule_cache()
+                self.assertEqual(snapshot[-1][key]['_enforcement'], state)
+                self.assertFalse(a._threshold_has_rule(endpoint))
+                self.assertIn(key, a.global_ports)
+                row = a._make_rule_rows(*snapshot)[0]
+                self.assertIn(state.lower(), row['status'])
+        native.rules.clear()
+        self.assertTrue(a.apply_global_port_rules(entries))  # Repair through the same transaction.
+        self.assertEqual(a.sync_rule_cache()[-1][key]['_enforcement'], 'Verified')
+        path = r'C:\allowed.exe'
+        a.allowed_apps.add(NS['normalize_path'](path))
+        rule = dict(name='PyFirewall_external_In', action='Block', direction='Inbound', path=path,
+                    normalized_path=NS['normalize_path'](path), is_global=False, is_hold=False, enabled=False)
+        native.rules = {rule['name']: rule}
+        snapshot = a.sync_rule_cache()
+        self.assertEqual(a.get_rule_status(path), 'allowed')
+        self.assertEqual(snapshot[0][NS['normalize_path'](path)]['_enforcement'], 'Disabled')
+        self.assertFalse(a.blocked_paths)  # Observation must not become saved intent.
+        self.assertFalse(a._rule_is_duplicate(path, allow=True))
+        rows = a._make_rule_rows(*snapshot)
+        self.assertEqual(next(r for r in rows if r['action'] == 'Allow')['status'], 'Allowed')
+        self.assertEqual(next(r for r in rows if r['action'] == 'Block')['status'], 'Block observed (disabled)')
+        rule['enabled'] = True
+        a.sync_rule_cache()
+        self.assertEqual(a.get_rule_status(path), 'blocked_in')
+        self.assertIn(NS['normalize_path'](path), a.allowed_apps)
+
     def setUp(self):
         self.a = app()
         self.a.proc_traffic = {}
@@ -63,6 +154,7 @@ class GlobalTrafficTests(unittest.TestCase):
         a.render_rule_traffic()
         self.assertEqual(a.rule_rows[0]['upload'], 1024 * 1024 + 100)
         a.rules_tree = Mock()
+        a.rules_tree.get_children.return_value = []
         a.rules_tree.selection.return_value = []
         a.rules_tree.get_children.return_value = []
         a.rule_search_var = Mock()
@@ -71,8 +163,111 @@ class GlobalTrafficTests(unittest.TestCase):
         App.render_rules(a)
         self.assertEqual(a.rules_tree.insert.call_args.kwargs['values'][App.RULE_COLUMNS.index('Upload (MB)')], '1.00 MB')
 
+    def test_old_refresh_cannot_overwrite_a_committed_block_or_mix_policy_snapshots(self):
+        a = self.a
+        native = MemoryFirewall(a)
+        a.ui_queue = queue.Queue()
+        a.rules_generation = 1
+        a.rules_refresh_pending = a.rules_refresh_worker_running = True
+        a.render_rules = a.render_monitor = Mock()
+        a.global_ports = a._parse_port_rules([{'scope': 'remote', 'port': 443, 'action': 'Allow'}])
+        a._refresh_rules_worker()
+        old = a.ui_queue.get_nowait()
+        saved = []
+        a.save_settings.side_effect = lambda: saved.append(copy.deepcopy(a.blocked_paths)) or True
+        self.assertTrue(a._apply_rule_batch([(r'C:\new.exe', False, 'both', False)], quiet=True))
+        a._finish_rule_refresh(*old[1:])
+        self.assertEqual(a.get_rule_status(r'C:\new.exe'), 'blocked_both')
+        self.assertIn(r'c:\new.exe', saved[-1])
+        self.assertEqual(len([r for r in native.rules.values() if r.get('normalized_path') == r'c:\new.exe']), 2)
+        a.global_ports = {}
+        detached = a._make_rule_rows(*old[2:])
+        self.assertTrue(any(r.get('is_port') for r in detached))
+        a.rules_refresh_pending = True
+        a._refresh_rules_worker()
+        a._finish_rule_refresh(*a.ui_queue.get_nowait()[1:])
+        self.assertTrue(any(r['normalized_path'] == r'c:\new.exe' for r in a.rule_rows))
+        self.assertFalse(any(r.get('is_port') for r in a.rule_rows))
+
+    def test_refresh_requires_this_runs_initialization_and_can_retry_thread_start(self):
+        a = self.a
+        a.firewall_initialized = True
+        a.firewall_ready = False
+        a.rules_tree = Mock()
+        a.rules_tree.get_children.return_value = []
+        a.rules_generation = 0
+        a.rules_refresh_worker_running = a.rules_refresh_pending = False
+        a.ui_queue = queue.Queue()
+        with patch.object(NS['threading'], 'Thread') as worker:
+            a.refresh_rules(force=True)
+            worker.assert_not_called()
+            a.firewall_ready = True
+            worker.return_value.start.side_effect = RuntimeError('start failed')
+            with patch_dependencies(log_internal_error=Mock()):
+                a.refresh_rules(force=True)
+            self.assertFalse(a.rules_loading or a.rules_refresh_worker_running)
+            worker.return_value.start.side_effect = None
+            a.refresh_rules(force=True)
+        self.assertEqual(worker.return_value.start.call_count, 2)
+
+    def test_legacy_address_rule_totals_exclude_the_opposite_direction(self):
+        a = self.a
+        rows = a._make_rule_rows({}, set(), {'192.0.2.0/24': {'direction': 'Outbound'}},
+                                 {'192.0.2.1': {'direction': 'Inbound'}})
+        a._update_rule_traffic_locked(rows)
+        self.assertEqual([(r['download'], r['upload']) for r in rows], [(0, 100), (120, 0)])
+
 
 class GlobalPortTrafficTests(unittest.TestCase):
+    def test_blocked_native_worker_keeps_capture_and_tk_responsive_and_rejects_old_epoch(self):
+        a = self.a
+        a.global_ports = {}
+        a.log_alerts_only = True
+        a.rate_threshold = 1
+        a.install_auto_hold = Mock(return_value=True)
+        a.release_auto_holds = Mock()
+        a.firewall_profile_modified = False
+        entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+        root = NS['tk'].Tk()
+        root.attributes('-alpha', 0)
+        a._start_native_worker()
+        try:
+            def blocked():
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError('test timeout')
+            a._queue_native_job('Blocked native operation', blocked)
+            self.assertTrue(entered.wait(2))
+            self.capture(100)
+            self.capture(100, remote='192.0.2.2')
+            self.assertEqual(a.captured_packets, 2)
+            heartbeat = []
+            root.after_idle(lambda: heartbeat.append(True))
+            a.prompt_queue.put((0, 'key', 'demo', r'C:\demo.exe', 1, '192.0.2.1', '', 'Outgoing', 'connection', ''))
+            a.drain_prompt_queue()  # Busy native lock must not wait on Tk.
+            root.update()
+            self.assertEqual(heartbeat, [True])
+            a.auto_block_enabled = False
+            a._invalidate_auto_prompts(close_dialog=True)
+            a.auto_block_enabled = True
+            a.rate_threshold = 50
+            a._queue_native_job('Barrier', drained.set)
+            release.set()
+            self.assertTrue(drained.wait(2))
+            a.install_auto_hold.assert_not_called()
+            a.rate_threshold = 1
+            self.capture(100, remote='192.0.2.3')
+            drained.clear()
+            a._queue_native_job('Barrier', drained.set)
+            self.assertTrue(drained.wait(2))
+            a.install_auto_hold.assert_called_once()
+        finally:
+            release.set()
+            a.native_shutdown_requested = True
+            a.native_worker.join(3)
+            root.destroy()
+        self.assertFalse(a.native_worker.is_alive())
+
     def setUp(self):
         a = self.a = app()
         a.sniffing = True
@@ -98,6 +293,26 @@ class GlobalPortTrafficTests(unittest.TestCase):
             {'scope': 'local', 'port': 51000, 'action': 'Allow', 'direction': 'Inbound'},
             {'scope': 'remote', 'port': None, 'action': 'Allow', 'target': '2001:db8::1'},
         ])
+
+    def test_process_scoped_traffic_excludes_other_executables(self):
+        a = self.a
+        a.global_ports = a._parse_port_rules([
+            dict(scope='remote', port=443, action='Block', exe=r'C:\demo.exe')])
+        key = next(iter(a.global_ports))
+        self.capture(100, exe=r'C:\demo.exe')
+        self.capture(200, exe=r'C:\other.exe', pid=2)
+        self.assertEqual(a.global_port_traffic[key], {'download': 0, 'upload': 100})
+
+    def test_executable_group_counts_each_member_once_and_excludes_other_processes(self):
+        a = self.a
+        a.global_ports = a._parse_port_rules([dict(scope='remote', port=443, action='Block',
+            exes=[r'C:\demo.exe', r'C:\DEMO.exe', r'C:\second.exe'])])
+        key = next(iter(a.global_ports))
+        self.capture(100, exe=r'C:\demo.exe')
+        self.capture(200, exe=r'C:\second.exe', pid=2)
+        self.capture(300, incoming=True, exe=r'C:\second.exe', pid=2)
+        self.capture(900, exe=r'C:\other.exe', pid=3)
+        self.assertEqual(a.global_port_traffic, {key: {'download': 300, 'upload': 300}})
 
     def capture(self, size, incoming=False, remote='192.0.2.1', port=443,
                 protocol='TCP', exe='C:\\demo.exe', tracked=True, pid=1, local_port=51000):
@@ -134,14 +349,62 @@ class GlobalPortTrafficTests(unittest.TestCase):
         self.capture(999, tracked=False)
         a = self.a
         self.assertEqual(a.global_port_traffic, {
-            'remote:443': {'download': 900, 'upload': 1300},
-            'remote:443:TCP:example.test, 192.0.2.0/24': {'download': 900, 'upload': 400},
-            'local:51000': {'download': 900, 'upload': 0},
-            'remote:None:2001:db8::1': {'download': 700, 'upload': 0},
+            'remote:443:Allow:Both': {'download': 900, 'upload': 1300},
+            'remote:443:TCP:example.test, 192.0.2.0/24:Allow:Both': {'download': 900, 'upload': 400},
+            'local:51000:Allow:Inbound': {'download': 900, 'upload': 0},
+            'remote:None:2001:db8::1:Allow:Both': {'download': 700, 'upload': 0},
         })
         self.assertEqual(a.proc_traffic['c:\\demo.exe'], {'download': 900, 'upload': 1600})
         self.assertEqual(a.proc_traffic['c:\\second.exe'], {'download': 0, 'upload': 300})
         self.assertEqual(a.captured_packets, 7)
+
+    def test_pause_during_attribution_discards_the_packet_before_publication(self):
+        a = self.a
+        a.get_cached_dns.side_effect = lambda ip: setattr(a, 'is_paused', True) or ''
+        self.capture(100)
+        self.assertEqual(a.captured_packets, 0)
+        self.assertFalse(a.active_connections or a.proc_traffic or a.global_port_traffic)
+
+    def test_threshold_uses_outbound_packet_policy_after_inbound_first_packet_and_clear(self):
+        a = self.a
+        self.capture(100, incoming=True)
+        a.global_ports = a._parse_port_rules([{'scope': 'remote', 'port': 443, 'action': 'Allow',
+                                             'direction': 'Outbound', 'exe': r'C:\demo.exe'}])
+        a.log_alerts_only = True
+        a.upload_threshold_mb = 0.00001
+        a.queue_alert.side_effect = lambda *args, **kwargs: a.active_connections.clear()
+        a.install_auto_hold = Mock()
+        self.capture(200)
+        a.install_auto_hold.assert_not_called()
+        endpoint = a.queue_alert.call_args.kwargs['connection']
+        self.assertEqual((endpoint['direction'], endpoint['dport'], endpoint['exe']), ('Outgoing', 443, r'C:\demo.exe'))
+        self.assertFalse(a.active_connections)
+
+    def test_removed_or_replaced_filtered_rule_retires_only_its_counter_after_commit(self):
+        a = self.a
+        native = MemoryFirewall(a)
+        entries = [{'scope': 'remote', 'port': 443, 'action': 'Allow'},
+                   {'scope': 'local', 'port': 51000, 'action': 'Block'}]
+        a.global_ports = {}
+        self.assertTrue(a.apply_global_port_rules(entries))
+        self.capture(100)
+        old = 'remote:443:Allow:Both'
+        sibling = 'local:51000:Block:Both'
+        previous = copy.deepcopy(a.global_port_traffic)
+        with patch.object(a, '_replace_rule_records', side_effect=RuntimeError('delete failed')), \
+             patch.object(NS['messagebox'], 'showerror'):
+            self.assertFalse(a.remove_rule('Allowed (global)', old))
+        self.assertEqual(a.global_port_traffic, previous)
+        self.assertTrue(a.remove_rule('Allowed (global)', old))
+        self.assertNotIn(old, a.global_port_traffic)
+        self.assertEqual(a.global_port_traffic[sibling]['upload'], 100)
+        self.assertTrue(a.apply_global_port_rules([entries[0]]))
+        self.capture(25)
+        self.assertEqual(a.global_port_traffic[old]['upload'], 25)
+        replacement = [dict(entries[0], port=8443)]
+        self.assertTrue(a._apply_rule_batch((), port_updates=replacement, replace_rule=('port', old), quiet=True))
+        self.assertNotIn(old, a.global_port_traffic)
+        self.assertEqual(a.global_port_traffic[sibling]['upload'], 125)
 
     def test_live_monitor_counts_each_connection_while_app_rules_keep_totals(self):
         a = self.a
@@ -192,13 +455,13 @@ class GlobalPortTrafficTests(unittest.TestCase):
         self.capture(1024 * 1024)
         a._finish_rule_refresh(1, {}, {'c:\\demo.exe'}, {}, {})
         rows = {row['iid']: row for row in a.rule_rows}
-        self.assertEqual(rows['port:remote:443']['upload'], 1024 * 1024)
+        self.assertEqual(rows['port:remote:443:Allow:Both']['upload'], 1024 * 1024)
         self.assertEqual(rows['app:allow:c:\\demo.exe']['upload'], 1024 * 1024)
         a.active_connections.clear()
         with patch_dependencies(TRAFFIC_MAX_IP_ENTRIES=0):
             a._prune_traffic_state_locked()
         a.render_rule_traffic()
-        self.assertEqual(rows['port:remote:443']['upload'], 1024 * 1024)
+        self.assertEqual(rows['port:remote:443:Allow:Both']['upload'], 1024 * 1024)
         self.capture(2 * 1024 * 1024, incoming=True)
         a.render_rule_traffic()
         a.rules_tree = Mock()
@@ -210,8 +473,8 @@ class GlobalPortTrafficTests(unittest.TestCase):
         App.render_rules(a)
         displayed = {call.kwargs['iid']: call.kwargs['values']
                      for call in a.rules_tree.insert.call_args_list}
-        self.assertEqual(displayed['port:remote:443'][6:8], ('2.00 MB', '1.00 MB'))
-        self.assertEqual(displayed['port:remote:None:2001:db8::1'][6:8], ('0.00 MB', '0.00 MB'))
+        self.assertEqual(displayed['port:remote:443:Allow:Both'][6:8], ('2.00 MB', '1.00 MB'))
+        self.assertEqual(displayed['port:remote:None:2001:db8::1:Allow:Both'][6:8], ('0.00 MB', '0.00 MB'))
 
 
 class UninstallTests(unittest.TestCase):
@@ -326,7 +589,7 @@ class SettingsInteractionTests(unittest.TestCase):
                     self.assertEqual(dialog.cget('bg'), a.colors['frame'])
                     self.assertEqual(rows[0].winfo_children()[1].cget('fg'), a.colors['wallet'])
                     self.assertEqual(rows[0].winfo_children()[0].cget('fg'), a.colors['select'])
-                    self.assertEqual(body.pack_slaves()[0].cget('fg'), a.colors['fg'])
+                    self.assertEqual(body.pack_slaves()[0].cget('fg'), a.colors['crypto_heading'])
                     self.assertEqual(body.pack_slaves()[0].cget('text'),
                                      'Support EolnMsuk - Click any wallet to copy its address')
                 a.show_crypto_wallets()

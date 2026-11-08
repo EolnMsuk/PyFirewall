@@ -5,8 +5,9 @@ import queue
 import unittest
 import urllib.error
 from unittest.mock import Mock, patch
-from support import patch_dependencies
-from test_firewall_monitor import NS, app
+from support import NS, patch_dependencies
+from fixtures import app
+import updates
 
 
 class ReleaseCheckTests(unittest.TestCase):
@@ -16,12 +17,12 @@ class ReleaseCheckTests(unittest.TestCase):
             result = NS['check_latest_release']()
         sent = request.call_args.args[0]
         self.assertEqual(sent.full_url, 'https://api.github.com/repos/EolnMsuk/PyFirewall/releases/latest')
-        self.assertEqual(sent.get_header('User-agent'), 'PyFirewall/2.4')
+        self.assertEqual(sent.get_header('User-agent'), f'PyFirewall/{updates.__version__}')
         self.assertEqual(request.call_args.kwargs['timeout'], 10)
         return result
 
+    @patch('updates.__version__', '2.4')
     def test_numeric_comparison_and_leading_v(self):
-        self.assertEqual(NS['__version__'], '2.4')
         for tag, newer in [('v2.5', True), ('2.10', True), ('v2.4.1', True),
                            ('v3.0', True), ('v2.4', False), ('2.4.0', False),
                            ('2.3.99', False), ('1.99', False)]:
@@ -94,7 +95,7 @@ class UpdateDispatchTests(unittest.TestCase):
 
     def test_manual_results_and_quiet_startup_results(self):
         for manual in (False, True):
-            for result in (None, ('2.4', False), ('2.5', True)):
+            for result in (None, (NS['__version__'], False), ('2.5', True)):
                 with self.subTest(manual=manual, result=result), patch.object(NS['messagebox'], 'showinfo') as info:
                     self.a.update_check_manual = manual
                     self.a.update_check_running = True
@@ -103,8 +104,8 @@ class UpdateDispatchTests(unittest.TestCase):
                     self.assertFalse(self.a.update_check_running)
                     self.assertEqual(self.a._show_update_prompt.call_count, int(result == ('2.5', True)))
                     self.assertEqual(info.call_count, int(manual and result != ('2.5', True)))
-                    if manual and result == ('2.4', False):
-                        self.assertIn('2.4', info.call_args.args[1])
+                    if manual and result == (NS['__version__'], False):
+                        self.assertIn(NS['__version__'], info.call_args.args[1])
 
     def test_thread_start_failure_is_graceful(self):
         with patch.object(NS['threading'], 'Thread') as thread, patch.object(NS['messagebox'], 'showinfo') as info:
@@ -157,7 +158,7 @@ class UpdatePromptTests(unittest.TestCase):
             self.assertEqual(set(self.buttons()), {'Open Release Page', 'Cancel'})
             prompt = self.a.update_dialog.winfo_children()[0].cget('text')
             self.assertIn('2.5', prompt)
-            self.assertIn('2.4', prompt)
+            self.assertIn(NS['__version__'], prompt)
             self.buttons()['Cancel'].invoke()
             startfile.assert_not_called()
             self.assertIsNone(self.a.update_dialog)

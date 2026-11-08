@@ -1,6 +1,7 @@
-"""Run UI/settings regressions without importing Scapy or loading Npcap.
+"""Run regressions without importing Scapy or loading Npcap.
 
 Run from the project directory: python tests/run_ui_checks.py
+Use --all for the full suite, or pass unittest module/class/method names.
 """
 import pathlib
 import sys
@@ -19,6 +20,9 @@ sys.modules['scapy.all'] = scapy_all
 
 if __name__ == '__main__':
     names = sys.argv[1:] or [
+        'test_global_rules.GlobalRuleOptionsTests',
+        'test_global_rules.IndependentGlobalPolicyTests',
+        'test_global_rules.GlobalDialogAndMenuTests',
         'test_rule_presentation',
         'test_rule_editing',
         'test_feature_updates.ColumnAndDialogTests',
@@ -26,5 +30,7 @@ if __name__ == '__main__':
         'test_firewall_monitor.ContextGlobalRuleTests',
         'test_ui_preferences',
     ]
-    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
+    suite = (unittest.defaultTestLoader.discover(str(pathlib.Path(__file__).resolve().parent))
+             if names == ['--all'] else unittest.defaultTestLoader.loadTestsFromNames(names))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.exit(not result.wasSuccessful())

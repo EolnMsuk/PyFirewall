@@ -19,6 +19,7 @@ from constants import (
     TRAFFIC_MAX_PROC_IP_ENTRIES,
     TRAFFIC_PRUNE_INTERVAL,
     WATCH_PORTS,
+    RATE_MAX_KEYS,
 )
 from helpers import address_networks, is_global_target, is_ip, log_internal_error, mb, normalize_path, normalize_target
 
@@ -216,6 +217,7 @@ class MonitoringMixin:
 
     def _prune_traffic_state_locked(self):
         self.last_traffic_prune = time.monotonic()
+        self._prune_rates_locked(self.last_traffic_prune)
         self.global_port_traffic = {key: stats for key, stats in self.global_port_traffic.items()
                                     if key in self.global_ports}
         if len(self.ip_traffic) > TRAFFIC_MAX_IP_ENTRIES:
@@ -255,14 +257,41 @@ class MonitoringMixin:
                 parts.append(f'{label} {int(port)} ({desc})')
         return f"Port watch: {'; '.join(parts)}" if parts else ''
 
+    def _prune_rates_locked(self, now):
+        self.last_rate_prune = now
+        window = getattr(self, 'rate_window', 5.0)
+        for key, timestamps in list(self.connection_rates.items()):
+            while timestamps and now - timestamps[0] > window:
+                timestamps.popleft()
+            if not timestamps:
+                self.connection_rates.pop(key, None)
+
+    def _rate_hit_locked(self, key, now, threshold, window):
+        if threshold == 1:
+            return True
+        if now - getattr(self, 'last_rate_prune', 0) >= min(1.0, window):
+            self._prune_rates_locked(now)
+        timestamps = self.connection_rates.get(key)
+        if timestamps is None:
+            if len(self.connection_rates) >= RATE_MAX_KEYS:
+                # Preserve in-window histories already tracked. Admission resumes
+                # when they expire; saturation is visible, never a capture wait.
+                self.untracked_rate_events = getattr(self, 'untracked_rate_events', 0) + 1
+                return False
+            timestamps = self.connection_rates.setdefault(key, deque())
+        while timestamps and now - timestamps[0] > window:
+            timestamps.popleft()
+        timestamps.append(now)
+        if len(timestamps) >= threshold:
+            self.connection_rates.pop(key, None)
+            return True
+        return False
+
     def packet_handler(self, packet):
         with self.lock:
             if self.is_paused or not self.sniffing or self.closed:
                 return
-            log_alerts = self.log_alerts_only
-            rate_threshold = self.rate_threshold
-            rate_window = self.rate_window
-            upload_threshold = self.upload_threshold_mb
+            accepted_token = self._detection_token_locked()
         try:
             packet_size = max(0, len(packet))
             if IP in packet:
@@ -307,6 +336,12 @@ class MonitoringMixin:
             norm_ip = normalize_target(remote_ip)
             now = time.monotonic()
             with self.lock:
+                if self.is_paused or not self.sniffing or self.closed or accepted_token != self._detection_token_locked():
+                    return
+                log_alerts = self.log_alerts_only
+                rate_threshold = self.rate_threshold
+                rate_window = self.rate_window
+                upload_threshold = self.upload_threshold_mb
                 self.captured_packets += 1
                 self.captured_bytes += packet_size
                 if direction == 'Outgoing':
@@ -320,8 +355,10 @@ class MonitoringMixin:
                 istats[side] += packet_size
                 # Match this packet's direction, not the connection's first-seen
                 # direction. Overlapping global/app rules each retain the bytes.
-                endpoint = {'protocol': proto, 'lport': local_port, 'dport': remote_port,
-                            'dst_ip': remote_ip, 'direction': direction}
+                endpoint = {'exe': exe, 'protocol': proto, 'lport': local_port, 'dport': remote_port,
+                            'dst_ip': remote_ip, 'domain': domain, 'direction': direction,
+                            'key': key, 'name': proc_name, 'pid': pid, 'signal': signal}
+                endpoint['_detection_token'] = accepted_token
                 for rule_key in self.matching_global_port_rules(endpoint):
                     stats = self.global_port_traffic.setdefault(rule_key, {'download': 0, 'upload': 0})
                     stats[side] += packet_size
@@ -352,28 +389,22 @@ class MonitoringMixin:
                 rate_hit = False
                 if is_new and log_alerts:
                     rate_key = (norm_exe, norm_ip)
-                    timestamps = self.connection_rates.setdefault(rate_key, deque())
-                    while timestamps and now - timestamps[0] > rate_window:
-                        timestamps.popleft()
-                    timestamps.append(now)
-                    rate_hit = len(timestamps) >= rate_threshold
-                    if rate_hit:
-                        self.connection_rates.pop(rate_key, None)
+                    rate_hit = self._rate_hit_locked(rate_key, now, rate_threshold, rate_window)
             if signal and is_new:
-                with self.lock:
-                    alert_connection = dict(self.active_connections.get(key, {}))
-                endpoint = f'[{remote_ip}]:{remote_port}' if ':' in remote_ip else f'{remote_ip}:{remote_port}'
-                self.queue_alert('Watch', proc_name, pid, endpoint, f'{direction} connection on {proto}; {signal}.',
-                                 connection=alert_connection)
+                remote_endpoint = f'[{remote_ip}]:{remote_port}' if ':' in remote_ip else f'{remote_ip}:{remote_port}'
+                self.queue_alert('Watch', proc_name, pid, remote_endpoint, f'{direction} connection on {proto}; {signal}.',
+                                 connection=endpoint)
             if upload_key and log_alerts and (upload_total >= upload_threshold * 1024 * 1024):
                 with self.lock:
+                    if accepted_token != self._detection_token_locked():
+                        return
                     first_upload_alert = upload_key not in self.upload_alerted
                     if first_upload_alert:
                         self.upload_alerted.add(upload_key)
                 if first_upload_alert:
-                    self.handle_threshold(proc_name, exe, pid, remote_ip, domain, direction, key, 'upload', mb(upload_total))
+                    self.handle_threshold(proc_name, exe, pid, remote_ip, domain, direction, key, 'upload', mb(upload_total), endpoint)
             if rate_hit:
-                self.handle_threshold(proc_name, exe, pid, remote_ip, domain, direction, key, 'connection', '')
+                self.handle_threshold(proc_name, exe, pid, remote_ip, domain, direction, key, 'connection', '', endpoint)
         except Exception as exc:
             log_internal_error('packet_handler', exc)
 
@@ -425,6 +456,7 @@ class MonitoringMixin:
                 # Npcap opens every second. Normal IP capture needs no promiscuity.
                 capture_socket = conf.L2listen(iface=iface, filter='ip or ip6', promisc=False)
                 with self.lock:
+                    self.detection_epoch = getattr(self, 'detection_epoch', 0) + 1
                     self.capture_interface = f'{iface.name} ({iface.network_name})'
                 return capture_socket
             except Exception as exc:
@@ -492,6 +524,7 @@ class MonitoringMixin:
                         self.capture_error = str(exc)
                         self.capture_healthy = False
                         self.capture_interface = None
+                    self._invalidate_auto_prompts(close_dialog=True)
                     if changed:
                         log_internal_error('packet_capture', exc)
                         self.queue_alert('High', 'Packet capture', '', '',

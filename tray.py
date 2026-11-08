@@ -6,6 +6,7 @@ import threading
 from ctypes import wintypes
 
 from constants import ICON_FILE
+from helpers import log_internal_error
 
 class PyFirewallSystemTray:
     WM_TRAYICON = 1024 + 1
@@ -13,6 +14,7 @@ class PyFirewallSystemTray:
     WM_DESTROY = 2
     WM_NULL = 0
     WM_RBUTTONUP = 517
+    WM_LBUTTONUP = 514
     WM_LBUTTONDBLCLK = 515
     NIM_ADD = 0
     NIM_DELETE = 2
@@ -53,9 +55,14 @@ class PyFirewallSystemTray:
         self.class_name = f'PyFirewallTray_{os.getpid()}_{id(self)}'
         self._wndproc = None
         self._hicon = None
+        self._owns_icon = False
+        self._hinstance = None
+        self._taskbar_created = None
         self._registered = False
         self._icon_added = False
         self._ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._stopped = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True, name='PyFirewallTray')
         self.thread.start()
 
@@ -63,6 +70,8 @@ class PyFirewallSystemTray:
         try:
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
             self.thread_id = kernel32.GetCurrentThreadId()
             user32.RegisterClassExW.argtypes = [ctypes.POINTER(self.WNDCLASSEXW)]
             user32.RegisterClassExW.restype = wintypes.ATOM
@@ -72,6 +81,15 @@ class PyFirewallSystemTray:
             user32.DefWindowProcW.restype = ctypes.c_ssize_t
             user32.DestroyWindow.argtypes = [wintypes.HWND]
             user32.DestroyWindow.restype = wintypes.BOOL
+            user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+            user32.UnregisterClassW.restype = wintypes.BOOL
+            user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+            user32.RegisterWindowMessageW.restype = wintypes.UINT
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+            user32.GetMessageW.restype = wintypes.BOOL
+            user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.restype = ctypes.c_ssize_t
             user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
             user32.ShowWindow.restype = wintypes.BOOL
             user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
@@ -104,6 +122,7 @@ class PyFirewallSystemTray:
             default_icon = ctypes.cast(ctypes.c_void_p(32512), wintypes.LPCWSTR)
             arrow_cursor = user32.LoadCursorW(None, default_icon)
             self._hicon = user32.LoadImageW(None, ICON_FILE, 1, 0, 0, 16 | 64)
+            self._owns_icon = bool(self._hicon)
             if not self._hicon:
                 self._hicon = user32.LoadIconW(None, default_icon)
             if not self._hicon:
@@ -116,6 +135,12 @@ class PyFirewallSystemTray:
             wnd.cbClsExtra = 0
             wnd.cbWndExtra = 0
             wnd.hInstance = kernel32.GetModuleHandleW(None)
+            if not wnd.hInstance:
+                raise OSError(kernel32.GetLastError(), 'GetModuleHandleW failed')
+            self._hinstance = wnd.hInstance
+            self._taskbar_created = user32.RegisterWindowMessageW('TaskbarCreated')
+            if not self._taskbar_created:
+                raise OSError(kernel32.GetLastError(), 'Could not register TaskbarCreated')
             wnd.hIcon = self._hicon
             wnd.hCursor = arrow_cursor
             wnd.hbrBackground = None
@@ -124,73 +149,103 @@ class PyFirewallSystemTray:
             wnd.hIconSm = self._hicon
             atom = user32.RegisterClassExW(ctypes.byref(wnd))
             if not atom:
-                raise OSError(f'RegisterClassExW failed with error {ctypes.get_last_error()}')
+                raise OSError(kernel32.GetLastError(), 'RegisterClassExW failed')
             self._registered = True
-            self.hwnd = user32.CreateWindowExW(0, self.class_name, 'PyFirewall', 0, 0, 0, 0, 0, None, None, wnd.hInstance, None)
-            if not self.hwnd:
-                raise OSError(f'CreateWindowExW failed with error {ctypes.get_last_error()}')
-            user32.ShowWindow(self.hwnd, self.SW_HIDE)
-            nid = self.NOTIFYICONDATAW()
-            nid.cbSize = ctypes.sizeof(self.NOTIFYICONDATAW)
-            nid.hWnd = self.hwnd
-            nid.uID = 1
-            nid.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
-            nid.uCallbackMessage = self.WM_TRAYICON
-            nid.hIcon = self._hicon
-            nid.szTip = 'PyFirewall'
-            if not shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(nid)):
-                raise OSError(f'Shell_NotifyIconW(NIM_ADD) failed with error {ctypes.get_last_error()}')
-            self._icon_added = True
+            hwnd = user32.CreateWindowExW(0, self.class_name, 'PyFirewall', 0, 0, 0, 0, 0, None, None, wnd.hInstance, None)
+            if not hwnd:
+                raise OSError(kernel32.GetLastError(), 'CreateWindowExW failed')
+            with self.state_lock:
+                self.hwnd = hwnd
+            user32.ShowWindow(hwnd, self.SW_HIDE)
+            if self._stop_requested.is_set():
+                return
+            self._add_icon(hwnd)
             self._ready.set()
             msg = wintypes.MSG()
-            while True:
+            while not self._stop_requested.is_set():
                 result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if result == 0 or result == -1:
+                if result == -1:
+                    raise OSError('Tray GetMessageW failed')
+                if result == 0:
                     break
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
-        except Exception:
-            self._ready.set()
+        except Exception as exc:
+            log_internal_error('tray_initialization', exc)
+            if not self._stop_requested.is_set():
+                self.command_queue.put('tray_unavailable')
         finally:
-            try:
-                if self._icon_added and self.hwnd:
-                    nid = self.NOTIFYICONDATAW()
-                    nid.cbSize = ctypes.sizeof(self.NOTIFYICONDATAW)
-                    nid.hWnd = self.hwnd
-                    nid.uID = 1
-                    ctypes.windll.shell32.Shell_NotifyIconW(self.NIM_DELETE, ctypes.byref(nid))
-                    self._icon_added = False
-            except Exception:
-                pass
-            try:
-                if self.hwnd:
-                    ctypes.windll.user32.DestroyWindow(self.hwnd)
-                    self.hwnd = None
-            except Exception:
-                pass
-            try:
+            # Only the message-loop owner disposes native resources. stop() can
+            # no longer post to a handle after it has been destroyed/reused.
+            with self.state_lock:
+                hwnd, self.hwnd = self.hwnd, None
+                icon_added, self._icon_added = self._icon_added, False
+                cleanup = []
+                if icon_added and hwnd:
+                    nid = self._icon_data(hwnd)
+                    cleanup.append(('tray_remove_icon', lambda: ctypes.windll.shell32.Shell_NotifyIconW(self.NIM_DELETE, ctypes.byref(nid))))
+                if hwnd:
+                    cleanup.append(('tray_destroy_window', lambda: ctypes.windll.user32.DestroyWindow(hwnd)))
                 if self._registered:
-                    ctypes.windll.user32.UnregisterClassW(self.class_name, ctypes.windll.kernel32.GetModuleHandleW(None))
-                    self._registered = False
-            except Exception:
-                pass
-            try:
-                if self._hicon:
-                    ctypes.windll.user32.DestroyIcon(self._hicon)
-                    self._hicon = None
-            except Exception:
-                pass
+                    cleanup.append(('tray_unregister_class', lambda: ctypes.windll.user32.UnregisterClassW(self.class_name, self._hinstance)))
+                if self._hicon and self._owns_icon:
+                    cleanup.append(('tray_destroy_icon', lambda: ctypes.windll.user32.DestroyIcon(self._hicon)))
+                for context, dispose in cleanup:
+                    try:
+                        if not dispose():
+                            raise OSError(f'{context} failed')
+                    except Exception as exc:
+                        log_internal_error(context, exc)
+                self._registered = False
+                self._hicon = None
+            self._ready.set()
+            self._stopped.set()
+
+    def _icon_data(self, hwnd):
+        nid = self.NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(self.NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
+        nid.uCallbackMessage = self.WM_TRAYICON
+        nid.hIcon = self._hicon
+        nid.szTip = 'PyFirewall'
+        return nid
+
+    def _add_icon(self, hwnd):
+        with self.state_lock:
+            if self._stop_requested.is_set():
+                return
+            nid = self._icon_data(hwnd)
+            if not ctypes.windll.shell32.Shell_NotifyIconW(self.NIM_ADD, ctypes.byref(nid)):
+                raise OSError(ctypes.windll.kernel32.GetLastError(), 'Shell_NotifyIconW(NIM_ADD) failed')
+            self._icon_added = True
+
+    @property
+    def available(self):
+        with self.state_lock:
+            return self._icon_added and not self._stop_requested.is_set()
 
     def _window_proc(self, hwnd, msg, wparam, lparam):
         if msg == self.WM_TRAYICON:
             event = wintypes.UINT(lparam & 4294967295).value
             if event == self.WM_RBUTTONUP:
                 self._show_context_menu(hwnd)
-            elif event == self.WM_LBUTTONDBLCLK:
+            elif event in (self.WM_LBUTTONUP, self.WM_LBUTTONDBLCLK):
                 self.command_queue.put('show')
             return 0
+        if self._taskbar_created and msg == self._taskbar_created:
+            with self.state_lock:
+                self._icon_added = False
+            try:
+                self._add_icon(hwnd)
+            except Exception as exc:
+                log_internal_error('tray_taskbar_recreation', exc)
+                self.command_queue.put('tray_unavailable')
+            return 0
         if msg == self.WM_CLOSE:
-            ctypes.windll.user32.DestroyWindow(hwnd)
+            self._stop_requested.set()
+            ctypes.windll.user32.PostQuitMessage(0)
             return 0
         if msg == self.WM_DESTROY:
             ctypes.windll.user32.PostQuitMessage(0)
@@ -243,14 +298,14 @@ class PyFirewallSystemTray:
             user32.DestroyMenu(menu)
 
     def stop(self):
-        hwnd = self.hwnd
-        if hwnd:
-            try:
-                ctypes.windll.user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0)
-            except Exception:
-                pass
-        elif self.thread and self.thread.is_alive() and self.thread_id:
-            try:
-                ctypes.windll.user32.PostThreadMessageW(self.thread_id, self.WM_CLOSE, 0, 0)
-            except Exception:
-                pass
+        self._stop_requested.set()
+        with self.state_lock:
+            if self.hwnd:
+                try:
+                    if not ctypes.windll.user32.PostMessageW(self.hwnd, self.WM_CLOSE, 0, 0):
+                        raise OSError('Could not wake the tray thread for shutdown')
+                except Exception as exc:
+                    log_internal_error('tray_stop', exc)
+
+    def wait(self, timeout=0.5):
+        return self._stopped.wait(timeout)

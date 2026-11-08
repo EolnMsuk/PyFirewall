@@ -5,8 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from support import NS, patch_dependencies
-from test_firewall_monitor import app
-from test_native_port_rules import MemoryFirewall, connection, port
+from fixtures import MemoryFirewall, app, connection, port
 
 
 class ProtocolAndReplacementTests(unittest.TestCase):
@@ -35,9 +34,9 @@ class ProtocolAndReplacementTests(unittest.TestCase):
         entries = [dict(port(), protocol=p) for p in ('TCP/UDP', 'TCP', 'UDP')]
         a._commit_rule_batch([], port_updates=entries)
         self.assertEqual(len([r for r in backend.rules.values() if r.get('is_port')]), 8)
-        a._remove_rule_batch([('Global Port Allow', 'remote:443:TCP')])
+        a._remove_rule_batch([('Global Port Allow', 'remote:443:TCP:Allow:Both')])
         self.assertEqual(len([r for r in backend.rules.values() if r.get('is_port')]), 6)
-        self.assertEqual(set(a.global_ports), {'remote:443', 'remote:443:UDP'})
+        self.assertEqual(set(a.global_ports), {'remote:443:Allow:Both', 'remote:443:UDP:Allow:Both'})
 
     def test_edit_changes_all_fields_atomically_and_rolls_back_on_failure(self):
         a = app()
@@ -55,7 +54,7 @@ class ProtocolAndReplacementTests(unittest.TestCase):
         self.assertEqual(a.global_ports, cache)
         self.assertTrue(a._apply_rule_batch([], port_updates=[replacement], replace_rule=('port', old_key), quiet=True))
         self.assertNotIn(old_key, a.global_ports)
-        self.assertEqual(set(a.global_ports), {'remote:80', 'local:53:UDP:198.51.100.1'})
+        self.assertEqual(set(a.global_ports), {'remote:80:Allow:Both', 'local:53:UDP:198.51.100.1:Allow:Inbound'})
         native = [r for r in backend.rules.values() if r.get('is_port')]
         self.assertEqual(len(native), 5)
         self.assertEqual(sum(r['protocol'] == 'UDP' and r['direction'] == 'Inbound' and r['local_ports'] == ['53'] for r in native), 1)
@@ -77,10 +76,9 @@ class ProtocolAndReplacementTests(unittest.TestCase):
         self.assertEqual(a.connection_tag(connection()), 'global_allow')
         self.assertEqual(a.connection_tag(connection(protocol='UDP')), 'even')
 
-    def test_invalid_protocol_and_unrestricted_empty_rule_rejected(self):
+    def test_invalid_protocol_rejected(self):
         a = app()
-        for entry in (dict(port(), protocol='ICMP'), dict(port(), protocol=''), port(number=None),
-                      dict(port(number=None), target='  ')):
+        for entry in (dict(port(), protocol='ICMP'), dict(port(), protocol='')):
             with self.assertRaises(ValueError):
                 a._parse_port_rules([entry])
 
@@ -109,7 +107,7 @@ class ProtocolAndReplacementTests(unittest.TestCase):
         a._ask_global_rule_fields = Mock(return_value=('missing.test', 53, 'local', 'TCP', 'Block'))
         a.resolve_global_target = Mock(side_effect=ValueError('DNS failed'))
         with patch.object(NS['messagebox'], 'showwarning') as warning:
-            a.add_global_rule_dialog({}, ('port', 'remote:443'))
+            a.add_global_rule_dialog({}, ('port', 'remote:443:Allow:Both'))
         self.assertEqual(backend.rules, before)
         self.assertIn('existing rule was kept', warning.call_args.args[1])
 
@@ -152,8 +150,8 @@ class EditingAndMenuTests(unittest.TestCase):
         a.blocked_paths[NS['normalize_path'](row['exe'])] = {'path': row['exe'], 'in': True, 'out': True}
         a.edit_global_rule.reset_mock()
         a.edit_connection_rule(row)
-        a.edit_app_rule.assert_called_once()
-        a.edit_global_rule.assert_not_called()
+        a.edit_app_rule.assert_not_called()
+        a.edit_global_rule.assert_called_once()
 
     def test_new_connection_type_selection_and_cancel(self):
         for choice in ('app', 'global', None):
@@ -198,7 +196,7 @@ class EditingAndMenuTests(unittest.TestCase):
         initial, old = a.add_global_rule_dialog.call_args.args
         self.assertEqual(initial['action'], 'Allow')
         self.assertEqual(initial['port'], 443)
-        self.assertEqual(old, ('port', 'remote:443'))
+        self.assertEqual(old, ('port', 'remote:443:Block:Both'))
 
     def test_details_actions_capture_connection_and_copy_full_text(self):
         a = app()
@@ -382,7 +380,7 @@ class EditingAndMenuTests(unittest.TestCase):
                 a.show_alert_menu(event)
             else:
                 a.rules_tree = Mock()
-                a.rules_tree.item.return_value = ('Global Port Allow', '', 'Both', '', '', 'remote:443')
+                a.rules_tree.item.return_value = ('Global Port Allow', '', 'Both', '', '', 'remote:443:Allow:Both')
                 a.show_rules_menu(event)
             entries = {c.kwargs['label']: c.kwargs for c in menu.add_command.call_args_list}
             self.assertEqual(entries['Allow Connection']['foreground'], '#ffffff')
@@ -442,6 +440,7 @@ class ContextRuleEditorTests(unittest.TestCase):
                     expected = dict(entry, action=action, editing=True)
                     if section != 'managed' and label != 'Edit Global Rule':
                         expected['target'] = row['dst_ip']
+                        expected['exe'] = row['exe']
                     self.assertEqual(initial, expected)
                     self.assertEqual(old, ('port', key))
                 labels = list(menu)
@@ -514,7 +513,7 @@ class ContextRuleEditorTests(unittest.TestCase):
              patch_dependencies(log_internal_error=Mock()):
             self.assertTrue(a._apply_rule_batch([], port_updates=[port()], report=True))
             self.assertTrue(a._apply_rule_batch([], port_updates=[port()], report=True))
-            self.assertTrue(a._remove_rules_with_feedback([('Global Port Allow', 'remote:443')]))
+            self.assertTrue(a._remove_rules_with_feedback([('Global Port Allow', 'remote:443:Allow:Both')]))
             info.assert_not_called()
             warning.assert_not_called()
             error.assert_not_called()
@@ -524,7 +523,7 @@ class ContextRuleEditorTests(unittest.TestCase):
             error.assert_called_once()
             error.reset_mock()
             a.get_firewall_rules.side_effect = RuntimeError('Access denied')
-            self.assertFalse(a._remove_rules_with_feedback([('Global Port Allow', 'remote:443')]))
+            self.assertFalse(a._remove_rules_with_feedback([('Global Port Allow', 'remote:443:Allow:Both')]))
             self.assertIn('Access denied', error.call_args.args[1])
 
     def test_settings_write_failure_is_reported_for_updates_and_removals(self):
@@ -536,7 +535,7 @@ class ContextRuleEditorTests(unittest.TestCase):
             a.settings_save_error = 'Disk full'
             with patch.object(NS['messagebox'], 'showerror') as error, patch_dependencies(log_internal_error=Mock()):
                 if remove:
-                    result = a._remove_rules_with_feedback([('Global Port Allow', 'remote:443')])
+                    result = a._remove_rules_with_feedback([('Global Port Allow', 'remote:443:Allow:Both')])
                 else:
                     result = a._apply_rule_batch([], port_updates=[port(action='Block')])
             self.assertFalse(result)
@@ -558,6 +557,35 @@ class ContextRuleEditorTests(unittest.TestCase):
 
 
 class RealWidgetTests(unittest.TestCase):
+    def test_conflict_warning_keeps_editor_open_for_correction(self):
+        a = self.a
+        a.global_ports = a._parse_port_rules([dict(port(number=43), protocol='TCP/UDP')])
+        errors = []
+        def interact():
+            dialog = next(w for w in self.root.winfo_children() if isinstance(w, NS['tk'].Toplevel))
+            try:
+                children = self.descendants(dialog)
+                entries = [w for w in children if isinstance(w, NS['ttk'].Entry)
+                           and not isinstance(w, NS['ttk'].Combobox)]
+                entries = entries[1:]  # Executable precedes target and port.
+                save = next(w for w in children if isinstance(w, NS['ttk'].Button) and w.cget('text') == 'Save')
+                with patch.object(NS['messagebox'], 'showwarning') as warning:
+                    save.invoke()
+                self.assertIn('Overlapping protocol', warning.call_args.args[1])
+                self.assertTrue(dialog.winfo_exists())
+                self.assertEqual(entries[1].get(), '43')
+                entries[1].delete(0, NS['tk'].END)
+                entries[1].insert(0, '44')
+                save.invoke()
+            except Exception as exc:
+                errors.append(exc)
+                dialog.destroy()
+        self.root.after(20, interact)
+        fields = a._ask_global_rule_fields(dict(port=43, protocol='TCP', action='Block Incoming'))
+        if errors:
+            raise errors[0]
+        self.assertEqual(fields, ('', 44, 'remote', 'TCP', 'Block Incoming'))
+
     def setUp(self):
         self.root = NS['tk'].Tk()
         self.root.withdraw()
@@ -658,7 +686,7 @@ class RealWidgetTests(unittest.TestCase):
 
     def test_edit_dialog_prefills_all_fields(self):
         initial = {'editing': True, 'action': 'Block Incoming', 'target': 'example.test',
-                   'port': 53, 'scope': 'local', 'protocol': 'UDP'}
+                   'port': 53, 'scope': 'local', 'protocol': 'UDP', 'exe': r'C:\demo.exe'}
         observed = {}
         def inspect():
             dialog = next(w for w in self.root.winfo_children() if isinstance(w, NS['tk'].Toplevel))
@@ -668,7 +696,8 @@ class RealWidgetTests(unittest.TestCase):
             labels = {w.cget('text'): w for w in widgets if isinstance(w, NS['ttk'].Label)}
             combos = [w for w in widgets if isinstance(w, NS['ttk'].Combobox)]
             entries = [w for w in widgets if isinstance(w, NS['ttk'].Entry) and not isinstance(w, NS['ttk'].Combobox)]
-            observed['aligned_label'] = labels['Port Number:'].winfo_rootx() == labels['Action:'].winfo_rootx()
+            entries = entries[1:]
+            observed['aligned_label'] = labels['Port Numbers:'].winfo_rootx() == labels['Action:'].winfo_rootx()
             observed['aligned_input'] = entries[0].winfo_rootx() == entries[1].winfo_rootx()
             observed['aligned_right'] = len({w.winfo_rootx() + w.winfo_width() for w in combos + entries[:1]}) == 1
             observed['range_between'] = (entries[1].winfo_rootx() + entries[1].winfo_width()
@@ -678,10 +707,103 @@ class RealWidgetTests(unittest.TestCase):
         self.root.after(20, inspect)
         result = self.a._ask_global_rule_fields(initial)
         self.assertEqual(observed['combos'], ['Block Incoming', 'Local', 'UDP'])
-        self.assertEqual(observed['entries'], ['example.test', '53'])
-        self.assertEqual(result, ('example.test', 53, 'local', 'UDP', 'Block Incoming'))
+        self.assertEqual(observed['entries'], ['demo.exe', 'example.test', '53'])
+        self.assertEqual(result, ('example.test', 53, 'local', 'UDP', 'Block Incoming', r'C:\demo.exe'))
         for key in ('aligned_label', 'aligned_input', 'aligned_right', 'range_between'):
             self.assertTrue(observed[key], key)
+
+    def test_executable_browse_appends_names_and_readonly_field_retains_paths(self):
+        a = self.a
+        paths = [r'C:\First Folder\demo.exe', r'C:\Second, Folder\demo.exe']
+        for initial in ({'exe': paths[0]}, {'editing': True, 'exes': paths}):
+            errors = []
+            def interact():
+                dialog = a.rule_editor_dialog
+                try:
+                    widgets = self.descendants(dialog)
+                    exe = next(w for w in widgets if isinstance(w, NS['ttk'].Entry)
+                               and not isinstance(w, NS['ttk'].Combobox))
+                    buttons = {w.cget('text'): w for w in widgets if isinstance(w, NS['ttk'].Button)}
+                    self.assertEqual(str(exe.cget('state')), 'readonly')
+                    original = exe.get()
+                    exe.delete(0, NS['tk'].END)
+                    exe.insert(0, r'C:\manual.exe')
+                    self.assertEqual(exe.get(), original)
+                    with patch.object(NS['filedialog'], 'askopenfilename',
+                                      side_effect=[paths[1], paths[0].upper(), '']):
+                        for _ in range(3):
+                            buttons['Browse'].invoke()
+                    self.assertEqual(exe.get(), 'demo.exe, demo.exe')
+                    self.assertNotIn('C:', exe.get())
+                    buttons['Save'].invoke()
+                except Exception as exc:
+                    errors.append(exc)
+                    dialog.destroy()
+            self.root.after(20, interact)
+            result = a._ask_global_rule_fields(initial)
+            if errors:
+                raise errors[0]
+            self.assertEqual(result, ('', None, 'remote', 'TCP/UDP', 'Allow', paths))
+
+    def test_invalid_executable_warning_has_only_ok_and_clear_returns_to_all_processes(self):
+        a = self.a
+        for editing in (False, True):
+            errors = []
+            def interact():
+                dialog = a.rule_editor_dialog
+                try:
+                    widgets = self.descendants(dialog)
+                    entries = [w for w in widgets if isinstance(w, NS['ttk'].Entry)
+                               and not isinstance(w, NS['ttk'].Combobox)]
+                    buttons = {w.cget('text'): w for w in widgets if isinstance(w, NS['ttk'].Button)}
+                    with patch.object(NS['messagebox'], 'showwarning') as warning, \
+                         patch.object(NS['messagebox'], 'askokcancel') as cancel_prompt:
+                        buttons['Save'].invoke()
+                    cancel_prompt.assert_not_called()
+                    warning.assert_called_once()
+                    self.assertIn('absolute executable', warning.call_args.args[1])
+                    self.assertEqual(warning.call_args.kwargs['parent'], dialog)
+                    self.assertNotIn('type', warning.call_args.kwargs)
+                    self.assertTrue(dialog.winfo_exists())
+                    self.assertEqual([w.get() for w in entries], ['relative.exe', '192.0.2.1', '443'])
+                    buttons['Clear'].invoke()
+                    self.assertEqual(entries[0].get(), '')
+                    buttons['Save'].invoke()
+                except Exception as exc:
+                    errors.append(exc)
+                    dialog.destroy()
+            self.root.after(20, interact)
+            result = a._ask_global_rule_fields(dict(editing=editing, exe='relative.exe',
+                                                   target='192.0.2.1', port=443))
+            if errors:
+                raise errors[0]
+            self.assertEqual(result, ('192.0.2.1', 443, 'remote', 'TCP/UDP', 'Allow'))
+
+    def test_blank_space_clear_actions_share_copy_color_and_follow_tab(self):
+        a = self.a
+        a.tree, a.alerts_tree, a.rules_tree = Mock(), Mock(), Mock()
+        a.clear_list, a.clear_alerts = Mock(), Mock()
+        event = types.SimpleNamespace(x=1, y=1, x_root=1, y_root=1)
+        for foreground in ('#e8e8e8', '#202020'):
+            a.colors['fg'] = foreground
+            for tree, label, command in ((a.tree, 'Clear List', a.clear_list),
+                                         (a.alerts_tree, 'Clear Alerts', a.clear_alerts),
+                                         (a.rules_tree, None, None)):
+                tree.identify_region.return_value = 'nothing'
+                menu = NS['ThemedContextMenu'](self.root, a.colors)
+                menu.post = Mock()
+                with patch.object(a, '_context_menu', return_value=menu):
+                    self.assertEqual(a.show_empty_rows_menu(event, tree), 'break')
+                self.assertEqual([item[0].cget('text') for item in menu.items],
+                                 ['Add App Rule', 'Add Global Rule'] + ([label] if label else []))
+                separators = [w for w in menu.body.winfo_children() if isinstance(w, NS['tk'].Frame)]
+                self.assertEqual(len(separators), int(label is not None))
+                if label:
+                    self.assertEqual(menu.items[-1][0].cget('fg'), foreground)
+                    menu._invoke(index=2)
+                    command.assert_called()
+                else:
+                    menu._close()
 
     def test_details_buttons_share_style_and_hover_restores_background(self):
         self.root.attributes('-alpha', 0)

@@ -9,6 +9,9 @@ import socket
 import subprocess
 import tempfile
 import time
+import queue
+import threading
+import copy
 from tkinter import messagebox
 
 from constants import (
@@ -28,12 +31,16 @@ from helpers import (
     direction_name,
     direction_set,
     display_path,
+    executable_fields,
+    executable_identity,
     error_details,
     is_global_target,
     is_ip,
     log_internal_error,
     normalize_path,
+    normalize_ports,
     normalize_target,
+    rule_executables,
 )
 
 class FirewallMixin:
@@ -44,6 +51,69 @@ class FirewallMixin:
         return 'Both' if data['in'] and data['out'] else 'Inbound' if data['in'] else 'Outbound'
 
     # Command execution and verified transactions
+
+    def _start_native_worker(self):
+        self.native_jobs = queue.Queue(maxsize=128)
+        self.native_job_keys = set()
+        self.native_shutdown_requested = False
+        self.native_worker = threading.Thread(target=self._native_worker, daemon=True,
+                                               name='PyFirewall-Native')
+        self.native_worker.start()
+
+    def _native_ui_call(self):
+        return (hasattr(self, 'native_jobs') and
+                threading.get_ident() == self.ui_thread_id)
+
+    def _queue_native_job(self, label, operation, key=None):
+        """Bound discardable requests; cleanup and shutdown use retained state."""
+        with self.lock:
+            if self.closed or getattr(self, 'native_shutdown_requested', False):
+                return False
+            if key is not None and key in self.native_job_keys:
+                return True
+            try:
+                self.native_jobs.put_nowait((label, operation, key))
+            except queue.Full:
+                self.queue_alert('High', 'Native work queue', '', '',
+                                 f'{label} was not queued: the worker is busy. Please retry.')
+                return False
+            if key is not None:
+                self.native_job_keys.add(key)
+        return True
+
+    def _native_worker(self):
+        while True:
+            if self.native_shutdown_requested:
+                self._shutdown_worker()
+                return
+            # Retired holds are durable cleanup obligations, not queue events.
+            if getattr(self, 'auto_hold_cleanup', {}):
+                self._release_auto_holds_for_generation(None)
+            try:
+                label, operation, key = self.native_jobs.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if not self.native_shutdown_requested:
+                    with self.firewall_lock:
+                        with self.lock:
+                            self.native_operation_label = label
+                        operation()
+            except Exception as exc:
+                log_internal_error('native_worker', exc)
+                self.queue_alert('High', label, '', '', str(exc))
+                self._native_message('showerror', label, str(exc))
+            finally:
+                with self.lock:
+                    self.native_operation_label = None
+                    self.native_job_keys.discard(key)
+                self.native_jobs.task_done()
+
+    def _native_message(self, method, title, text, **options):
+        if threading.get_ident() != getattr(self, 'ui_thread_id', threading.main_thread().ident):
+            self.ui_queue.put(('message', method, title, text))
+        else:
+            getattr(messagebox, method)(title, text, **options)
 
     def _run(self, args, check=True, timeout=None):
         return subprocess.run(
@@ -107,7 +177,7 @@ if ($existing.Count) { 'removed' } else { 'absent' }
             raise RuntimeError('Firewall rules could not be removed: ' + ', '.join(sorted(remaining)))
         return bool(names & existing)
 
-    def _replace_rule_records(self, previous, desired_names, apply, apply_first=False, preserve_holds=False):
+    def _replace_rule_records(self, previous, desired_names, apply, apply_first=False, preserve_holds=False, commit=None):
         names = {r['name'] for r in previous} | set(desired_names)
         try:
             if preserve_holds:
@@ -120,6 +190,8 @@ if ($existing.Count) { 'removed' } else { 'absent' }
             else:
                 self.delete_rule_names(r['name'] for r in previous)
                 apply()
+            if commit is not None:
+                commit()
         except Exception as error:
             cleanup_error = None
             try:
@@ -134,7 +206,7 @@ if ($existing.Count) { 'removed' } else { 'absent' }
             except Exception as rollback_error:
                 try:
                     self.sync_rule_cache()
-                    self.save_settings()
+                    self._save_settings_with_feedback()
                 except Exception as reconcile_error:
                     log_internal_error('rule_reconciliation', reconcile_error)
                 raise RuntimeError(f'Rule update failed: {error}; rollback failed: {rollback_error}') from rollback_error
@@ -150,14 +222,16 @@ $rules = Get-NetFirewallRule -ErrorAction Stop |
     $r = $_
     $a = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r -ErrorAction Stop |
       Select-Object -First 1
-    $p = if ($r.DisplayName -like 'PyFirewall_GlobalPort_*') {
-      Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r -ErrorAction Stop | Select-Object -First 1
-    } else { $null }
+    $p = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r -ErrorAction Stop | Select-Object -First 1
+    $address = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $r -ErrorAction Stop
     [PSCustomObject]@{
       DisplayName=[string]$r.DisplayName
       Action=[string]$r.Action
       Direction=[string]$r.Direction
-      Addresses=@((Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $r -ErrorAction Stop).RemoteAddress)
+      Enabled=[string]$r.Enabled
+      Profile=[string]$r.Profile
+      Addresses=@($address.RemoteAddress)
+      LocalAddresses=@($address.LocalAddress)
       Program=if($null -ne $a){[string]$a.Program}else{""}
       Protocol=if($p){[string]$p.Protocol}else{""}
       LocalPorts=@(if($p){$p.LocalPort})
@@ -188,8 +262,14 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             name = str(item.get('DisplayName', '') or '')
             global_rule = name.startswith((GLOBAL_BLOCK_PREFIX, GLOBAL_ALLOW_PREFIX, GLOBAL_PORT_PREFIX))
             records.append({'name': name, 'action': str(item.get('Action', '') or ''), 'direction': str(item.get('Direction', '') or ''), 'path': '' if global_rule else display_path(item.get('Program', '')), 'normalized_path': '' if global_rule else normalize_path(item.get('Program', '')), 'is_global': global_rule, 'is_hold': name.startswith(AUTO_HOLD_PREFIX), 'addresses': item.get('Addresses', [])})
+            records[-1].update(enabled=str(item.get('Enabled', '')).casefold() == 'true',
+                               profile=item.get('Profile', 'Any'), local_addresses=item.get('LocalAddresses', ['Any']),
+                               program=display_path(item.get('Program', '')),
+                               protocol=item.get('Protocol', ''), local_ports=item.get('LocalPorts', []),
+                               remote_ports=item.get('RemotePorts', []))
             if name.startswith(GLOBAL_PORT_PREFIX):
                 records[-1].update(is_port=True, protocol=item.get('Protocol', ''),
+                                   path=display_path(item.get('Program', '')) if item.get('Program') not in ('Any', '', None) else '',
                                    local_ports=item.get('LocalPorts', []), remote_ports=item.get('RemotePorts', []))
         return records
 
@@ -227,20 +307,17 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             protocol = str(entry.get('protocol', 'TCP/UDP')).upper()
             if protocol not in {'TCP/UDP', 'TCP', 'UDP'}:
                 raise ValueError('Protocol must be TCP/UDP, TCP or UDP.')
-            if raw is None and target:
-                port = None
-            elif isinstance(raw, bool) or not str(raw).isdecimal() or not 1 <= int(raw) <= 65535:
-                raise ValueError('Port numbers must be integers from 1 to 65535.')
-            else:
-                port = int(raw)
+            port = normalize_ports(raw)
             rule = {'scope': scope, 'port': port, 'action': action}
+            paths = rule_executables(entry)
+            rule.update(executable_fields(paths))
             if protocol != 'TCP/UDP':
                 rule['protocol'] = protocol
             raw_direction = str(entry.get('direction', 'Both')).casefold()
-            if raw_direction not in {'both', 'in', 'inbound', 'incoming'}:
-                raise ValueError('Global port rules must apply to Both or Inbound directions.')
-            if direction_name(raw_direction) == 'Inbound':
-                rule['direction'] = 'Inbound'
+            if raw_direction not in {'both', 'in', 'inbound', 'incoming', 'out', 'outbound', 'outgoing'}:
+                raise ValueError('Global rules must apply to Both, Inbound or Outbound directions.')
+            if direction_name(raw_direction) != 'Both':
+                rule['direction'] = direction_name(raw_direction)
             key = f'{scope}:{port}'
             if protocol != 'TCP/UDP':
                 key += f':{protocol}'
@@ -267,11 +344,17 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                             raise ValueError('Target addresses must be arrays.')
                         rule['target_addresses'][part] = sorted({normalize_address(value) for value in values})
                 key += f':{target}'
+            # Policies with different actions or direction sets are independent.
+            key += f":{action}:{direction_name(raw_direction)}"
+            if len(paths) == 1:
+                key += ':exe:' + normalize_path(paths[0])
+            elif paths:
+                key += ':exes:' + json.dumps(executable_identity(rule), ensure_ascii=True, separators=(',', ':'))
             result[key] = rule
         return result
 
     @staticmethod
-    def _port_firewall_rules(ports, all_directions=False):
+    def _port_firewall_rules(ports, all_directions=False, legacy_names=False):
         """One logical rule expands to TCP/UDP rules for its selected directions."""
         rules = []
         for r in ports.values():
@@ -280,23 +363,44 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             # Distinct logical policies may overlap without sharing native names.
             if r.get('protocol', 'TCP/UDP') != 'TCP/UDP':
                 suffix += '_' + r['protocol']
-            directions = ('Inbound', 'Outbound') if all_directions else (
-                ('Inbound',) if r.get('direction') == 'Inbound' else ('Inbound', 'Outbound'))
-            rules.extend([{'name': f"{GLOBAL_PORT_PREFIX}{r['scope']}_{r['port']}{suffix}_{number}_{direction}",
-                 'action': r['action'], 'direction': direction, 'path': '', 'is_port': True,
+            if not legacy_names:
+                suffix += f"_{r['action']}_{direction_name(r.get('direction', 'Both'))}"
+            paths = rule_executables(r)
+            if len(paths) == 1:
+                suffix += '_exe_' + hashlib.sha1(normalize_path(paths[0]).encode('utf-8')).hexdigest()[:16]
+            elif paths:
+                scope_key = json.dumps(executable_identity(r), ensure_ascii=True, separators=(',', ':'))
+                suffix += '_exes_' + hashlib.sha1(scope_key.encode('utf-8')).hexdigest()[:16]
+            directions = ('Inbound', 'Outbound') if all_directions else tuple(
+                direction for direction in ('Inbound', 'Outbound')
+                if direction_set(direction) <= direction_set(r.get('direction', 'Both')))
+            ports = str(r['port']).split(',') if r['port'] is not None else ['Any']
+            for path in paths or ['']:
+                program_suffix = ('_exe_' + hashlib.sha1(normalize_path(path).encode('utf-8')).hexdigest()[:16]
+                                  if len(paths) > 1 else '')
+                rules.extend([{'name': f"{GLOBAL_PORT_PREFIX}{r['scope']}_{r['port']}{suffix}{program_suffix}_{number}_{direction}",
+                 'action': r['action'], 'direction': direction, 'path': path, 'is_port': True,
                  'protocol': protocol, 'addresses': list(r.get('addresses') or ['Any']),
-                 'local_ports': [str(r['port'])] if r['scope'] == 'local' and r['port'] else ['Any'],
-                 'remote_ports': [str(r['port'])] if r['scope'] == 'remote' and r['port'] else ['Any']}
+                 'local_ports': ports if r['scope'] == 'local' else ['Any'],
+                 'remote_ports': ports if r['scope'] == 'remote' else ['Any']}
                 for protocol, number in (('TCP', 6), ('UDP', 17))
                 if r.get('protocol', 'TCP/UDP') in {'TCP/UDP', protocol} for direction in directions])
         return rules
+
+    def _legacy_port_rule_names(self, ports, records):
+        """Recognize native names written before action/direction were identity fields."""
+        expected = {(r['name'], r['action'], r['direction'])
+                    for r in self._port_firewall_rules(ports, legacy_names=True)}
+        return {r['name'] for r in records
+                if (r['name'], r.get('action'), direction_name(r.get('direction'))) in expected}
 
     def matching_global_port_rules(self, row):
         if str(row.get('protocol', '')).upper() not in {'TCP', 'UDP', '6', '17'}:
             return {}
         with self.lock:
             return {key: dict(rule) for key, rule in getattr(self, 'global_ports', {}).items()
-                    if (rule['port'] is None or str(row.get('lport' if rule['scope'] == 'local' else 'dport')) == str(rule['port']))
+                    if (rule['port'] is None or str(row.get('lport' if rule['scope'] == 'local' else 'dport')) in str(rule['port']).split(','))
+                    and (not rule_executables(rule) or normalize_path(row.get('exe', '')) in executable_identity(rule))
                     and rule.get('protocol', 'TCP/UDP') in {'TCP/UDP', {'6': 'TCP', '17': 'UDP'}.get(str(row.get('protocol')), str(row.get('protocol', '')).upper())}
                     and (row.get('direction') is None or
                          direction_set(row['direction']) <= direction_set(rule.get('direction', 'Both')))
@@ -304,7 +408,8 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                         {rule['target']: rule}, row.get('dst_ip', ''), row.get('domain', ''), row.get('direction')))}
 
     def global_port_action(self, row):
-        actions = [rule['action'] for rule in self.matching_global_port_rules(row).values()]
+        actions = [rule['action'] for key, rule in self.matching_global_port_rules(row).items()
+                   if self._policy_verified('port', key)]
         return 'Block' if 'Block' in actions else 'Allow' if 'Allow' in actions else None
 
     def apply_global_port_rules(self, entries):
@@ -447,7 +552,8 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     side = 'in' if direction_name(record['direction']) == 'Inbound' else 'out'
                     self.run_netsh(['add', 'rule', f'name={name}', f'dir={side}',
                                     'action=' + record['action'].lower(),
-                                    'remoteip=' + ','.join(addresses), 'enable=yes'])
+                                    'remoteip=' + ','.join(addresses),
+                                    'enable=yes' if record.get('enabled', True) else 'enable=no'])
                     created.append(name)
                     continue
                 if not path:
@@ -458,6 +564,11 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     rule_name = name if name.endswith(f"_{suffixes[side]}") else f"{name}_{suffixes[side]}"
                     self._add_app_firewall_rule(rule_name, path, side, action)
                     created.append(rule_name)
+                    if record.get('enabled', True) is False:
+                        self.run_ps('$r=Get-NetFirewallRule -DisplayName ' + self._ps_quote(rule_name)
+                                    + " -ErrorAction Stop; $r | Set-NetFirewallRule -Enabled False -ErrorAction Stop; "
+                                    + 'if (@(Get-NetFirewallRule -DisplayName ' + self._ps_quote(rule_name)
+                                    + " -ErrorAction Stop | Where-Object { [string]$_.Enabled -ne 'False' }).Count) { throw 'Disabled rule restoration failed' }")
         except Exception:
             if created:
                 try:
@@ -570,6 +681,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                         return False, 'Application is closing.'
                 if os.path.exists(FIREWALL_PROFILE_BACKUP_FILE):
                     self._restore_firewall_profile_state_locked()
+                self._require_valid_policy_settings()
                 self._backup_firewall_profile_state()
                 with self.lock:
                     self.firewall_profile_modified = True
@@ -587,6 +699,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
                     raise
                 with self.lock:
                     self.firewall_initialized = True
+                    self.firewall_ready = True
             return True, ''
         except Exception as exc:
             log_internal_error('initialize_or_restore_firewall', exc)
@@ -634,6 +747,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         with self.lock:
             self.firewall_profile_modified = False
             self.firewall_initialized = False
+            self.firewall_ready = False
         return True
 
     def restore_saved_rules_locked(self):
@@ -651,7 +765,9 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             wanted = direction_set(rule['direction'])
             actual = set()
             for record in records:
-                if record['normalized_path'] == norm and not record['is_hold'] and record['action'].casefold() == 'block':
+                if (record['normalized_path'] == norm and not record['is_hold'] and record['action'].casefold() == 'block'
+                        and self._native_record_matches(record, dict(record, path=path, action='Block',
+                            protocol='Any', addresses=['Any'], local_ports=['Any'], remote_ports=['Any']))):
                     d = record['direction'].casefold()
                     if 'in' in d:
                         actual.add('in')
@@ -677,20 +793,20 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def get_rule_status(self, exe_path):
         norm = normalize_path(exe_path)
         with self.lock:
-            if norm in self.allowed_apps:
-                return 'allowed'
-            data = self.blocked_paths.get(norm, {})
+            data = getattr(self, 'verified_blocked_paths', self.blocked_paths).get(norm, {})
             if data.get('in') and data.get('out'):
                 return 'blocked_both'
             if data.get('in'):
                 return 'blocked_in'
             if data.get('out'):
                 return 'blocked_out'
+            if norm in self.allowed_apps:
+                return 'allowed'
             return ''
 
     def get_rule_status_display(self, exe_path):
         status = self.get_rule_status(exe_path)
-        return {'allowed': 'Allowed', 'blocked_both': 'Blocked', 'blocked_in': 'Blocked (In)', 'blocked_out': 'Blocked'}.get(status, '—')
+        return {'allowed': 'Allowed', 'blocked_both': 'Blocked', 'blocked_in': 'Blocked (in)', 'blocked_out': 'Blocked'}.get(status, '—')
 
     def _global_match(self, collection, remote_ip, domain, direction=None):
         try:
@@ -710,15 +826,17 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
 
     def is_globally_blocked(self, remote_ip, domain='', direction=None):
         with self.lock:
-            return self._global_match(self.global_blocks, remote_ip, domain, direction)
+            return self._global_match({k: v for k, v in self.global_blocks.items()
+                                       if self._policy_verified('block', k)}, remote_ip, domain, direction)
 
     def is_globally_allowed(self, remote_ip, domain='', direction=None):
         with self.lock:
-            return self._global_match(self.global_allows, remote_ip, domain, direction)
+            return self._global_match({k: v for k, v in self.global_allows.items()
+                                       if self._policy_verified('allow', k)}, remote_ip, domain, direction)
 
     def connection_has_rule(self, exe_path, remote_ip, domain, direction, local_port=None, remote_port=None, protocol='TCP'):
         if self.global_port_action({'lport': local_port, 'dport': remote_port, 'protocol': protocol,
-                                    'dst_ip': remote_ip, 'domain': domain, 'direction': direction}):
+                                    'dst_ip': remote_ip, 'domain': domain, 'direction': direction, 'exe': exe_path}):
             return True
         if self.is_globally_blocked(remote_ip, domain, direction) or self.is_globally_allowed(remote_ip, domain, direction):
             return True
@@ -736,7 +854,37 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
         return bool(self.get_rule_status(exe_path))
 
     def rules_changed(self):
-        self.refresh_rules(force=True)
+        if threading.get_ident() != getattr(self, 'ui_thread_id', threading.main_thread().ident):
+            self.ui_queue.put(('rules_changed',))
+        else:
+            self.refresh_rules(force=True)
+
+    def _require_valid_policy_settings(self):
+        if getattr(self, 'settings_load_error', None):
+            raise RuntimeError(self.settings_load_error + '\nSaved policy is preserved; rule changes are disabled for this run.')
+
+    def _invalidate_rule_snapshot_locked(self):
+        """Caller holds firewall_lock then lock after a native commit."""
+        self.rules_generation = getattr(self, 'rules_generation', 0) + 1
+        if getattr(self, 'rules_refresh_worker_running', False):
+            self.rules_refresh_pending = True
+
+    def _record_app_commit_locked(self, norm, decision_guard=None):
+        if not hasattr(self, 'app_policy_versions'):
+            self.app_policy_versions = {}
+        self.app_policy_versions[norm] = self.app_policy_versions.get(norm, 0) + 1
+        if hasattr(self, 'verified_blocked_paths'):
+            self.verified_blocked_paths.pop(norm, None)
+            if norm in self.blocked_paths:
+                self.verified_blocked_paths[norm] = dict(self.blocked_paths[norm])
+        if hasattr(self, 'rule_enforcement'):
+            self.rule_enforcement[('app', norm)] = 'Verified'
+        if hasattr(self, 'observed_app_paths'):
+            self.observed_app_paths.discard(norm)
+            if norm in self.blocked_paths:
+                self.observed_app_paths.add(norm)
+        if decision_guard is not None and hasattr(decision_guard, 'committed'):
+            decision_guard.committed(self.app_policy_versions[norm])
 
     def _rule_is_duplicate(self, target, allow=False, direction='both', global_target=False):
         """Use the managed-rule cache; never launch a firewall command to check."""
@@ -744,13 +892,17 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
             if global_target:
                 target = normalize_target(target)
                 collection = self.global_allows if allow else self.global_blocks
-                return target in collection and direction_set(collection[target].get('direction', 'Both')) == direction_set(direction)
+                return (self._policy_verified('allow' if allow else 'block', target) and target in collection
+                        and direction_set(collection[target].get('direction', 'Both')) == direction_set(direction))
             norm = normalize_path(target)
             if allow:
-                return norm in self.allowed_apps and norm not in self.blocked_paths
+                return (norm in self.allowed_apps and norm not in self.blocked_paths
+                        and norm not in getattr(self, 'observed_app_paths', set())
+                        and norm not in getattr(self, 'verified_blocked_paths', {}))
             data = self.blocked_paths.get(norm, {})
             actual = {side for side in ('in', 'out') if data.get(side)}
-            return norm not in self.allowed_apps and actual == direction_set(direction)
+            return (self._policy_verified('app', norm) and norm not in self.allowed_apps
+                    and actual == direction_set(direction))
 
     def _warn_duplicate_rule(self, target, quiet=False):
         text = f'The requested rule already exists and was skipped:\n{target}'
@@ -759,7 +911,20 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
     def _persist_rule_changes(self):
         if self.save_settings() is False:
             detail = getattr(self, 'settings_save_error', None) or 'Could not write the saved configuration.'
+            self.settings_save_error = detail
             raise RuntimeError(f'Firewall changes were applied, but could not be saved for the next launch.\n{detail}')
+
+    def _duplicate_rule_result(self, target, quiet=False):
+        self._warn_duplicate_rule(target, quiet)
+        if getattr(self, 'settings_save_error', None):
+            try:
+                self._persist_rule_changes()
+            except Exception as exc:
+                self.queue_alert('High', target, '', '', str(exc))
+                if not quiet:
+                    self._native_message('showerror', 'Save Failed', str(exc), parent=self.root)
+                return False
+        return True
 
     # Bulk rule creation and commit
 
@@ -790,12 +955,14 @@ function Get-AddressKey([string]$address) {
     $ip.ToString() + '/' + $prefix
 }
 foreach ($rule in $rules) {
+    $enabled = if ($rule.enabled -eq $false) { 'False' } else { 'True' }
     $params = @{
         Name=[string]$rule.name; DisplayName=[string]$rule.name
         Direction=[string]$rule.direction; Action=[string]$rule.action
-        Enabled='True'; Profile='Any'; ErrorAction='Stop'
+        Enabled=$enabled; Profile='Any'; ErrorAction='Stop'
     }
     if ($rule.is_port) {
+        if ($rule.path) { $params.Program=[string]$rule.path }
         $params.Protocol=[string]$rule.protocol
         $params.LocalPort=[string[]]$rule.local_ports
         $params.RemotePort=[string[]]$rule.remote_ports
@@ -806,8 +973,9 @@ foreach ($rule in $rules) {
     New-NetFirewallRule @params | Out-Null
 }
 foreach ($rule in $rules) {
+    $enabled = if ($rule.enabled -eq $false) { 'False' } else { 'True' }
     $r = Get-NetFirewallRule -Name $rule.name -ErrorAction Stop
-    if (@($r).Count -ne 1 -or [string]$r.Enabled -ne 'True' -or
+    if (@($r).Count -ne 1 -or [string]$r.Enabled -ne $enabled -or
         [string]$r.Action -ne $rule.action -or [string]$r.Direction -ne $rule.direction) {
         throw ('Firewall rule verification failed: ' + $rule.name)
     }
@@ -830,7 +998,9 @@ foreach ($rule in $rules) {
         if ($rule.addresses) { $expectedAddresses = @($rule.addresses) }
         $expectedKeys = @($expectedAddresses | ForEach-Object { if ($_ -eq 'Any') { 'Any' } else { Get-AddressKey $_ } } | Sort-Object -Unique)
         $actualKeys = @($address.RemoteAddress | ForEach-Object { if ($_ -eq 'Any') { 'Any' } else { Get-AddressKey $_ } } | Sort-Object -Unique)
-        if ([string]$program.Program -ne 'Any' -or
+        $expectedProgram = 'Any'
+        if ($rule.path) { $expectedProgram = [string]$rule.path }
+        if (-not [string]::Equals([string]$program.Program, $expectedProgram, [System.StringComparison]::OrdinalIgnoreCase) -or
             (Compare-Object $expectedKeys $actualKeys) -or
             (Compare-Object @('Any') @($address.LocalAddress))) {
             throw ('Wrong application or address filter for port rule: ' + $rule.name)
@@ -856,7 +1026,11 @@ foreach ($rule in $rules) {
 
     def _commit_rule_batch(self, requests, records=None, port_updates=None, observed_addresses=None, replace_rule=None):
         """Caller holds firewall_lock; publish caches only after the transaction."""
+        self._require_valid_policy_settings()
         ports = self._parse_port_rules(port_updates or [])
+        with self.lock:
+            existing_ports = {key: dict(rule) for key, rule in getattr(self, 'global_ports', {}).items()
+                              if key in ports}
         for key, rule in ports.items():
             if rule.get('target'):
                 with self.lock:
@@ -920,7 +1094,7 @@ foreach ($rule in $rules) {
                                         'action': 'Block', 'path': target})
         port_rules = self._port_firewall_rules(ports)
         planned.extend(port_rules)
-        # Direction changes must also delete the old outbound rules.
+        # Names include the policy direction, so this cannot touch sibling policies.
         global_names.update(rule['name'] for rule in self._port_firewall_rules(ports, all_directions=True))
         if replace_rule:
             kind, key = replace_rule
@@ -928,12 +1102,14 @@ foreach ($rule in $rules) {
                 with self.lock:
                     old = getattr(self, 'global_ports', {}).get(key)
                 if old:
+                    existing_ports[key] = old
                     global_names.update(r['name'] for r in self._port_firewall_rules({key: old}, all_directions=True))
             else:
                 global_names.update(self._global_rule_names(key, kind == 'allow'))
         if records is None:
             records = self.get_firewall_rules()
-        previous = [r for r in records if r.get('normalized_path') in apps or r['name'] in global_names
+        global_names.update(self._legacy_port_rule_names(existing_ports, records))
+        previous = [r for r in records if (not r.get('is_global') and r.get('normalized_path') in apps) or r['name'] in global_names
                     or (globals_ and r.get('is_hold'))]
         # Keep temporary blocks in place until all replacement rules verify.
         self._replace_rule_records(previous, [r['name'] for r in planned],
@@ -943,8 +1119,14 @@ foreach ($rule in $rules) {
                 kind, key = replace_rule
                 store = self.global_ports if kind == 'port' else self.global_allows if kind == 'allow' else self.global_blocks
                 store.pop(key, None)
+                getattr(self, 'rule_enforcement', {}).pop((kind, key), None)
+                if kind == 'port' and key not in ports:
+                    self.global_port_traffic.pop(key, None)
             if ports:
                 self.global_ports.update(ports)
+                if hasattr(self, 'rule_enforcement'):
+                    for key in ports:
+                        self.rule_enforcement['port', key] = 'Verified'
             for norm, (path, allow, wanted) in apps.items():
                 if allow:
                     self.allowed_apps.add(norm)
@@ -952,6 +1134,7 @@ foreach ($rule in $rules) {
                 else:
                     self.allowed_apps.discard(norm)
                     self.blocked_paths[norm] = {'path': path, 'in': 'in' in wanted, 'out': 'out' in wanted}
+                self._record_app_commit_locked(norm)
             self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] not in apps}
             self.upload_alerted = {k for k in self.upload_alerted if k[0] not in apps or not apps[k[0]][1]}
             for target, (allow, addresses, direction) in globals_.items():
@@ -959,16 +1142,24 @@ foreach ($rule in $rules) {
                 other = self.global_blocks if allow else self.global_allows
                 destination[target] = {'addresses': addresses, 'direction': direction_name(direction)}
                 other.pop(target, None)
+                if hasattr(self, 'rule_enforcement'):
+                    self.rule_enforcement['allow' if allow else 'block', target] = 'Verified'
+                    self.rule_enforcement.pop(('block' if allow else 'allow', target), None)
+            self._invalidate_rule_snapshot_locked()
         return apps, bool(globals_)
 
     def _apply_rule_batch(self, requests, quiet=False, port_updates=None, observed_addresses=None, replace_rule=None, report=False):
         """Apply a whole selection/import with one snapshot, save and refresh."""
+        if self._native_ui_call():
+            snapshot = copy.deepcopy((list(requests), quiet, port_updates, observed_addresses, replace_rule, report))
+            queued = self._queue_native_job('Rule update', lambda: self._apply_rule_batch(*snapshot))
+            return None if queued else False
         try:
             ports = self._parse_port_rules(port_updates or [])
         except ValueError as exc:
             self.queue_alert('High', 'Global port rule', '', '', str(exc))
             if not quiet:
-                messagebox.showerror('Global Port Rule', str(exc), parent=self.root)
+                self._native_message('showerror', 'Global Port Rule', str(exc), parent=self.root)
             return False
         selected = {}
         skipped_global, skipped_app = [], []
@@ -1003,9 +1194,11 @@ foreach ($rule in $rules) {
                 with self.lock:
                     for key, rule in ports.items():
                         existing = getattr(self, 'global_ports', {}).get(key, {})
-                        same_policy = {k: v for k, v in existing.items() if k != 'addresses'} == {
-                            k: v for k, v in rule.items() if k != 'addresses'}
-                        if not replace_rule and same_policy and set(rule.get('addresses', ())) <= set(existing.get('addresses', ())):
+                        ignored = {'addresses', 'exe', 'exes'}
+                        same_policy = ({k: v for k, v in existing.items() if k not in ignored} ==
+                                       {k: v for k, v in rule.items() if k not in ignored} and
+                                       executable_identity(existing) == executable_identity(rule))
+                        if not replace_rule and self._policy_verified('port', key) and same_policy and set(rule.get('addresses', ())) <= set(existing.get('addresses', ())):
                             duplicates.append(key)
                         else:
                             port_pending.append(rule)
@@ -1040,7 +1233,7 @@ foreach ($rule in $rules) {
             log_internal_error('rule_batch', exc)
             self.queue_alert('High', 'Bulk rules', '', '', f'Firewall rule update failed: {details}')
             if not quiet:
-                messagebox.showerror('Rule Update Failed', details)
+                self._native_message('showerror', 'Rule Update Failed', details)
             return False
         return True
 
@@ -1055,36 +1248,47 @@ foreach ($rule in $rules) {
         if quiet:
             self.queue_alert('Info', 'Skipped rules', '', '', text)
         else:
-            messagebox.showwarning('Some Rules Were Skipped', text)
+            self._native_message('showwarning', 'Some Rules Were Skipped', text)
 
     # Single-rule actions and removal
 
-    def block_executable(self, exe_path, proc_name=None, direction='both', refresh=True, quiet=False, update_ui=True):
+    def block_executable(self, exe_path, proc_name=None, direction='both', refresh=True, quiet=False, update_ui=True, decision_guard=None):
+        if self._native_ui_call():
+            self._queue_native_job('Block application', lambda: self.block_executable(
+                exe_path, proc_name, direction, refresh, quiet, update_ui, decision_guard))
+            return None
         path = display_path(exe_path)
         norm = normalize_path(path)
         if not norm:
             return False
         proc_name = proc_name or os.path.splitext(os.path.basename(path))[0] or 'Process'
         if self._rule_is_duplicate(path, direction=direction):
-            self._warn_duplicate_rule(path, quiet)
-            return True
+            return self._duplicate_rule_result(path, quiet)
         try:
             with self.firewall_lock:
+                self._require_valid_policy_settings()
                 if self._rule_is_duplicate(path, direction=direction):
-                    self._warn_duplicate_rule(path, quiet)
-                    return True  # The requested state is already satisfied.
+                    return self._duplicate_rule_result(path, quiet)
                 records = self.get_firewall_rules()
-                previous = [r for r in records if r['normalized_path'] == norm]
+                previous = [r for r in records if r['normalized_path'] == norm and not r.get('is_global')]
                 base = self.app_rule_base(proc_name, path, 'Block')
                 replacing_hold = bool(previous) and all(r.get('is_hold') for r in previous)
+                def create():
+                    if decision_guard is not None and not decision_guard():
+                        raise RuntimeError('Auto-Block decision was cancelled.')
+                    self.add_app_rules(proc_name, path, direction, kind='Block')
+                def commit():
+                    with self.lock:
+                        if decision_guard is not None and not decision_guard():
+                            raise RuntimeError('Auto-Block decision was cancelled.')
+                        wanted = direction_set(direction)
+                        self.allowed_apps.discard(norm)
+                        self.blocked_paths[norm] = {'in': 'in' in wanted, 'out': 'out' in wanted, 'path': path}
+                        self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
+                        self._invalidate_rule_snapshot_locked()
+                        self._record_app_commit_locked(norm, decision_guard)
                 self._replace_rule_records(previous, (base + '_In', base + '_Out'),
-                                           lambda: self.add_app_rules(proc_name, path, direction, kind='Block'),
-                                           apply_first=replacing_hold)
-                with self.lock:
-                    wanted = direction_set(direction)
-                    self.allowed_apps.discard(norm)
-                    self.blocked_paths[norm] = {'in': 'in' in wanted, 'out': 'out' in wanted, 'path': path}
-                    self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
+                                           create, apply_first=replacing_hold, commit=commit)
             if update_ui:
                 self._cancel_app_prompt(norm)
             if refresh and update_ui:
@@ -1094,30 +1298,38 @@ foreach ($rule in $rules) {
         except Exception as exc:
             self.queue_alert('High', path, '', '', f'Firewall rule update failed: {exc}')
             if not quiet:
-                messagebox.showerror('Block Failed', f'{proc_name}\n\n{exc}')
+                self._native_message('showerror', 'Block Failed', f'{proc_name}\n\n{exc}')
             return False
 
-    def allow_executable(self, exe_path, refresh=True, quiet=False, update_ui=True):
+    def allow_executable(self, exe_path, refresh=True, quiet=False, update_ui=True, decision_guard=None):
+        if self._native_ui_call():
+            self._queue_native_job('Allow application', lambda: self.allow_executable(
+                exe_path, refresh, quiet, update_ui, decision_guard))
+            return None
         path = display_path(exe_path)
         norm = normalize_path(path)
         if not norm:
             return False
         if self._rule_is_duplicate(path, allow=True):
-            self._warn_duplicate_rule(path, quiet)
-            return True
+            return self._duplicate_rule_result(path, quiet)
         try:
             with self.firewall_lock:
+                self._require_valid_policy_settings()
                 if self._rule_is_duplicate(path, allow=True):
-                    self._warn_duplicate_rule(path, quiet)
-                    return True
+                    return self._duplicate_rule_result(path, quiet)
                 records = self.get_firewall_rules()
-                previous = [r for r in records if r['normalized_path'] == norm]
-                self._replace_rule_records(previous, (), lambda: None)
-                with self.lock:
-                    self.allowed_apps.add(norm)
-                    self.blocked_paths.pop(norm, None)
-                    self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
-                    self.upload_alerted = {k for k in self.upload_alerted if k[0] != norm}
+                previous = [r for r in records if r['normalized_path'] == norm and not r.get('is_global')]
+                def commit():
+                    with self.lock:
+                        if decision_guard is not None and not decision_guard():
+                            raise RuntimeError('Auto-Block decision was cancelled.')
+                        self.allowed_apps.add(norm)
+                        self.blocked_paths.pop(norm, None)
+                        self.connection_rates = {k: v for k, v in self.connection_rates.items() if k[0] != norm}
+                        self.upload_alerted = {k for k in self.upload_alerted if k[0] != norm}
+                        self._invalidate_rule_snapshot_locked()
+                        self._record_app_commit_locked(norm, decision_guard)
+                self._replace_rule_records(previous, (), lambda: None, commit=commit)
             if update_ui:
                 self._cancel_app_prompt(norm)
             if refresh and update_ui:
@@ -1127,27 +1339,32 @@ foreach ($rule in $rules) {
         except Exception as exc:
             self.queue_alert('High', path, '', '', f'Firewall rule update failed: {exc}')
             if not quiet:
-                messagebox.showerror('Allow Failed', f'{path}\n\n{exc}')
+                self._native_message('showerror', 'Allow Failed', f'{path}\n\n{exc}')
             return False
 
     def add_global_rule(self, target, allow, refresh=True, quiet=False, direction='both'):
+        if self._native_ui_call():
+            self._queue_native_job('Global rule', lambda: self.add_global_rule(target, allow, refresh, quiet, direction))
+            return None
         target = normalize_target(target)
         if not target:
             return False
         if self._rule_is_duplicate(target, allow, direction, global_target=True):
-            self._warn_duplicate_rule(target, quiet)
-            return True
+            return self._duplicate_rule_result(target, quiet)
         try:
             with self.firewall_lock:
+                self._require_valid_policy_settings()
                 if self._rule_is_duplicate(target, allow, direction, global_target=True):
-                    self._warn_duplicate_rule(target, quiet)
-                    return True
+                    return self._duplicate_rule_result(target, quiet)
                 target, addresses = self.add_global_rule_sync(target, allow, direction)
                 with self.lock:
                     destination = self.global_allows if allow else self.global_blocks
                     other = self.global_blocks if allow else self.global_allows
                     destination[target] = {'addresses': addresses, 'direction': direction_name(direction)}
                     other.pop(target, None)
+                    if hasattr(self, 'rule_enforcement'):
+                        self.rule_enforcement['allow' if allow else 'block', target] = 'Verified'
+                    self._invalidate_rule_snapshot_locked()
             try:
                 self.release_auto_holds()
             except Exception as exc:
@@ -1161,7 +1378,7 @@ foreach ($rule in $rules) {
             log_internal_error(f'global_rule {"allow" if allow else "block"} {target}', exc)
             self.queue_alert('High', 'Global rule', '', target, f'Firewall rule update failed: {details}')
             if not quiet:
-                messagebox.showerror('Global Rule Failed', f"{('Allow' if allow else 'Block')} {target}\n\n{details}")
+                self._native_message('showerror', 'Global Rule Failed', f"{('Allow' if allow else 'Block')} {target}\n\n{details}")
             return False
 
     def remove_rule(self, status, path, refresh=True):
@@ -1169,7 +1386,7 @@ foreach ($rule in $rules) {
 
     def _managed_rule_category(self, status, path):
         status = str(status).casefold()
-        if status == 'blocked (in) (global)':
+        if status.endswith('(global)'):
             with self.lock:
                 return 'port' if str(path) in getattr(self, 'global_ports', {}) else 'global'
         if status in {'global port block', 'global port allow', 'allowed (global)', 'blocked (global)'}:
@@ -1179,6 +1396,10 @@ foreach ($rule in $rules) {
         return 'app'
 
     def _remove_rule_batch(self, requests, refresh=True):
+        if self._native_ui_call():
+            snapshot = tuple(requests)
+            self._queue_native_job('Remove rules', lambda: self._remove_rule_batch(snapshot, refresh))
+            return None
         apps, globals_, ports = set(), set(), set()
         for status, path in requests:
             status = str(status).casefold()
@@ -1188,7 +1409,7 @@ foreach ($rule in $rules) {
             elif category == 'global':
                 target = normalize_target(str(path).split(' (', 1)[0])
                 if target:
-                    globals_.add((target, status == 'global allow'))
+                    globals_.add((target, 'allow' in status))
             else:
                 norm = normalize_path(path)
                 if norm:
@@ -1197,22 +1418,29 @@ foreach ($rule in $rules) {
             return False
         try:
             with self.firewall_lock:
+                self._require_valid_policy_settings()
                 records = self.get_firewall_rules()
                 names = {name for target, allow in globals_
                          for name in self._global_rule_names(target, allow)}
                 with self.lock:
                     selected_ports = {key: rule for key, rule in getattr(self, 'global_ports', {}).items() if key in ports}
                 names.update(rule['name'] for rule in self._port_firewall_rules(selected_ports, all_directions=True))
-                previous = [r for r in records if r.get('normalized_path') in apps or r['name'] in names]
+                names.update(self._legacy_port_rule_names(selected_ports, records))
+                previous = [r for r in records if (not r.get('is_global') and r.get('normalized_path') in apps) or r['name'] in names]
                 self._replace_rule_records(previous, (), lambda: None)
                 with self.lock:
                     for key in ports:
                         self.global_ports.pop(key, None)
+                        self.global_port_traffic.pop(key, None)
+                        getattr(self, 'rule_enforcement', {}).pop(('port', key), None)
                     for target, allow in globals_:
                         (self.global_allows if allow else self.global_blocks).pop(target, None)
+                        getattr(self, 'rule_enforcement', {}).pop(('allow' if allow else 'block', target), None)
                     for norm in apps:
                         self.allowed_apps.discard(norm)
                         self.blocked_paths.pop(norm, None)
+                        self._record_app_commit_locked(norm)
+                    self._invalidate_rule_snapshot_locked()
                 for norm in apps:
                     self._cancel_app_prompt(norm)
             if refresh:
@@ -1220,19 +1448,137 @@ foreach ($rule in $rules) {
             self._persist_rule_changes()
             return True
         except Exception as exc:
-            messagebox.showerror('Remove Rule Failed', str(exc))
+            self._native_message('showerror', 'Remove Rule Failed', str(exc))
             return False
 
     # Cache reconciliation
+
+    def _policy_verified(self, kind, key):
+        states = getattr(self, 'rule_enforcement', None)
+        return states is None or states.get((kind, key)) == 'Verified'
+
+    @staticmethod
+    def _native_record_matches(record, expected):
+        def values(raw, addresses=False):
+            raw = [raw] if isinstance(raw, (str, int)) else raw or ['Any']
+            parts = [str(part).strip() for value in raw for part in str(value).split(',')]
+            if addresses:
+                try:
+                    networks = [network for part in parts for network in address_networks(part)]
+                    return tuple(sorted(str(n) for version in (4, 6) for n in ipaddress.collapse_addresses(
+                        n for n in networks if n.version == version)))
+                except ValueError:
+                    pass
+            return tuple(sorted(p.casefold() for p in parts))
+        def protocol(value):
+            return {'6': 'tcp', '17': 'udp', '256': 'any', '': 'any'}.get(str(value).casefold(), str(value).casefold())
+        program = record.get('program', record.get('path', ''))
+        program = '' if str(program).casefold() in {'any', ''} else normalize_path(program)
+        return (record.get('enabled', True) is True
+                and str(record.get('action', '')).casefold() == expected['action'].casefold()
+                and direction_name(record.get('direction')) == direction_name(expected['direction'])
+                and program == (normalize_path(expected.get('path')) or '')
+                and protocol(record.get('protocol', 'Any')) == protocol(expected.get('protocol', 'Any'))
+                and values(record.get('addresses'), True) == values(expected.get('addresses'), True)
+                and str(record.get('profile', 'Any')).casefold() in {'any', '0'}
+                and values(record.get('local_addresses'), True) == values(['Any'], True)
+                and values(record.get('local_ports')) == values(expected.get('local_ports'))
+                and values(record.get('remote_ports')) == values(expected.get('remote_ports')))
+
+    def _enforcement_for(self, expected, records):
+        by_name = {}
+        for record in records:
+            by_name.setdefault(record['name'], []).append(record)
+        matches = [by_name.get(rule['name'], []) for rule in expected]
+        if not any(matches):
+            return 'Missing'
+        if any(len(group) != 1 for group in matches):
+            return 'Partial'
+        if any(not group[0].get('enabled', True) for group in matches):
+            return 'Disabled'
+        return 'Verified' if all(self._native_record_matches(group[0], rule)
+                                 for group, rule in zip(matches, expected)) else 'Changed'
+
+    def _reconcile_native_rules_locked(self, records):
+        """Keep intended policy; publish only a fully checked native observation.
+
+        Caller owns firewall_lock. No native I/O runs while holding the model lock.
+        Drift is repaired by the normal verified edit transactions, never refresh.
+        """
+        with self.lock:
+            blocked = copy.deepcopy(self.blocked_paths)
+            allowed = set(self.allowed_apps)
+            blocks, allows, ports = copy.deepcopy((self.global_blocks, self.global_allows, self.global_ports))
+            states = {}
+            for norm, data in blocked.items():
+                base = self.app_rule_base(None, data.get('path', norm))
+                expected = [{'name': base + ('_In' if side == 'in' else '_Out'),
+                             'path': data.get('path', norm), 'action': 'Block',
+                             'direction': 'Inbound' if side == 'in' else 'Outbound'}
+                            for side in ('in', 'out') if data.get(side)]
+                states['app', norm] = data['_enforcement'] = self._enforcement_for(expected, records)
+            for kind, collection in (('block', blocks), ('allow', allows)):
+                for target, data in collection.items():
+                    expected = []
+                    for side in ('In', 'Out'):
+                        if side.casefold() not in direction_set(data.get('direction', 'Both')):
+                            continue
+                        candidates = [base + '_' + side for base in (
+                            self.global_rule_base(target, kind == 'allow', include_domain=True),
+                            self.global_rule_base(target, kind == 'allow'))]
+                        name = next((name for name in candidates if any(r['name'] == name for r in records)), candidates[0])
+                        expected.append({'name': name, 'path': '', 'action': kind.title(),
+                                         'direction': 'Inbound' if side == 'In' else 'Outbound',
+                                         'addresses': data.get('addresses') or target.split(',')})
+                    states[kind, target] = data['_enforcement'] = self._enforcement_for(expected, records)
+            for key, rule in ports.items():
+                states['port', key] = rule['_enforcement'] = self._enforcement_for(
+                    self._port_firewall_rules({key: rule}), records)
+            self.verified_blocked_paths = self._blocked_from_records(records)
+            self.observed_app_paths = {r.get('normalized_path') for r in records
+                                       if not r.get('is_global') and not r.get('is_hold')}
+            # Observed native blocks take precedence over a stored Allow exclusion.
+            observed = {}
+            for record in records:
+                if record.get('is_global') or record.get('is_hold') or str(record.get('action')).casefold() != 'block':
+                    continue
+                norm = record.get('normalized_path')
+                if not norm:
+                    continue
+                data = observed.setdefault(norm, {'path': record['path'], 'in': False, 'out': False, 'records': []})
+                data['records'].append(record)
+                for side in direction_set(record.get('direction')):
+                    data[side] = True
+            for norm, data in observed.items():
+                if norm not in blocked:
+                    members = data.pop('records')
+                    if not any(r.get('enabled', True) for r in members):
+                        state = 'Disabled'
+                    elif not all(r.get('enabled', True) for r in members):
+                        state = 'Partial'
+                    else:
+                        state = 'Observed' if norm in self.verified_blocked_paths else 'Changed'
+                    blocked[norm] = dict(data, _enforcement=state, _native_only=True)
+            self.rule_enforcement = states
+            return blocked, allowed, blocks, allows, ports
+
+    def _invalidate_native_observation(self):
+        with self.lock:
+            self.rule_enforcement = {key: 'Unknown' for key in getattr(self, 'rule_enforcement', {})}
+            self.verified_blocked_paths = {}
 
     @staticmethod
     def _blocked_from_records(records):
         blocked = {}
         for record in records:
-            if record['is_global'] or record['is_hold'] or record['action'].casefold() != 'block':
+            if record['is_global'] or record['is_hold'] or record['action'].casefold() != 'block' or not record.get('enabled', True):
                 continue
             norm = record['normalized_path']
             if not norm:
+                continue
+            if not FirewallMixin._native_record_matches(record, dict(
+                    record, action='Block', addresses=['Any'], protocol='Any',
+                    local_ports=['Any'], remote_ports=['Any'])):
                 continue
             data = blocked.setdefault(norm, {'in': False, 'out': False, 'path': record['path']})
             direction = record['direction'].casefold()
@@ -1243,17 +1589,4 @@ foreach ($rule in $rules) {
     def sync_rule_cache(self):
         with self.firewall_lock:
             records = self.get_firewall_rules()
-            blocked = self._blocked_from_records(records)
-            with self.lock:
-                self.allowed_apps.difference_update(blocked)
-                self.blocked_paths = blocked
-                names = {r['name'] for r in records}
-                for allow, collection in ((False, self.global_blocks), (True, self.global_allows)):
-                    for target in list(collection):
-                        matching = self._global_rule_names(target, allow) & names
-                        if not matching:
-                            collection.pop(target, None)
-                        else:
-                            sides = {name.rsplit('_', 1)[-1] for name in matching}
-                            collection[target]['direction'] = ('Both' if len(sides) == 2 else
-                                                               'Inbound' if 'In' in sides else 'Outbound')
+            return self._reconcile_native_rules_locked(records)

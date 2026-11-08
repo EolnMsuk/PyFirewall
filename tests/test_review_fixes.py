@@ -4,8 +4,8 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
-from support import patch_dependencies
-from test_firewall_monitor import App, NS, app
+from support import App, NS, patch_dependencies
+from fixtures import app
 
 
 class ProcessGlobalRuleTests(unittest.TestCase):

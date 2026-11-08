@@ -7,8 +7,8 @@ import tempfile
 import types
 import unittest
 from unittest.mock import Mock, patch
-from support import patch_dependencies
-from test_firewall_monitor import App, NS, app
+from support import App, NS, patch_dependencies
+from fixtures import app
 
 
 class ColumnAndDialogTests(unittest.TestCase):
@@ -75,7 +75,7 @@ class ColumnAndDialogTests(unittest.TestCase):
             with patch.object(NS['filedialog'], 'asksaveasfilename', return_value=str(path)), patch.object(NS['messagebox'], 'showinfo'):
                 a.export_rules()
             saved = json.loads(path.read_text())
-            self.assertEqual(saved['version'], 6)
+            self.assertEqual(saved['version'], 7)
             self.assertEqual(saved['global_port_rules'], [])
 
     def test_rule_batch_stays_bounded_to_requested_directions(self):
@@ -262,7 +262,7 @@ class TkHeaderTests(unittest.TestCase):
                     a.load_settings()
                     self.assertTrue(a.check_updates_on_startup_var.get())
                     self.assertEqual(a.hidden_columns['monitor'], ['PID'])
-                    self.assertEqual(a.global_ports, {'remote:443': {'scope': 'remote', 'port': 443, 'action': 'Allow'}})
+                    self.assertEqual(a.global_ports, {'remote:443:Allow:Both': {'scope': 'remote', 'port': 443, 'action': 'Allow'}})
                     self.assertTrue(a.save_settings())
                     self.assertEqual(json.loads(config.read_text())['global_port_rules'], legacy['global_port_rules'])
                     a.get_firewall_rules = Mock(return_value=[])

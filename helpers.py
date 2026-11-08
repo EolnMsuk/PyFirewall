@@ -47,6 +47,44 @@ def display_path(path):
     return os.path.normpath(str(path).replace('/', '\\')) if path else ''
 
 
+def rule_executables(rule, validate=True):
+    """Read legacy/saved program filters without parsing display-name CSVs."""
+    if 'exes' in rule:
+        values = rule['exes']
+        if not isinstance(values, (list, tuple)):
+            raise ValueError('Global rule executables must be an array of paths.')
+    else:
+        value = rule.get('exe', '')
+        if value is None or value == '':
+            return []
+        values = [value]
+    paths, seen = [], set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError('Select an absolute executable (.exe) path, or leave it blank for all processes.')
+        path = display_path(value.strip())
+        # A rooted path without a drive is not a fully qualified Windows path.
+        drive, tail = os.path.splitdrive(path)
+        if validate and (not drive or not tail.startswith('\\') or not path.lower().endswith('.exe')):
+            raise ValueError('Select an absolute executable (.exe) path, or leave it blank for all processes.')
+        key = normalize_path(path)
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+    return paths
+
+
+def executable_fields(paths):
+    """Keep singleton exports compatible; an empty selection is unrestricted."""
+    if len(paths) == 1:
+        return {'exe': paths[0]}
+    return {'exes': list(paths)} if paths else {}
+
+
+def executable_identity(rule):
+    return tuple(sorted(normalize_path(path) for path in rule_executables(rule)))
+
+
 def normalize_target(target):
     value = str(target or '').strip()
     if ',' in value:
@@ -127,6 +165,17 @@ def is_global_target(target):
 
 def mb(value):
     return f'{value / (1024 * 1024):.2f} MB'
+
+
+def normalize_ports(value):
+    """Keep single-port compatibility; store multiple ports as a canonical CSV."""
+    if value is None or isinstance(value, str) and not value.strip():
+        return None
+    parts = [part.strip() for part in str(value).split(',')]
+    if any(not part.isdecimal() or not 1 <= int(part) <= 65535 for part in parts):
+        raise ValueError('Port numbers must be integers from 1 to 65535, separated by commas.')
+    ports = sorted({int(part) for part in parts})
+    return ports[0] if len(ports) == 1 else ','.join(map(str, ports))
 
 
 def direction_name(value):

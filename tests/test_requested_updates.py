@@ -9,8 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from support import App, NS, patch_dependencies
-from test_firewall_monitor import app
-from test_native_port_rules import MemoryFirewall, connection
+from fixtures import MemoryFirewall, app, connection
 import test_ui_preferences as preferences
 
 

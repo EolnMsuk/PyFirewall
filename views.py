@@ -1,6 +1,7 @@
 """Connection, rule and alert views, context actions and import/export."""
 
 import csv
+import copy
 import ctypes
 import ipaddress
 import json
@@ -18,12 +19,18 @@ from helpers import (
     direction_name,
     direction_set,
     display_path,
+    executable_fields,
+    executable_identity,
     is_global_target,
     is_ip,
     log_internal_error,
     mb,
     normalize_path,
+    normalize_ports,
     normalize_target,
+    normalize_address,
+    global_targets,
+    rule_executables,
 )
 from widgets import add_tooltip
 
@@ -34,17 +41,28 @@ class ViewsMixin:
 
     def refresh_rules(self, force=False):
         with self.lock:
-            if not self.firewall_initialized:
+            if self.closed or not getattr(self, 'firewall_ready', False):
                 return
             self.rules_generation += 1
             self.rules_refresh_pending = True
+            self.rules_loading = True
             if self.rules_refresh_worker_running:
                 return
-            self.rules_loading = True
             self.rules_refresh_worker_running = True
         self.rules_tree.delete(*self.rules_tree.get_children())
         self.rules_tree.insert('', tk.END, iid='__loading__', values=('Loading', 'Reading Windows Firewall...', '', '', '', ''), tags=('even',))
-        threading.Thread(target=self._refresh_rules_worker, daemon=True, name='RuleRefresh').start()
+        try:
+            if hasattr(self, 'native_jobs'):
+                if not self._queue_native_job('Refresh rules', self._refresh_rules_worker):
+                    raise RuntimeError('Native work queue is busy. Retry Refresh.')
+            else:
+                threading.Thread(target=self._refresh_rules_worker, daemon=True, name='RuleRefresh').start()
+        except Exception as exc:
+            with self.lock:
+                self.rules_refresh_worker_running = self.rules_refresh_pending = self.rules_loading = False
+                generation = self.rules_generation
+            log_internal_error('rule_refresh_start', exc)
+            self.ui_queue.put(('rules_error', generation, str(exc)))
 
     def _refresh_rules_worker(self):
         while True:
@@ -62,11 +80,12 @@ class ViewsMixin:
                 with self.firewall_lock:
                     records = self.get_firewall_rules()
                     with self.lock:
-                        allowed = set(self.allowed_apps)
-                        blocks = {k: dict(v) for k, v in self.global_blocks.items()}
-                        allows = {k: dict(v) for k, v in self.global_allows.items()}
-                self.ui_queue.put(('rules', generation, self._blocked_from_records(records), allowed, blocks, allows))
+                        if self.closed:
+                            continue
+                    blocked, allowed, blocks, allows, ports = self._reconcile_native_rules_locked(records)
+                self.ui_queue.put(('rules', generation, blocked, allowed, blocks, allows, ports))
             except Exception as exc:
+                self._invalidate_native_observation()
                 self.ui_queue.put(('rules_error', generation, str(exc)))
             with self.lock:
                 if self.closed:
@@ -78,51 +97,79 @@ class ViewsMixin:
                 self.rules_refresh_worker_running = False
                 return
 
-    def _make_rule_rows(self, blocked, allowed, blocks, allows):
+    @staticmethod
+    def _global_rule_description(rule):
+        target = rule.get('target') or 'All domains/IPs'
+        addresses = rule.get('addresses', ())
+        if rule.get('target') and not is_ip(target) and addresses:
+            target = f"{target} ({', '.join(addresses)})"
+        ports = str(rule['port']).replace(',', ', ') if rule['port'] is not None else 'All'
+        remote = ports if rule['scope'] == 'remote' else 'All'
+        local = ports if rule['scope'] == 'local' else 'All'
+        names = ', '.join(os.path.basename(path) for path in rule_executables(rule))
+        process = names + ' | ' if names else ''
+        return (f"{process}{target} | Remote ports: {remote} | Local ports: {local}"
+                f" | Protocol: {rule.get('protocol', 'TCP/UDP')}")
+
+    def _make_rule_rows(self, blocked, allowed, blocks, allows, ports=None):
         rows = []
         allowed_normalized = {normalize_path(path) for path in allowed}
         for path in sorted(allowed):
             rows.append({'iid': f'app:allow:{path}', 'status': 'Allowed', 'rule': os.path.basename(path) or path, 'action': 'Allow', 'direction': 'Both', 'path': path, 'normalized_path': path, 'remote_port': 'All', 'local_port': 'All', 'protocol': 'TCP/UDP', 'download': 0, 'upload': 0})
         for path, data in sorted(blocked.items()):
-            if path in allowed_normalized:
-                continue
             direction = self._direction_from_flags(data)
-            rows.append({'iid': f'app:block:{path}', 'status': 'Blocked' if direction != 'Inbound' else 'Blocked (In)', 'rule': os.path.basename(data['path']) or data['path'], 'action': 'Block', 'direction': direction, 'path': data['path'], 'normalized_path': path, 'remote_port': 'All', 'local_port': 'All', 'protocol': 'TCP/UDP', 'download': 0, 'upload': 0})
+            rows.append({'iid': f'app:block:{path}', 'status': 'Blocked' if direction != 'Inbound' else 'Blocked (in)', 'rule': os.path.basename(data['path']) or data['path'], 'action': 'Block', 'direction': direction, 'path': data['path'], 'normalized_path': path, 'remote_port': 'All', 'local_port': 'All', 'protocol': 'TCP/UDP', 'download': 0, 'upload': 0})
         for kind, collection in (('block', blocks), ('allow', allows)):
             global_text = 'Block' if kind == 'block' else 'Allow'
             for target, data in sorted(collection.items()):
                 addresses = tuple(data.get('addresses', ()))
-                rows.append({'iid': f'global:{kind}:{target}', 'status': 'Blocked (in) (Global)' if kind == 'block' and direction_name(data.get('direction', 'Both')) == 'Inbound' else f'Global {global_text}', 'rule': target, 'action': global_text, 'direction': data.get('direction', 'Both'), 'path': target if not addresses else f"{target} ({', '.join(addresses)})", 'normalized_path': target, 'addresses': addresses, 'global_type': kind, 'remote_port': 'All', 'local_port': 'All', 'protocol': 'TCP/UDP', 'download': 0, 'upload': 0})
-        with self.lock:
-            for key, rule in sorted(getattr(self, 'global_ports', {}).items()):
-                target = rule.get('target', '')
-                addresses = tuple(rule.get('addresses', ()))
-                target_label = (f"{target} ({', '.join(addresses)})"
-                                if target and not is_ip(target) and addresses else target)
-                if not target_label:
-                    target_label = f"{rule['scope'].title()} Port {rule['port'] or 'All'} ({rule.get('protocol', 'TCP/UDP')})"
-                rows.append({'iid': f'port:{key}',
-                             'status': 'Blocked (in) (Global)' if rule['action'] == 'Block' and direction_name(rule.get('direction', 'Both')) == 'Inbound' else f"{rule['action']}ed (Global)",
-                             'rule': target_label,
-                             'remote_port': rule['port'] if rule['scope'] == 'remote' and rule['port'] else 'All',
-                             'local_port': rule['port'] if rule['scope'] == 'local' and rule['port'] else 'All',
-                             'protocol': rule.get('protocol', 'TCP/UDP'),
-                             'action': rule['action'], 'direction': rule.get('direction', 'Both'),
-                             'path': key, 'normalized_path': key,
-                             'display_path': key.replace(':None:', ':All:', 1),
-                             'global_type': rule['action'].lower(), 'is_port': True, 'download': 0, 'upload': 0})
+                description = self._global_rule_description(dict(data, target=target, port=None,
+                                                                 scope='remote', protocol='Any'))
+                rows.append({'iid': f'global:{kind}:{target}', 'status': self._global_status(global_text, data.get('direction', 'Both')), 'rule': description, 'action': global_text, 'direction': data.get('direction', 'Both'), 'path': target if not addresses else f"{target} ({', '.join(addresses)})", 'normalized_path': target, 'display_path': description, 'addresses': addresses, 'global_type': kind, 'remote_port': 'All', 'local_port': 'All', 'protocol': 'Any', 'download': 0, 'upload': 0})
+        if ports is None:
+            with self.lock:
+                ports = copy.deepcopy(getattr(self, 'global_ports', {}))
+        for key, rule in sorted(ports.items()):
+            description = self._global_rule_description(rule)
+            paths = rule_executables(rule)
+            program_display = (paths[0] if len(paths) == 1 else
+                               ', '.join(os.path.basename(path) for path in paths) if paths else description)
+            rows.append({'iid': f'port:{key}',
+                         'status': self._global_status(rule['action'], rule.get('direction', 'Both')),
+                         'rule': description,
+                         'remote_port': rule['port'] if rule['scope'] == 'remote' and rule['port'] else 'All',
+                         'local_port': rule['port'] if rule['scope'] == 'local' and rule['port'] else 'All',
+                         'protocol': rule.get('protocol', 'TCP/UDP'),
+                         'action': rule['action'], 'direction': rule.get('direction', 'Both'),
+                         'path': key, 'normalized_path': key,
+                         'display_path': program_display, 'executable_paths': paths,
+                         'global_type': rule['action'].lower(), 'is_port': True, 'download': 0, 'upload': 0})
+        for row in rows:
+            key = row['normalized_path']
+            if row.get('is_port'):
+                state = ports[key].get('_enforcement', 'Verified')
+            elif row.get('global_type'):
+                state = (blocks if row['global_type'] == 'block' else allows)[key].get('_enforcement', 'Verified')
+            elif row['action'] == 'Allow':
+                state = 'Verified'  # A stored application exclusion has no native Allow rule.
+            else:
+                state = blocked.get(key, {}).get('_enforcement', 'Verified')
+            row['enforcement'] = state
+            if state not in {'Verified', 'Observed'}:
+                origin = 'observed' if blocked.get(key, {}).get('_native_only') else 'intended'
+                row['status'] = f"{row['action']} {origin} ({state.lower()})"
         return rows
 
-    def _finish_rule_refresh(self, generation, blocked, allowed, blocks, allows):
+    def _finish_rule_refresh(self, generation, blocked, allowed, blocks, allows, ports=None):
         if generation != self.rules_generation or self.closed:
             return
+        rows = self._make_rule_rows(blocked, allowed, blocks, allows, ports)
         with self.lock:
-            self.blocked_paths = {path: {'in': data['in'], 'out': data['out'], 'path': data['path']} for path, data in blocked.items() if path not in self.allowed_apps}
-        rows = self._make_rule_rows(blocked, allowed, blocks, allows)
-        with self.lock:
+            if generation != self.rules_generation or self.closed:
+                return
             self._update_rule_traffic_locked(rows)
-        self.rule_rows = rows
-        self.rules_loading = False
+            self.rule_rows = rows
+            self.rules_loading = False
         self.render_rules()
         self.render_monitor()
 
@@ -227,8 +274,6 @@ class ViewsMixin:
     @staticmethod
     def _validate_global_rule_fields(target, port, scope):
         target, port = target.strip(), port.strip()
-        if not target and not port:
-            raise ValueError('At least one value (domain / IP or port number) needs to be set to create the rule.')
         targets = []
         if target:
             for value in target.split(','):
@@ -239,9 +284,50 @@ class ViewsMixin:
                     raise ValueError(f'Enter a valid domain or IP address: {value}')
                 if value not in targets:
                     targets.append(value)
-        if port and (not port.isdecimal() or not 1 <= int(port) <= 65535):
-            raise ValueError('Port numbers must be integers from 1 to 65535.')
-        return ', '.join(targets), int(port) if port else None, scope.lower()
+        return ', '.join(targets), normalize_ports(port), scope.lower()
+
+    def _global_editor_conflict(self, fields, replace_rule=None):
+        target, port, scope, protocol, action = fields[:5]
+        selected = fields[5] if len(fields) > 5 else ''
+        programs = {'exes': selected} if isinstance(selected, (list, tuple)) else {'exe': selected}
+        targets = [normalize_target(value) for value in target.split(',') if value.strip()]
+        targets = [value for value in targets if is_global_target(value)]
+        candidate = next(iter(self._parse_port_rules([dict(
+            target=', '.join(targets), port=port, scope=scope, protocol=protocol,
+            **programs, action=action.split()[0], direction='Inbound' if action.endswith('Incoming') else
+            'Outbound' if action.endswith('Outgoing') else 'Both')]).values()))
+
+        def filters(rule):
+            return (frozenset(normalize_target(v) for v in rule.get('target', '').split(',') if v),
+                    rule.get('port'), rule.get('scope') if rule.get('port') is not None else None,
+                    executable_identity(rule))
+
+        with self.lock:
+            policies = list(getattr(self, 'global_ports', {}).items())
+        for key, existing in policies:
+            if replace_rule == ('port', key) or filters(candidate) != filters(existing):
+                continue
+            wanted_protocol = candidate.get('protocol', 'TCP/UDP')
+            existing_protocol = existing.get('protocol', 'TCP/UDP')
+            if not set(wanted_protocol.split('/')) & set(existing_protocol.split('/')):
+                continue
+            wanted = direction_set(candidate.get('direction', 'Both'))
+            present = direction_set(existing.get('direction', 'Both'))
+            if not wanted & present:
+                continue
+            if wanted_protocol != existing_protocol:
+                return (f'Overlapping protocol: {wanted_protocol} and {existing_protocol} cover '
+                        'some of the same traffic. A matching rule already applies '
+                        f"{existing['action']} in direction {existing.get('direction', 'Both')}. "
+                        'Choose protocols or directions that do not overlap.')
+            if wanted != present:
+                return ('Conflicting direction: a matching rule already applies to '
+                        f"{existing.get('direction', 'Both')}. Both overlaps Incoming and Outgoing.")
+            if candidate['action'] == existing['action']:
+                return 'This global rule already exists with the same filters, action, and direction.'
+            return ('Conflicting rule: a matching rule already has the opposite action '
+                    f"({existing['action']}) for the same direction.")
+        return None
 
     def _ask_global_rule_fields(self, initial=None):
         initial = initial or {}
@@ -258,35 +344,75 @@ class ViewsMixin:
         fields.pack(fill=tk.BOTH, expand=True)
         text_options = {} if self.dark_mode else {'foreground': '#222222'}
         ttk.Label(fields, text='Action:', **text_options).grid(row=0, column=0, sticky='w')
-        action = ttk.Combobox(fields, values=('Allow', 'Block', 'Block Incoming'), state='readonly', width=30)
+        action = ttk.Combobox(fields, values=('Allow', 'Allow Outgoing', 'Allow Incoming', 'Block Incoming', 'Block Outgoing', 'Block'), state='readonly', width=30)
         action.set(initial.get('action', 'Allow'))
         action.grid(row=0, column=1, sticky='ew', pady=(0, 12))
-        ttk.Label(fields, text='Domains or IP addresses:', **text_options).grid(row=1, column=0, sticky='w', padx=(0, 12))
+        ttk.Label(fields, text='Executable (optional):', **text_options).grid(row=1, column=0, sticky='w', padx=(0, 12))
+        exe_frame = ttk.Frame(fields)
+        exe_frame.grid(row=1, column=1, sticky='ew', pady=4)
+        # Keep invalid legacy/prefilled paths visible until Save validates them.
+        selected_paths = rule_executables(initial, validate=False)
+        exe_names = tk.StringVar(master=dialog, value=', '.join(os.path.basename(path) for path in selected_paths))
+        exe = ttk.Entry(exe_frame, width=30, state='readonly', textvariable=exe_names, **text_options)
+        exe.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def display_executables():
+            exe_names.set(', '.join(os.path.basename(path) for path in selected_paths))
+
+        def browse_executable():
+            path = filedialog.askopenfilename(parent=dialog, title='Select Executable',
+                                             filetypes=[('Executable Files', '*.exe')])
+            if path:
+                if normalize_path(path) not in {normalize_path(item) for item in selected_paths}:
+                    selected_paths.append(display_path(path))
+                    display_executables()
+
+        def clear_executables():
+            selected_paths.clear()
+            display_executables()
+
+        ttk.Button(exe_frame, text='Browse', command=browse_executable).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(exe_frame, text='Clear', command=clear_executables).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(fields, text='Domains or IP addresses:', **text_options).grid(row=2, column=0, sticky='w', padx=(0, 12))
         target = ttk.Entry(fields, width=36, **text_options)
         target.insert(0, initial.get('target', ''))
-        target.grid(row=1, column=1, sticky='ew', pady=4)
-        ttk.Label(fields, text='Port Number:', **text_options).grid(row=2, column=0, sticky='w')
+        target.grid(row=2, column=1, sticky='ew', pady=4)
+        ttk.Label(fields, text='Port Numbers:', **text_options).grid(row=3, column=0, sticky='w')
         port_frame = ttk.Frame(fields)
-        port_frame.grid(row=2, column=1, sticky='ew', pady=4)
-        port = ttk.Entry(port_frame, width=8, **text_options)
+        port_frame.grid(row=3, column=1, sticky='ew', pady=4)
+        port = ttk.Entry(port_frame, width=18, **text_options)
         port.insert(0, str(initial.get('port') or ''))
         port.pack(side=tk.LEFT)
         ttk.Label(port_frame, text='(1-65535)', **text_options).pack(side=tk.LEFT, padx=6)
         scope = ttk.Combobox(port_frame, values=('Remote', 'Local'), state='readonly', width=10)
         scope.set(initial.get('scope', 'remote').title())
         scope.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-        ttk.Label(fields, text='Protocol:', **text_options).grid(row=3, column=0, sticky='w')
+        ttk.Label(fields, text='Protocol:', **text_options).grid(row=4, column=0, sticky='w')
         protocol = ttk.Combobox(fields, values=('TCP/UDP', 'TCP', 'UDP'), state='readonly', width=30)
         protocol.set(initial.get('protocol', 'TCP/UDP'))
-        protocol.grid(row=3, column=1, sticky='ew', pady=4)
-        ttk.Label(fields, text='Separate targets with commas; use start-end for IP ranges.', **text_options).grid(row=4, column=0, columnspan=2, sticky='w', pady=8)
+        protocol.grid(row=4, column=1, sticky='ew', pady=4)
+        ttk.Label(fields, text='Separate targets and ports with commas; use start-end for IP ranges.\nBrowse adds another executable; names are shown and full paths are retained.\nClear executables to apply to all processes.\nLeave targets blank for all domains/IPs; leave ports blank for all ports.', **text_options).grid(row=5, column=0, columnspan=2, sticky='w', pady=8)
 
         def submit():
+            try:
+                paths = rule_executables({'exes': selected_paths})
+            except ValueError as exc:
+                messagebox.showwarning(dialog.title(), str(exc), parent=dialog)
+                dialog.focus_set()
+                return
             try:
                 # Validate shared fields now; individual targets are processed independently.
                 raw_target = target.get().strip()
                 _, number, side = self._validate_global_rule_fields('192.0.2.1' if raw_target else '', port.get(), scope.get())
-                result[0] = (raw_target, number, side, protocol.get(), action.get())
+                proposed = (raw_target, number, side, protocol.get(), action.get())
+                if paths:
+                    proposed += (paths[0] if len(paths) == 1 else paths,)
+                conflict = self._global_editor_conflict(proposed, initial.get('_replace_rule'))
+                if conflict:
+                    messagebox.showwarning('Global Rule Not Saved', conflict +
+                                           '\n\nChange the rule settings or cancel this editor.', parent=dialog)
+                    return
+                result[0] = proposed
             except ValueError as exc:
                 if not messagebox.askokcancel('Add Global Rule', str(exc), icon='warning', parent=dialog):
                     dialog.destroy()
@@ -294,7 +420,7 @@ class ViewsMixin:
             dialog.destroy()
 
         buttons = ttk.Frame(fields)
-        buttons.grid(row=5, column=1, pady=(12, 0))
+        buttons.grid(row=6, column=1, pady=(12, 0))
         ttk.Button(buttons, text='Save', command=submit).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text='Cancel', command=dialog.destroy).pack(side=tk.LEFT, padx=4)
         dialog.bind('<Return>', lambda _: submit())
@@ -306,10 +432,22 @@ class ViewsMixin:
         return result[0]
 
     def add_global_rule_dialog(self, initial=None, replace_rule=None):
+        if replace_rule:
+            initial = dict(initial or {}, _replace_rule=replace_rule)
         fields = self._ask_global_rule_fields(initial)
         if fields is None:
             return
-        target, port, scope, protocol, action = fields
+        if self._native_ui_call():
+            snapshot = copy.deepcopy((fields, initial, replace_rule))
+            self._queue_native_job('Global rule update', lambda: self._apply_global_rule_fields(*snapshot))
+            return
+        return self._apply_global_rule_fields(fields, initial, replace_rule)
+
+    def _apply_global_rule_fields(self, fields, initial=None, replace_rule=None):
+        target, port, scope, protocol, action = fields[:5]
+        selected = fields[5] if len(fields) > 5 else ''
+        programs = executable_fields(rule_executables(
+            {'exes': selected} if isinstance(selected, (list, tuple)) else {'exe': selected}))
         entries, failures = [], []
         targets = dict.fromkeys(normalize_target(value) for value in target.split(',')) if target else ['']
         for value in targets:
@@ -326,9 +464,12 @@ class ViewsMixin:
                     if not addresses:
                         raise ValueError('No addresses found.')
                 entry = {'target': name, 'port': port, 'scope': scope, 'protocol': protocol,
-                         'action': 'Allow' if action == 'Allow' else 'Block', 'addresses': addresses}
-                if action == 'Block Incoming':
+                         'action': 'Allow' if action.startswith('Allow') else 'Block', 'addresses': addresses}
+                entry.update(programs)
+                if action.endswith('Incoming'):
                     entry['direction'] = 'Inbound'
+                elif action.endswith('Outgoing'):
+                    entry['direction'] = 'Outbound'
                 entries.append(entry)
             except Exception as exc:
                 failures.append(f'{value.strip() or "(empty target)"}: {exc}')
@@ -346,7 +487,7 @@ class ViewsMixin:
                 summary = 'The valid targets could not all be applied and saved. See the error details.'
             if replace_rule and not entries:
                 summary += ' The existing rule was kept.'
-            messagebox.showwarning('Global Rule Update', summary + '\n\nTargets not added:\n' + '\n'.join(failures), parent=self.root)
+            self._native_message('showwarning', 'Global Rule Update', summary + '\n\nTargets not added:\n' + '\n'.join(failures), parent=self.root)
 
     def bulk_remote_ports(self, tree, allow):
         ports = set()
@@ -432,8 +573,18 @@ class ViewsMixin:
 
     def sort_monitor_rows(self, rows, state):
         column, reverse = state
-        fields = {'#': lambda r: r['number'], 'Process Name': lambda r: r['name'].casefold(), 'Status': lambda r: self.connection_status(r).casefold(), 'PID': lambda r: r['pid'], 'Direction': lambda r: r['direction'].casefold(), 'Protocol': lambda r: r['protocol'].casefold(), 'Local Port': lambda r: r['lport'], 'Remote IP': lambda r: r['dst_ip'].casefold(), 'Remote Host': lambda r: r.get('remote_host', r.get('domain', '')).casefold(), 'Remote Port': lambda r: r['dport'], 'Download (MB)': lambda r: r.get('_down', 0), 'Upload (MB)': lambda r: r.get('_up', 0), 'Signal': lambda r: r.get('signal', '').casefold(), 'Exe Path': lambda r: r['exe'].casefold()}
+        fields = {'#': lambda r: r['number'], 'Process Name': lambda r: r['name'].casefold(), 'Status': lambda r: self.connection_status(r).casefold(), 'PID': lambda r: r['pid'], 'Direction': lambda r: r['direction'].casefold(), 'Protocol': lambda r: r['protocol'].casefold(), 'Local Port': lambda r: r['lport'], 'Remote IP': lambda r: self._ip_sort_key(r['dst_ip']), 'Remote Host': lambda r: r.get('remote_host', r.get('domain', '')).casefold(), 'Remote Port': lambda r: r['dport'], 'Download (MB)': lambda r: r.get('_down', 0), 'Upload (MB)': lambda r: r.get('_up', 0), 'Signal': lambda r: r.get('signal', '').casefold(), 'Exe Path': lambda r: r['exe'].casefold()}
         rows.sort(key=fields.get(column, lambda r: ''), reverse=reverse)
+
+    @staticmethod
+    def _ip_sort_key(value):
+        text = str(value or '').strip()
+        try:
+            address = ipaddress.ip_address(text.strip('[]').split('%', 1)[0])
+            return address.version, int(address), text.casefold()
+        except ValueError:
+            # Keep empty/unavailable addresses sortable alongside IPv4 and IPv6.
+            return 0, 0, text.casefold()
 
     def _render_connections(self, tree, search_var, sort_state):
         if not isinstance(tree, ttk.Treeview):
@@ -466,43 +617,57 @@ class ViewsMixin:
                   'Upload (MB)': mb(row.get('_up', 0)), 'Signal': row.get('signal') or '—', 'Exe Path': row['exe']}
         return tuple(values[c] for c in self.MONITOR_COLUMNS if include_status or c != 'Status')
 
+    @staticmethod
+    def _global_tag(action, direction='Both'):
+        suffix = {'Inbound': '_in', 'Outbound': '_out'}.get(direction_name(direction), '')
+        return 'global_' + action.lower() + suffix
+
+    @staticmethod
+    def _global_status(action, direction='Both'):
+        suffix = {'Inbound': ' (in)', 'Outbound': ' (out)'}.get(direction_name(direction), '')
+        return f'{action.title()}ed{suffix} (Global)'
+
     def connection_status(self, row):
         tag = self.connection_tag(row)
         with self.lock:
             if normalize_path(row.get('exe', '')) in self.auto_prompt_keys:
                 return 'Blocked (Pending)'
-        return {'global_allow': 'Allowed (Global)', 'global_block': 'Blocked (Global)',
-                'global_block_in': 'Blocked (in) (Global)'}.get(tag, self.get_rule_status_display(row.get('exe', '')))
+        if tag.startswith('global_'):
+            _, action, *side = tag.split('_')
+            return self._global_status(action, side[0] if side else 'Both')
+        if tag in {'blocked', 'blocked_in', 'allowed'}:
+            return self.get_rule_status_display(row.get('exe', ''))
+        if any(not self._policy_verified(kind, key) for kind, key, _ in self.connection_global_rules(row)):
+            return 'Policy drift'
+        if normalize_path(row.get('exe')) in self.blocked_paths:
+            return 'Block intended (unverified)'
+        return '\u2014'
 
     def connection_tag(self, row, index=0):
-        # Application blocks keep their process-level color, including pending
-        # Auto-Block holds. A global allow never overrides a Windows block.
+        # Matching blocks win over allows; a global block wins a block tie.
         with self.lock:
             if normalize_path(row.get('exe', '')) in self.auto_prompt_keys:
                 return 'blocked'
         status = self.get_rule_status(row.get('exe', ''))
-        if status == 'blocked_in':
-            return 'blocked_in'
-        if status in {'blocked_both', 'blocked_out'}:
-            return 'blocked'
-        remote = row.get('dst_ip', '')
-        domain = row.get('domain', '')
-        port_rules = self.matching_global_port_rules(row).values()
-        port_blocks = [rule for rule in port_rules if rule['action'] == 'Block']
-        if any(rule.get('direction', 'Both') == 'Both' for rule in port_blocks):
-            return 'global_block'
-        if self.is_globally_blocked(remote, domain, row.get('direction')):
-            return self.global_block_tag(remote, domain, row.get('direction'))
-        if port_blocks:
-            return 'global_block_in'
-        if any(rule['action'] == 'Allow' for rule in port_rules) or self.is_globally_allowed(remote, domain, row.get('direction')):
-            return 'global_allow'
+        rules = [data for kind, key, data in self.connection_global_rules(row)
+                 if self._policy_verified(kind, key)]
+        for action in ('Block', 'Allow'):
+            if action == 'Allow':
+                if status == 'blocked_in' and direction_name(row.get('direction')) != 'Outbound':
+                    return 'blocked_in'
+                if status == 'blocked_both' or (status == 'blocked_out' and direction_name(row.get('direction')) != 'Inbound'):
+                    return 'blocked'
+            matching = [rule for rule in rules if rule['action'] == action]
+            if matching:
+                rule = next((rule for rule in matching if direction_name(rule.get('direction')) == 'Both'), matching[0])
+                return self._global_tag(action, rule.get('direction', 'Both'))
         if status == 'allowed':
             return 'allowed'
         return 'watch' if row.get('signal') else 'even' if index % 2 == 0 else 'odd'
 
-    def alert_tag(self, values):
-        row, remote_ip = self.alert_context(values)
+    def alert_tag(self, values, iid=None):
+        row = self.alert_connection_row(values, iid) if iid else self.alert_context(values)[0]
+        remote_ip = row.get('dst_ip', '') if row else self.alert_context(values)[1]
         if row:
             tag = self.connection_tag(row)
             return '' if tag in {'even', 'odd', 'watch'} else tag
@@ -514,9 +679,12 @@ class ViewsMixin:
 
     def global_block_tag(self, remote, domain='', direction=None):
         with self.lock:
-            both = {target: data for target, data in self.global_blocks.items()
-                    if direction_name(data.get('direction', 'Both')) == 'Both'}
-            return 'global_block' if self._global_match(both, remote, domain, direction) else 'global_block_in'
+            for side in ('Both', 'Inbound', 'Outbound'):
+                rules = {target: data for target, data in self.global_blocks.items()
+                         if direction_name(data.get('direction', 'Both')) == side}
+                if self._global_match(rules, remote, domain, direction):
+                    return self._global_tag('Block', side)
+        return 'global_block'
 
     def render_rules(self):
         if not hasattr(self, 'rules_tree'):
@@ -524,7 +692,7 @@ class ViewsMixin:
         search = self.rule_search_var.get().casefold().strip()
         rows = list(self.rule_rows)
         if search:
-            rows = [row for row in rows if search in ' '.join(map(str, (row['status'], row['rule'], row['action'], row['direction'], row.get('display_path', row['path']), row.get('remote_port', ''), row.get('local_port', ''), row.get('protocol', ''), mb(row.get('download', 0)), mb(row.get('upload', 0))))).casefold()]
+            rows = [row for row in rows if search in ' '.join(map(str, (row['status'], row['rule'], row['action'], row['direction'], row.get('display_path', row['path']), row.get('remote_port', ''), row.get('local_port', ''), row.get('protocol', ''), ' '.join(row.get('executable_paths', ())), mb(row.get('download', 0)), mb(row.get('upload', 0))))).casefold()]
         column, reverse = self.rule_sort
         if column:
             fields = {'Status': lambda r: r['status'].casefold(), 'Application & Global Rules': lambda r: r['rule'].casefold(), 'Direction': lambda r: r['direction'].casefold(), 'Download (MB)': lambda r: r.get('download', 0), 'Upload (MB)': lambda r: r.get('upload', 0), 'Program Path': lambda r: r.get('display_path', r['path']).casefold()}
@@ -535,7 +703,7 @@ class ViewsMixin:
         selected = set(self.rules_tree.selection())
         self.rules_tree.delete(*self.rules_tree.get_children())
         for row in rows:
-            tag = 'global_allow' if row.get('global_type') == 'allow' else ('global_block_in' if row['direction'] == 'Inbound' else 'global_block') if row.get('global_type') == 'block' else 'allowed' if row['status'] == 'Allowed' else 'blocked_in' if row['status'] == 'Blocked (In)' else 'blocked'
+            tag = self._global_tag(row['action'], row['direction']) if row.get('global_type') else 'allowed' if row['status'] == 'Allowed' else 'blocked_in' if row['status'] == 'Blocked (in)' else 'blocked'
             down = mb(row.get('download', 0))
             up = mb(row.get('upload', 0))
             self.rules_tree.insert('', tk.END, iid=row['iid'], values=(row['status'], row['rule'], row['direction'], row.get('remote_port') or 'All', row.get('local_port') or 'All', row.get('protocol', ''), down, up, row.get('display_path', row['path'])), tags=(tag,))
@@ -563,7 +731,7 @@ class ViewsMixin:
             values = (time.strftime('%H:%M:%S', time.localtime(ts)), severity, process, pid, remote, host or '—', reason)
             if search and search not in ' '.join(map(str, values)).casefold():
                 continue
-            rendered.append((alert_id, values, self.alert_tag(values)))
+            rendered.append((alert_id, values, self.alert_tag(values, f'alert_{alert_id}')))
         self.alerts_tree.delete(*self.alerts_tree.get_children())
         for alert_id, values, tag in rendered:
             self.alerts_tree.insert('', tk.END, iid=f'alert_{alert_id}', values=values, tags=(tag,) if tag else ())
@@ -580,7 +748,11 @@ class ViewsMixin:
 
     def queue_alert(self, severity, process, pid, remote, reason, connection=None):
         alert = (time.time(), severity, process, pid, remote, '', reason)
-        self.alert_queue.put((*alert, dict(connection)) if connection else alert)
+        with self.lock:
+            try:
+                self.alert_queue.put_nowait((*alert, copy.deepcopy(connection)) if connection else alert)
+            except queue.Full:
+                self.dropped_alerts = getattr(self, 'dropped_alerts', 0) + 1
 
     def drain_alerts(self):
         changed = False
@@ -603,8 +775,14 @@ class ViewsMixin:
             self.render_alerts()
 
     def clear_alerts(self):
-        self.alerts.clear()
-        self.alert_connections = {}
+        with self.lock:
+            self.alerts.clear()
+            self.alert_connections = {}
+            while True:
+                try:
+                    self.alert_queue.get_nowait()
+                except queue.Empty:
+                    break
         if hasattr(self, 'alerts_tree'):
             self.alerts_tree.delete(*self.alerts_tree.get_children())
 
@@ -626,24 +804,23 @@ class ViewsMixin:
         if tag.startswith('global_'):
             for rule in self.connection_global_rules(row):
                 data = rule[2]
-                rule_tag = ('global_allow' if data['action'] == 'Allow' else
-                            'global_block_in' if direction_name(data.get('direction', 'Both')) == 'Inbound' else 'global_block')
+                rule_tag = self._global_tag(data['action'], data.get('direction', 'Both'))
                 if rule_tag == tag:
                     return rule
-        if self.application_has_rule(row.get('exe', '')) or tag == 'blocked':
+        if tag in {'allowed', 'blocked', 'blocked_in'}:
             return ('app', row.get('exe', ''), {'status': self.get_rule_status(row.get('exe', ''))})
         return None
 
     def edit_global_rule(self, rule, action=None):
         kind, key, data = rule
         initial = dict(data, editing=True)
-        initial['action'] = action or ('Allow' if data['action'] == 'Allow' else
-                                      'Block Incoming' if direction_name(data.get('direction', 'Both')) == 'Inbound' else 'Block')
+        initial['action'] = action or self._global_action_label(data['action'] == 'Allow', data.get('direction', 'Both'))
         self.add_global_rule_dialog(initial, (kind, key))
 
     @staticmethod
     def _global_action_label(allow, direction='both'):
-        return 'Allow' if allow else 'Block Incoming' if direction_name(direction) == 'Inbound' else 'Block'
+        suffix = {'Inbound': ' Incoming', 'Outbound': ' Outgoing'}.get(direction_name(direction), '')
+        return ('Allow' if allow else 'Block') + suffix
 
     def _connection_global_draft(self, row, action, scope='remote'):
         # The display may combine a passive DNS name with a reverse-DNS name.
@@ -658,7 +835,7 @@ class ViewsMixin:
         protocol = str(row.get('protocol', '')).upper()
         return {'target': target if is_global_target(target) else '', 'port': port,
                 'scope': scope, 'protocol': protocol if protocol in {'TCP', 'UDP'} else 'TCP/UDP',
-                'action': action, 'addresses': [remote] if is_ip(remote) else []}
+                'action': action, 'exe': row.get('exe', ''), 'addresses': [remote] if is_ip(remote) else []}
 
     def prompt_connection_globals(self, rows, allow=None, direction='both'):
         """Review connection assignments or explicitly edit the saved policy."""
@@ -668,14 +845,23 @@ class ViewsMixin:
             matches = self.connection_global_rules(row)
             if matches:
                 for kind, key, data in matches:
-                    if action and not any(token in data.get('target', '') for token in (',', '/', '-')):
-                        data = dict(data, **self._connection_global_draft(row, action, data.get('scope', 'remote')))
+                    if action:
+                        paths = rule_executables(data)
+                        if not any(token in data.get('target', '') for token in (',', '/', '-')):
+                            data = dict(data, **self._connection_global_draft(row, action, data.get('scope', 'remote')))
+                        else:
+                            data = dict(data, exe=row.get('exe', ''))
+                        # A connection edits the whole existing executable scope.
+                        if paths:
+                            data.pop('exe', None)
+                            data.pop('exes', None)
+                            data.update(executable_fields(paths))
                     existing.setdefault((kind, key), (kind, key, data))
             elif action:
                 draft = self._connection_global_draft(row, action)
-                if not draft['target'] and draft['port'] is None:
+                if not draft['target'] and draft['port'] is None and not draft['exe']:
                     continue
-                identity = (draft['target'], draft['port'], draft['scope'], draft['protocol'])
+                identity = (draft['target'], draft['port'], draft['scope'], draft['protocol'], normalize_path(draft['exe']))
                 if identity in drafts:
                     draft['addresses'] = sorted(set(drafts[identity]['addresses']) | set(draft['addresses']))
                 drafts[identity] = draft
@@ -784,7 +970,7 @@ class ViewsMixin:
         return self._remove_rule_batch(requests)
 
     def _show_rule_result(self, title, text):
-        messagebox.showinfo(title, text, parent=self.root)
+        self._native_message('showinfo', title, text, parent=self.root)
 
     def selected_rows(self, tree):
         rows = [(iid, tree.item(iid, 'values')) for iid in tree.selection() if tree.item(iid, 'values')]
@@ -797,6 +983,8 @@ class ViewsMixin:
         # Actions use the stable identity; Program Path is only a display label.
         if str(iid).startswith('port:') and values:
             return (*values[:-1], str(iid)[5:])
+        if str(iid).startswith('global:') and values:
+            return (*values[:-1], str(iid).split(':', 2)[2])
         return values
 
     def open_file_location_from_tree(self, tree, iid):
@@ -874,16 +1062,33 @@ class ViewsMixin:
         elif status == 'blocked_in' and direction != 'Outbound':
             tags.add('blocked_in')
         for _, _, rule in self.connection_global_rules(row):
-            tags.add('global_allow' if rule['action'] == 'Allow' else
-                     'global_block_in' if direction_name(rule.get('direction')) == 'Inbound' else 'global_block')
+            tags.add(self._global_tag(rule['action'], rule.get('direction', 'Both')))
         return tags
+
+    def show_empty_rows_menu(self, event, tree):
+        if tree.identify_region(event.x, event.y) not in {'nothing', 'cell', 'tree'}:
+            return
+        menu = self._context_menu()
+        menu.body.configure(bg='#242424')
+        for label, command in (('Add App Rule', self.add_custom_rule),
+                               ('Add Global Rule', self.add_global_rule_dialog)):
+            menu.add_command(label=label, command=command, foreground='#a8a8a8',
+                             background='#242424', activebackground='#3b3b3b')
+        clear_action = (('Clear List', self.clear_list) if tree is getattr(self, 'tree', None) else
+                        ('Clear Alerts', self.clear_alerts) if tree is getattr(self, 'alerts_tree', None) else None)
+        if clear_action:
+            menu.add_separator()
+            menu.add_command(label=clear_action[0], command=clear_action[1],
+                             background='#242424', activebackground='#3b3b3b')
+        menu.post(event.x_root, event.y_root)
+        return 'break'
 
     def show_connection_menu(self, event, tree):
         if self._show_header_menu(event, tree):
             return 'break'
         iid = self._focus_menu_row(tree, event)
         if not iid:
-            return
+            return self.show_empty_rows_menu(event, tree)
         menu = self._context_menu()
         rows = self.selected_connection_data(tree)
         focused = next((row for row in rows if row.get('key') == iid), rows[0] if rows else {})
@@ -895,11 +1100,11 @@ class ViewsMixin:
         has_app = any(self.application_has_rule(row.get('exe', '')) for row in rows)
         has_global = any(self.connection_global_rules(row) for row in rows)
         if has_app:
-            menu.add_command(label='Remove App Rule', command=lambda: self.remove_selected_connection_rules(tree), foreground=self.colors.get('muted', '#a8a8a8'))
+            menu.add_command(label='Remove App Rule', command=lambda: self.remove_selected_connection_rules(tree), foreground=self.colors.get('menu_edit', self.colors.get('muted', '#a8a8a8')))
         menu.add_separator()
         self._global_menu_commands(menu, lambda allow, direction: self.prompt_connection_globals(rows, allow, direction))
         if has_global:
-            menu.add_command(label='Remove Global Rule', command=lambda: self.remove_selected_connection_global_rules(tree), foreground=self.colors.get('muted', '#a8a8a8'))
+            menu.add_command(label='Remove Global Rule', command=lambda: self.remove_selected_connection_global_rules(tree), foreground=self.colors.get('menu_edit', self.colors.get('muted', '#a8a8a8')))
         menu.add_separator()
         menu.add_command(label='Copy IP Domain', command=lambda: self.copy_connection_endpoints(tree))
         menu.add_command(label='Copy details', command=lambda: self.copy_connection_details(tree))
@@ -912,7 +1117,7 @@ class ViewsMixin:
             return 'break'
         iid = self._focus_menu_row(self.rules_tree, event)
         if not iid:
-            return
+            return self.show_empty_rows_menu(event, self.rules_tree)
         values = self._managed_rule_values(iid, self.rules_tree.item(iid, 'values'))
         status = str(values[0]).casefold() if values else ''
         menu = self._context_menu()
@@ -920,7 +1125,7 @@ class ViewsMixin:
         category = self._managed_rule_category(status, values[-1] if values else '')
         global_port = category == 'port'
         global_rule = category != 'app'
-        menu.rule_tag = ('global_allow' if 'allow' in status else 'global_block_in' if direction == 'Inbound' else 'global_block') if global_rule else ('allowed' if 'allow' in status else 'blocked_in' if direction == 'Inbound' else 'blocked')
+        menu.rule_tag = self._global_tag('Allow' if 'allow' in status else 'Block', direction) if global_rule else ('allowed' if 'allow' in status else 'blocked_in' if direction == 'Inbound' else 'blocked')
         if global_port:
             self._global_menu_commands(menu, self.change_selected_ports, assigned=True)
         elif global_rule:
@@ -931,8 +1136,8 @@ class ViewsMixin:
                 self._menu_rule_command(menu, label, command, tag)
         menu.add_separator()
         menu.add_command(label='Edit Global Rule' if global_rule else 'Edit App Rule',
-                         command=lambda: self.edit_selected_managed_rule(iid), foreground=self.colors.get('muted', '#a8a8a8'))
-        menu.add_command(label='Remove Rule', command=self.remove_selected_rule, foreground=self.colors.get('muted', '#a8a8a8'))
+                         command=lambda: self.edit_selected_managed_rule(iid), foreground=self.colors.get('menu_edit', self.colors.get('muted', '#a8a8a8')))
+        menu.add_command(label='Remove Rule', command=self.remove_selected_rule, foreground=self.colors.get('menu_edit', self.colors.get('muted', '#a8a8a8')))
         menu.add_separator()
         menu.add_command(label='Copy IP Domain', command=lambda: self.copy_rule_endpoints(self.rules_tree))
         menu.add_command(label='Copy details', command=lambda: self.copy_rule_details(self.rules_tree))
@@ -946,7 +1151,7 @@ class ViewsMixin:
             return 'break'
         iid = self._focus_menu_row(self.alerts_tree, event)
         if not iid:
-            return
+            return self.show_empty_rows_menu(event, self.alerts_tree)
         menu = self._context_menu()
         values = self.alerts_tree.item(iid, 'values')
         menu.rule_tag = self.connection_tag(self.alert_connection_row(values, iid))
@@ -958,11 +1163,11 @@ class ViewsMixin:
             self._menu_rule_command(menu, label, command, tag)
         has_app = any(self.application_has_rule(row.get('exe', '')) for row in rows)
         if has_app:
-            menu.add_command(label='Remove App Rule', command=self.remove_selected_alert_rules, foreground=self.colors.get('muted', '#a8a8a8'))
+            menu.add_command(label='Remove App Rule', command=self.remove_selected_alert_rules, foreground=self.colors.get('menu_edit', self.colors.get('muted', '#a8a8a8')))
         menu.add_separator()
         self._global_menu_commands(menu, lambda allow, direction: self.prompt_connection_globals(rows, allow, direction))
         if has_global:
-            menu.add_command(label='Remove Global Rule', command=lambda: self.remove_connection_globals(rows), foreground=self.colors.get('muted', '#a8a8a8'))
+            menu.add_command(label='Remove Global Rule', command=lambda: self.remove_connection_globals(rows), foreground=self.colors.get('menu_edit', self.colors.get('muted', '#a8a8a8')))
         menu.add_separator()
         menu.add_command(label='Copy IP Domain', command=lambda: self.copy_connection_endpoints(self.alerts_tree))
         menu.add_command(label='Copy details', command=lambda: self.copy_connection_details(self.alerts_tree))
@@ -972,12 +1177,30 @@ class ViewsMixin:
 
     def _global_menu_commands(self, menu, callback, assigned=False):
         self._menu_rule_command(menu, 'Allow Connection', lambda: callback(True, 'both'), 'global_allow')
+        self._menu_rule_command(menu, 'Allow Outgoing', lambda: callback(True, 'out'), 'global_allow_out')
+        self._menu_rule_command(menu, 'Allow Incoming', lambda: callback(True, 'in'), 'global_allow_in')
         self._menu_rule_command(menu, 'Block Incoming', lambda: callback(False, 'in'), 'global_block_in')
+        self._menu_rule_command(menu, 'Block Outgoing', lambda: callback(False, 'out'), 'global_block_out')
         self._menu_rule_command(menu, 'Block Connection', lambda: callback(False, 'both'), 'global_block')
 
     def _display_values(self, tree, iid):
         mapping = dict(zip(tree['columns'], tree.item(iid, 'values')))
-        return tuple((mapping.get(column, '') for column in tree['displaycolumns']))
+        columns = tree['displaycolumns']
+        if columns == '#all' or tuple(columns) == ('#all',):
+            columns = tree['columns']
+        return tuple(mapping.get(column, '') for column in columns)
+
+    def copy_selected_rows(self, event):
+        tree = event.widget
+        selected = set(tree.selection())
+        lines = []
+        for iid in tree.get_children():
+            if iid in selected:
+                lines.append('\t'.join(str(value).replace('\r', ' ').replace('\n', ' ')
+                                       for value in self._display_values(tree, iid)))
+        if lines:
+            self.copy_text('\n'.join(lines))
+        return 'break'
 
     def tree_details_from_event(self, event, tree):
         if self._autosize_header(event, tree):
@@ -1144,6 +1367,9 @@ class ViewsMixin:
         for kind, key, data in self.connection_global_rules(row):
             fields = [f"Global Rule: {data['action']}",
                       f"Target: {data.get('target') or 'Any address'}"]
+            paths = rule_executables(data)
+            if paths:
+                fields.append('Process: ' + ', '.join(paths))
             if kind == 'port':
                 fields.append(f"{data['scope'].title()} Port: {data['port']}" if data['port'] else 'Ports: Any')
                 fields.append(f"Protocol: {data.get('protocol', 'TCP/UDP')}")
@@ -1224,13 +1450,19 @@ class ViewsMixin:
         if self._managed_rule_category(status, path) == 'global':
             target = normalize_target(str(path).split(' (', 1)[0])
             with self.lock:
-                store = self.global_allows if str(status).casefold() == 'global allow' else self.global_blocks
+                store = self.global_allows if 'allow' in str(status).casefold() else self.global_blocks
                 data = store.get(target, {})
             extra = '\nResolved Addresses: ' + (', '.join(data.get('addresses', ())) or 'Unknown')
         if len(values) == len(self.RULE_COLUMNS):
             extra += f'\nRemote Port: {values[3] or "-"}\nLocal Port: {values[4] or "-"}\nProtocol: {values[5]}'
         if self._managed_rule_category(status, path) == 'port':
-            path = str(path).replace(':None:', ':All:', 1)
+            with self.lock:
+                policy = getattr(self, 'global_ports', {}).get(path)
+            if policy:
+                path = self._global_rule_description(policy)
+                paths = rule_executables(policy)
+                if paths:
+                    extra += '\nExecutable Paths:\n' + '\n'.join(paths)
         return f'Status: {status}\nRule: {rule}\nDirection: {direction}\nDownload: {down}\nUpload: {up}\nPath/Target: {path}{extra}'
 
     def copy_rule_details(self, tree):
@@ -1251,7 +1483,7 @@ class ViewsMixin:
                     target = rule.get('target', '')
                 elif category == 'global':
                     target = normalize_target(path.split(' (', 1)[0])
-                    rule = (self.global_allows if status == 'global allow' else self.global_blocks).get(target, {})
+                    rule = (self.global_allows if 'allow' in status else self.global_blocks).get(target, {})
                 else:
                     continue  # Application rules have no remote endpoints.
                 targets = [part.strip() for part in target.split(',') if part.strip()]
@@ -1343,7 +1575,8 @@ class ViewsMixin:
 
     def export_connections(self, tree=None):
         tree = tree or self.tree
-        rows = tree.get_children()
+        columns = tuple(tree['displaycolumns'])
+        rows = [self._display_values(tree, iid) for iid in tree.get_children()]
         if not rows:
             messagebox.showinfo('Export Connections', 'There are no visible connections.')
             return
@@ -1353,9 +1586,8 @@ class ViewsMixin:
         try:
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
-                writer.writerow(tuple(tree['displaycolumns']))
-                for iid in rows:
-                    writer.writerow(self._display_values(tree, iid))
+                writer.writerow(columns)
+                writer.writerows(rows)
             messagebox.showinfo('Export Complete', f'Exported connections to:\n{path}')
         except Exception as exc:
             messagebox.showerror('Export Failed', str(exc))
@@ -1366,7 +1598,7 @@ class ViewsMixin:
             return
         try:
             with self.lock:
-                data = {'format': 'PyFirewall managed rules', 'version': 6, 'global_port_rules': list(getattr(self, 'global_ports', {}).values()), 'exported_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'rules': [{'action': 'Allow', 'direction': 'Both', 'path': path_value} for path_value in sorted(self.allowed_apps)] + [{'action': 'Block', 'direction': self._direction_from_flags(value), 'path': value['path']} for value in self.blocked_paths.values()], 'global_ip_blocks': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_blocks.items())], 'global_ip_allows': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_allows.items())]}
+                data = {'format': 'PyFirewall managed rules', 'version': 7, 'global_port_rules': list(getattr(self, 'global_ports', {}).values()), 'exported_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'rules': [{'action': 'Allow', 'direction': 'Both', 'path': path_value} for path_value in sorted(self.allowed_apps)] + [{'action': 'Block', 'direction': self._direction_from_flags(value), 'path': value['path']} for value in self.blocked_paths.values()], 'global_ip_blocks': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_blocks.items())], 'global_ip_allows': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_allows.items())]}
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
             messagebox.showinfo('Export Complete', f'Exported managed rules to:\n{path}')
@@ -1388,7 +1620,7 @@ class ViewsMixin:
             ports = list(self._parse_port_rules(data.get('global_port_rules', [])).values())
             if not all(isinstance(entries, list) for entries in (rules, blocks, allows)):
                 raise ValueError('Rule collections must be JSON arrays.')
-            requests = []
+            requests, observed = [], {}
             for rule in rules:
                 if not isinstance(rule, dict):
                     continue
@@ -1399,18 +1631,32 @@ class ViewsMixin:
             for entries, allow in ((blocks, False), (allows, True)):
                 for entry in entries:
                     target = entry.get('target', '') if isinstance(entry, dict) else entry
-                    if isinstance(target, str) and normalize_target(target):
-                        requests.append((target, allow, entry.get('direction', 'both') if isinstance(entry, dict) else 'both', True))
+                    if not isinstance(target, str) or not is_global_target(normalize_target(target)):
+                        raise ValueError('Invalid imported legacy global target.')
+                    global_targets(target)
+                    addresses = entry.get('addresses', []) if isinstance(entry, dict) else []
+                    if not isinstance(addresses, list):
+                        raise ValueError('Imported fallback addresses must be an array.')
+                    observed.setdefault(normalize_target(target), set()).update(normalize_address(value) for value in addresses)
+                    requests.append((target, allow, entry.get('direction', 'both') if isinstance(entry, dict) else 'both', True))
             if not requests and not ports:
                 messagebox.showerror('Import Rules', 'No valid managed rules were found.')
                 return
             if not messagebox.askyesno('Import Rules', f'Apply {len(requests) + len(ports)} imported rule(s)?'):
                 return
             options = {'port_updates': ports} if ports else {}
-            if not self._apply_rule_batch(requests, quiet=True, **options):
-                messagebox.showerror('Import Incomplete', 'The rule batch could not be applied. See Alerts for details.')
+            if any(observed.values()):
+                options['observed_addresses'] = observed
+            if self._native_ui_call():
+                self._queue_native_job('Import rules', lambda: self._import_rule_batch(requests, options))
+            else:
+                self._import_rule_batch(requests, options)
         except Exception as exc:
             messagebox.showerror('Import Failed', str(exc))
+
+    def _import_rule_batch(self, requests, options):
+        if not self._apply_rule_batch(requests, quiet=True, **options):
+            self._native_message('showerror', 'Import Incomplete', 'The rule batch could not be applied and saved. See Alerts for details.')
 
     def open_windows_firewall(self):
         try:
@@ -1432,7 +1678,7 @@ class ViewsMixin:
                 row['upload'] = stats.get('upload', 0)
             elif row.get('global_type'):
                 down, up = self._target_traffic_locked(row['normalized_path'], row.get('addresses', ()))
-                row['download'] = down
+                row['download'] = 0 if direction_name(row['direction']) == 'Outbound' else down
                 row['upload'] = 0 if direction_name(row['direction']) == 'Inbound' else up
             else:
                 stats = self.proc_traffic.get(row['normalized_path'], {})

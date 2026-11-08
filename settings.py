@@ -1,7 +1,9 @@
 """Settings UI, saved preferences, reset behavior and support dialogs."""
 
 import ctypes
+import copy
 import json
+import math
 import os
 import threading
 import tkinter as tk
@@ -22,7 +24,8 @@ from constants import (
     SCRIPT_DIR,
     __version__,
 )
-from helpers import direction_name, direction_set, display_path, normalize_path, normalize_target
+from helpers import (direction_name, direction_set, display_path, global_targets,
+                     log_internal_error, normalize_address, normalize_path, normalize_target)
 from widgets import add_tooltip
 
 class SettingsMixin:
@@ -30,13 +33,76 @@ class SettingsMixin:
 
     # Configuration persistence
 
+    @staticmethod
+    def _positive_finite(value):
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError('Time Window and Upload Threshold must be finite and greater than zero.')
+        return value
+
+    def _save_settings_with_feedback(self):
+        """Publish failures through Tk's queue, including when called by a worker."""
+        ok = self.save_settings()
+        if ok is False:
+            detail = getattr(self, 'settings_save_error', None) or 'Could not write the saved configuration.'
+            self.ui_queue.put(('save_error', detail))
+        return ok is not False
+
+    def _validate_settings(self, config):
+        """Validate policy before publishing any part of a saved configuration."""
+        if not isinstance(config, dict):
+            raise ValueError('The saved configuration must be a JSON object.')
+        for name in ('rate_threshold', 'saved_rate_threshold', 'max_connections_alerts'):
+            if name in config:
+                int(config[name])
+        for name in ('rate_window', 'upload_threshold_mb'):
+            if name in config:
+                self._positive_finite(config[name])
+        for name in ('filter_all_enabled', 'log_alerts_only_enabled', 'auto_block_enabled',
+                     'keep_notification_foreground', 'dark_mode', 'firewall_initialized'):
+            if name in config and type(config[name]) is not bool:
+                raise ValueError(f'{name} must be true or false.')
+        allowed = config.get('allowed_apps', [])
+        if not isinstance(allowed, list) or any(not isinstance(p, str) or not os.path.isabs(p) for p in allowed):
+            raise ValueError('Allowed applications must be an array of absolute paths.')
+        directions = {'both', 'in', 'inbound', 'incoming', 'out', 'outbound', 'outgoing'}
+        for name in ('managed_rules', 'global_ip_blocks', 'global_ip_allows'):
+            entries = config.get(name, [])
+            if entries is None:  # Older saved files used null for empty collections.
+                entries = config[name] = []
+            if not isinstance(entries, list):
+                raise ValueError(f'{name} must be an array.')
+            for entry in entries:
+                if name == 'managed_rules':
+                    if (not isinstance(entry, dict) or not isinstance(entry.get('path'), str)
+                            or not os.path.isabs(entry['path'])
+                            or str(entry.get('action', 'Block')).casefold() not in {'block', 'allow'}):
+                        raise ValueError('Invalid saved application rule.')
+                else:
+                    target = entry.get('target') if isinstance(entry, dict) else entry
+                    if not isinstance(target, str):
+                        raise ValueError('Invalid saved global target.')
+                    global_targets(target)
+                    addresses = entry.get('addresses', []) if isinstance(entry, dict) else []
+                    if not isinstance(addresses, list):
+                        raise ValueError('Saved global addresses must be an array.')
+                    for address in addresses:
+                        normalize_address(address)
+                if isinstance(entry, dict) and str(entry.get('direction', 'Both')).casefold() not in directions:
+                    raise ValueError('Invalid saved rule direction.')
+        return self._parse_port_rules(config.get('global_port_rules', []))
+
     def load_settings(self):
-        if not os.path.exists(CONFIG_FILE):
-            return
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-        except Exception:
+            ports = self._validate_settings(config)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError, OverflowError) as exc:
+            self.settings_load_error = f'Could not load {CONFIG_FILE}: {exc}'
+            log_internal_error('load_settings', exc)
+            self.queue_alert('High', 'Saved configuration', '', '', self.settings_load_error)
             return
         with self.lock:
             self.filter_all_enabled = bool(config.get('filter_all_enabled', True))
@@ -113,7 +179,7 @@ class SettingsMixin:
             self.window_position = (list(position) if isinstance(position, (list, tuple)) and len(position) == 2
                                     and all(type(n) is int and -100000 <= n <= 100000 for n in position) else None)
             self.allowed_apps = {normalize_path(p) for p in config.get('allowed_apps', []) if normalize_path(p)}
-            self.global_ports = self._parse_port_rules(config.get('global_port_rules', []))
+            self.global_ports = ports
             self.pending_rules = []
             self.blocked_paths = {}
             for rule in config.get('managed_rules', []) or []:
@@ -151,8 +217,11 @@ class SettingsMixin:
 
     def save_settings(self):
         temp = CONFIG_FILE + '.tmp'
-        try:
-            with self.settings_io_lock:
+        with self.settings_io_lock:
+            if getattr(self, 'settings_load_error', None):
+                self.settings_save_error = self.settings_load_error
+                return False
+            try:
                 with self.lock:
                     managed = [{'action': 'Allow', 'direction': 'Both', 'path': path} for path in sorted(self.allowed_apps)]
                     managed += [{'action': 'Block', 'direction': self._direction_from_flags(data), 'path': data.get('path', normalized)} for normalized, data in sorted(self.blocked_paths.items())]
@@ -163,21 +232,22 @@ class SettingsMixin:
                     config['window_size'] = getattr(self, 'window_size', None)
                     config['window_position'] = getattr(self, 'window_position', None)
                     config['window_maximized'] = getattr(self, 'window_maximized', False)
+                    config = copy.deepcopy(config)
                 with open(temp, 'w', encoding='utf-8') as f:
-                    json.dump(config, f, indent=2)
+                    json.dump(config, f, indent=2, allow_nan=False)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(temp, CONFIG_FILE)
-            self.settings_save_error = None
-            return True
-        except (OSError, TypeError, ValueError) as exc:
-            self.settings_save_error = str(exc)
-            try:
-                if os.path.exists(temp):
-                    os.remove(temp)
-            except OSError:
-                pass
-            return False
+                self.settings_save_error = None
+                return True
+            except (OSError, TypeError, ValueError) as exc:
+                self.settings_save_error = str(exc)
+                try:
+                    if os.path.exists(temp):
+                        os.remove(temp)
+                except OSError:
+                    pass
+                return False
 
     # Settings page and support dialogs
 
@@ -225,7 +295,7 @@ class SettingsMixin:
         self._make_monitor_controls(self.settings_monitor_controls, prefix='settings_', stacked=True)
         for row, description in enumerate((
                 'Pause or Resume the live capture and threshold rules.',
-                'Filter All Connections auto-blocks and prompts for every new process (requires Monitoring).')):
+                'Filter All Connections requests a hold after observed traffic; initial packets may already have passed.')):
             tk.Label(self.settings_monitor_controls, text=description, fg=self.colors['muted'],
                      wraplength=600, justify=tk.LEFT).grid(row=row, column=1, sticky=tk.W,
                                                          padx=(18, 0), pady=(0, 12) if row == 0 else 0)
@@ -442,7 +512,8 @@ class SettingsMixin:
         body = tk.Frame(dialog, bg=self.colors['frame'])
         body.pack(fill=tk.BOTH, expand=True, padx=18, pady=12)
         title = tk.Label(body, text='Support EolnMsuk - Click any wallet to copy its address',
-                         bg=self.colors['frame'], fg='#cccccc', font=('Segoe UI', 10, 'bold'))
+                         bg=self.colors['frame'], fg=self.colors['crypto_heading'], font=('Segoe UI', 10, 'bold'))
+        title._theme_foreground_key = 'crypto_heading'
         title.pack(anchor=tk.W, pady=(0, 8))
         
         confirmation = tk.Label(body, text='Choose a wallet above.', anchor=tk.W,
@@ -562,17 +633,17 @@ class SettingsMixin:
                 self.filter_all_saved_auto_block = None
             if self.filter_all_enabled:
                 self.rate_threshold = 1
-                self.rate_threshold_var.set('1')
             else:
                 self.rate_threshold = max(1, self.saved_rate_threshold)
-                self.rate_threshold_var.set(str(self.rate_threshold))
-            self.log_alerts_var.set(self.log_alerts_only)
-            self.auto_block_var.set(self.auto_block_enabled)
+        self.rate_threshold_var.set(str(self.rate_threshold))
+        self.log_alerts_var.set(self.log_alerts_only)
+        self.auto_block_var.set(self.auto_block_enabled)
+        self._invalidate_auto_prompts(close_dialog=True)
         self.update_auto_block_controls()
         self.update_filter_ui()
         self.root.update_idletasks()
-        self._queue_settings_change(release_auto_holds=not self.log_alerts_only or not self.auto_block_enabled)
-        self.save_settings()
+        self._queue_settings_change(release_auto_holds=True)
+
 
     def update_pause_button(self, resume):
         pause_text = '▶  Resume Monitoring' if resume else '⏸  Pause Monitoring'
@@ -589,16 +660,18 @@ class SettingsMixin:
             # A failed capture displays Resume; clicking it must not pause retries.
             self.is_paused = False if capture_failed else not self.is_paused
             paused = self.is_paused
-        if paused:
-            self._invalidate_auto_prompts(close_dialog=True)
+        self._invalidate_auto_prompts(close_dialog=True)
         self.update_pause_button(paused or capture_failed)
         self.update_auto_block_controls()
         self.update_filter_ui()
         if paused:
-            try:
-                self.release_auto_holds()
-            except Exception as exc:
-                messagebox.showerror('Temporary Block Cleanup Failed', str(exc), parent=self.root)
+            if hasattr(self, 'native_jobs'):
+                self._queue_settings_change(release_auto_holds=True)
+            else:
+                try:
+                    self.release_auto_holds()
+                except Exception as exc:
+                    messagebox.showerror('Temporary Block Cleanup Failed', str(exc), parent=self.root)
         else:
             self.render_all()
         self.update_status()
@@ -620,28 +693,24 @@ class SettingsMixin:
             if self.settings_change_worker_running:
                 return
             self.settings_change_worker_running = True
-        threading.Thread(target=self._settings_change_worker, daemon=True, name='PyFirewall-Settings').start()
+        if hasattr(self, 'native_jobs'):
+            if not self._queue_native_job('Save settings', self._settings_change_worker):
+                with self.settings_change_lock:
+                    self.settings_change_worker_running = False
+                self._save_settings_with_feedback()
+        else:
+            threading.Thread(target=self._settings_change_worker, daemon=True, name='PyFirewall-Settings').start()
 
     def _release_auto_holds_for_generation(self, generation):
-        try:
+        # Retired ownership survives newer settings generations and re-enabling.
+        # Native removal is checked per path while serialized with installation.
+        with self.lock:
+            retired = dict(getattr(self, 'auto_hold_cleanup', {}))
+        ok = True
+        for path, owner in retired.items():
             with self.firewall_lock:
-                with self.settings_change_lock:
-                    if generation != self.settings_change_generation:
-                        return False
-                with self.lock:
-                    if self.closed or (self.log_alerts_only and self.auto_block_enabled):
-                        return False
-                self.remove_auto_holds_locked()
-                with self.settings_change_lock:
-                    generation_is_current = generation == self.settings_change_generation
-                with self.lock:
-                    still_current = generation_is_current and (not self.closed) and (not self.log_alerts_only) and (not self.auto_block_enabled)
-                if still_current:
-                    self._invalidate_auto_prompts(close_dialog=False)
-                return still_current
-        except Exception as exc:
-            self.queue_alert('High', 'Temporary blocks', '', '', f'Could not release temporary blocks: {exc}')
-            return False
+                ok = self._release_auto_hold_locked(path, owner) and ok
+        return ok
 
     def _settings_change_worker(self):
         while True:
@@ -652,16 +721,14 @@ class SettingsMixin:
                 release_auto_holds = self.settings_change_release_holds
                 self.settings_change_release_holds = False
                 self.settings_change_pending = False
-            with self.settings_change_lock:
                 generation = self.settings_change_generation
             with self.lock:
-                disabled = not self.log_alerts_only or not self.auto_block_enabled
                 closed = self.closed
             if closed:
                 continue
-            if release_auto_holds and disabled:
+            if release_auto_holds or getattr(self, 'auto_hold_cleanup', {}):
                 self._release_auto_holds_for_generation(generation)
-            self.save_settings()
+            self._save_settings_with_feedback()
 
     def on_log_alerts_changed(self):
         enabled = bool(self.log_alerts_var.get())
@@ -669,8 +736,8 @@ class SettingsMixin:
             self.log_alerts_only = enabled
             if not enabled:
                 self.auto_block_enabled = False
+        self._invalidate_auto_prompts(close_dialog=True)
         if not enabled:
-            self._invalidate_auto_prompts(close_dialog=True)
             self.auto_block_var.set(False)
         self.update_auto_block_controls()
         self.root.update_idletasks()
@@ -681,8 +748,7 @@ class SettingsMixin:
         with self.lock:
             self.auto_block_enabled = self.log_alerts_only and enabled
             actual_enabled = self.auto_block_enabled
-        if not actual_enabled:
-            self._invalidate_auto_prompts(close_dialog=True)
+        self._invalidate_auto_prompts(close_dialog=True)
         self.auto_block_var.set(actual_enabled)
         self.update_auto_block_controls()
         self.root.update_idletasks()
@@ -699,7 +765,7 @@ class SettingsMixin:
                     dialog.lift()
             except tk.TclError:
                 pass
-        self.save_settings()
+        self._save_settings_with_feedback()
 
     # History limits, applying settings and reset
 
@@ -721,8 +787,8 @@ class SettingsMixin:
     def apply_settings(self):
         try:
             threshold = 1 if self.filter_all_enabled else int(self.rate_threshold_var.get().strip())
-            window = float(self.rate_window_var.get().strip())
-            upload = float(self.upload_threshold_var.get().strip())
+            window = self._positive_finite(self.rate_window_var.get().strip())
+            upload = self._positive_finite(self.upload_threshold_var.get().strip())
             max_connections_alerts = int(self.max_connections_alerts_var.get().strip())
         except (ValueError, tk.TclError):
             messagebox.showerror('Invalid Settings', 'Threshold and Max Connections / Alerts must be whole numbers; Time Window and Upload Threshold must be positive numbers.')
@@ -730,6 +796,7 @@ class SettingsMixin:
         if threshold < 1 or window <= 0 or upload <= 0 or max_connections_alerts < 1:
             messagebox.showerror('Invalid Settings', 'Threshold and Max Connections / Alerts must be at least 1; Time Window and Upload Threshold must be > 0.')
             return False
+        self._invalidate_auto_prompts(close_dialog=True)
         with self.lock:
             self.rate_threshold = threshold
             if not self.filter_all_enabled:
@@ -746,93 +813,126 @@ class SettingsMixin:
         self.rate_window_var.set(str(window))
         self.upload_threshold_var.set(str(upload))
         self.max_connections_alerts_var.set(str(max_connections_alerts))
-        self.save_settings()
+        saved = self._save_settings_with_feedback()
         if self.startup_complete:
             self.render_monitor()
             self.render_alerts()
         self.update_status()
-        return True
+        return saved
 
     def reset_to_defaults(self):
+        if getattr(self, 'settings_load_error', None):
+            messagebox.showerror('Reset Unavailable', self.settings_load_error, parent=self.root)
+            return
         if not messagebox.askyesno('Reset to Defaults', 'Remove all PyFirewall_* firewall rules and reset application settings?\n\nOther Windows Firewall rules will not be changed.', icon='warning'):
             return
+        self._invalidate_auto_prompts(close_dialog=True)
+        if self._native_ui_call():
+            def reset():
+                saved = self._reset_defaults_worker()
+                if saved is not None:
+                    self.ui_queue.put(('reset_complete', saved))
+            self._queue_native_job('Reset defaults', reset)
+        else:
+            saved = self._reset_defaults_worker()
+            if saved is not None:
+                self._finish_reset_defaults(saved)
+
+    def _reset_defaults_worker(self):
         try:
             with self.firewall_lock:
+                records = self.get_firewall_rules()
+                self._replace_rule_records(records, (), lambda: None)
                 with self.settings_change_lock:
                     self.settings_change_generation += 1
                     self.settings_change_pending = False
                     self.settings_change_release_holds = False
-                records = self.get_firewall_rules()
-                self._replace_rule_records(records, (), lambda: None)
-                self._invalidate_auto_prompts(close_dialog=True)
-            with self.lock:
-                self.filter_all_enabled = True
-                self.is_paused = False
-                self.filter_all_saved_alerts = None
-                self.filter_all_saved_auto_block = None
-                self.saved_rate_threshold = DEFAULT_RATE_THRESHOLD
-                self.rate_threshold = 1 if self.filter_all_enabled else DEFAULT_RATE_THRESHOLD
-                self.rate_window = DEFAULT_RATE_WINDOW
-                self.upload_threshold_mb = DEFAULT_UPLOAD_THRESHOLD_MB
-                self.max_connections_alerts = DEFAULT_MAX_CONNECTIONS_ALERTS
-                self.log_alerts_only = DEFAULT_LOG_ALERTS_ONLY
-                self.auto_block_enabled = True
-                self.keep_notification_foreground = True
-                self.dark_mode = DEFAULT_DARK_MODE
-                self.check_updates_on_startup = DEFAULT_CHECK_UPDATES_ON_STARTUP
-                self.allowed_apps.clear()
-                self.blocked_paths.clear()
-                self.global_blocks.clear()
-                self.global_allows.clear()
-                self.global_ports.clear()
-                self.hidden_columns.clear()
-                self.column_widths = {}
-                self.window_size = None
-                self.window_position = None
-                self.window_maximized = False
-                self.active_connections.clear()
-                self.connection_rates.clear()
-                self.proc_ip_upload.clear()
-                self.proc_ip_upload_last_seen.clear()
-                self.upload_alerted.clear()
-                self.ip_traffic_last_seen.clear()
-                self.proc_traffic.clear()
-                self.ip_traffic.clear()
-                self.pruned_target_traffic.clear()
-                self.global_port_traffic.clear()
-                self.total_download = self.total_upload = 0
-                self.firewall_initialized = True
-                self.column_orders = {key: list(order) for key, order in self.default_column_orders.items()}
-            for tree_name, order_key in (('tree', 'monitor'), ('rules_tree', 'rules'), ('alerts_tree', 'alerts')):
-                tree = getattr(self, tree_name, None)
-                if tree is not None:
-                    tree['displaycolumns'] = tuple(self.column_orders[order_key])
-                    for column, width in getattr(tree, '_default_column_widths', {}).items():
-                        tree.column(column, width=width)
-                    tree._fill_column = None
-            self.rate_threshold_var.set(str(self.rate_threshold))
-            self.rate_window_var.set(str(DEFAULT_RATE_WINDOW))
-            self.upload_threshold_var.set(str(DEFAULT_UPLOAD_THRESHOLD_MB))
-            self.max_connections_alerts_var.set(str(DEFAULT_MAX_CONNECTIONS_ALERTS))
-            self.log_alerts_var.set(DEFAULT_LOG_ALERTS_ONLY)
-            self.auto_block_var.set(True)
-            self.keep_notification_foreground_var.set(True)
-            self.dark_mode_var.set(DEFAULT_DARK_MODE)
-            self.apply_theme()
-            for variable in (self.search_var, self.rule_search_var, self.alert_search_var):
-                variable.set('')
-            self.check_updates_on_startup_var.set(DEFAULT_CHECK_UPDATES_ON_STARTUP)
-            self.clear_alerts()
-            self.clear_list()
-            self.update_pause_button(not self.capture_healthy and self.capture_error is not None)
-            self.update_auto_block_controls()
-            self.update_filter_ui()
-            if self.startup_complete:
-                self.render_all()
-            self.save_settings()
-            self.refresh_rules(force=True)
-            self.update_status()
-            self._fit_initial_window()
-            messagebox.showinfo('Defaults Restored', 'PyFirewall-managed rules and saved settings were reset.')
+                self._invalidate_auto_prompts(close_dialog=False)
+                with self.lock:
+                    self.filter_all_enabled = True
+                    self.is_paused = False
+                    self.filter_all_saved_alerts = None
+                    self.filter_all_saved_auto_block = None
+                    self.saved_rate_threshold = DEFAULT_RATE_THRESHOLD
+                    self.rate_threshold = 1 if self.filter_all_enabled else DEFAULT_RATE_THRESHOLD
+                    self.rate_window = DEFAULT_RATE_WINDOW
+                    self.upload_threshold_mb = DEFAULT_UPLOAD_THRESHOLD_MB
+                    self.max_connections_alerts = DEFAULT_MAX_CONNECTIONS_ALERTS
+                    self.log_alerts_only = DEFAULT_LOG_ALERTS_ONLY
+                    self.auto_block_enabled = True
+                    self.keep_notification_foreground = True
+                    self.dark_mode = DEFAULT_DARK_MODE
+                    self.check_updates_on_startup = DEFAULT_CHECK_UPDATES_ON_STARTUP
+                    self.allowed_apps.clear()
+                    self.blocked_paths.clear()
+                    self.pending_rules.clear()
+                    self.global_blocks.clear()
+                    self.global_allows.clear()
+                    self.global_ports.clear()
+                    getattr(self, 'rule_enforcement', {}).clear()
+                    getattr(self, 'verified_blocked_paths', {}).clear()
+                    getattr(self, 'observed_app_paths', set()).clear()
+                    self.hidden_columns.clear()
+                    self.column_widths = {}
+                    self.window_size = None
+                    self.window_position = None
+                    self.window_maximized = False
+                    self.active_connections.clear()
+                    self.connection_rates.clear()
+                    self.proc_ip_upload.clear()
+                    self.proc_ip_upload_last_seen.clear()
+                    self.upload_alerted.clear()
+                    self.ip_traffic_last_seen.clear()
+                    self.proc_traffic.clear()
+                    self.ip_traffic.clear()
+                    self.pruned_target_traffic.clear()
+                    self.global_port_traffic.clear()
+                    self.total_download = self.total_upload = 0
+                    self.firewall_initialized = True
+                    self._invalidate_rule_snapshot_locked()
+                    self.auto_hold_owners.clear()
+                    self.auto_hold_cleanup.clear()
+                    self.column_orders = {key: list(order) for key, order in self.default_column_orders.items()}
+            return self._save_settings_with_feedback()
         except Exception as exc:
-            messagebox.showerror('Reset Failed', str(exc))
+            self._native_message('showerror', 'Reset Failed', str(exc))
+            return None
+
+    def _finish_reset_defaults(self, saved):
+        if self.closed:
+            return
+        self._dismiss_auto_dialog(self.auto_prompt_dialog)
+        self.auto_prompt_dialog = self.auto_prompt_key = None
+        self.auto_prompt_active = False
+        for tree_name, order_key in (('tree', 'monitor'), ('rules_tree', 'rules'), ('alerts_tree', 'alerts')):
+            tree = getattr(self, tree_name, None)
+            if tree is not None:
+                tree['displaycolumns'] = tuple(self.column_orders[order_key])
+                for column, width in getattr(tree, '_default_column_widths', {}).items():
+                    tree.column(column, width=width)
+                tree._fill_column = None
+        self.rate_threshold_var.set(str(self.rate_threshold))
+        self.rate_window_var.set(str(DEFAULT_RATE_WINDOW))
+        self.upload_threshold_var.set(str(DEFAULT_UPLOAD_THRESHOLD_MB))
+        self.max_connections_alerts_var.set(str(DEFAULT_MAX_CONNECTIONS_ALERTS))
+        self.log_alerts_var.set(DEFAULT_LOG_ALERTS_ONLY)
+        self.auto_block_var.set(True)
+        self.keep_notification_foreground_var.set(True)
+        self.dark_mode_var.set(DEFAULT_DARK_MODE)
+        self.apply_theme()
+        for variable in (self.search_var, self.rule_search_var, self.alert_search_var):
+            variable.set('')
+        self.check_updates_on_startup_var.set(DEFAULT_CHECK_UPDATES_ON_STARTUP)
+        self.clear_alerts()
+        self.clear_list()
+        self.update_pause_button(not self.capture_healthy and self.capture_error is not None)
+        self.update_auto_block_controls()
+        self.update_filter_ui()
+        if self.startup_complete:
+            self.render_all()
+        self.refresh_rules(force=True)
+        self.update_status()
+        self._fit_initial_window()
+        if saved:
+            messagebox.showinfo('Defaults Restored', 'PyFirewall-managed rules and saved settings were reset.')
+

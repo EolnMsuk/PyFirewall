@@ -21,6 +21,7 @@ from constants import (
     DEFAULT_UPLOAD_THRESHOLD_MB,
     DNS_MAX_PENDING,
     GLOBAL_PURPLE,
+    ALERT_BACKLOG_LIMIT,
 )
 from firewall import FirewallMixin
 from helpers import error_details, log_internal_error, mb
@@ -46,6 +47,7 @@ class FirewallMonitorApp(
 
     def __init__(self, root, activation_port=None):
         self.root = root
+        self.ui_thread_id = threading.get_ident()
         root.title('Python Personal Firewall & Network Monitor')
         root.geometry('1800x900')
         root.minsize(1500, 750)
@@ -60,13 +62,15 @@ class FirewallMonitorApp(
         self.settings_change_generation = 0
         self.ui_queue = queue.Queue()
         self.prompt_queue = queue.Queue()
-        self.alert_queue = queue.Queue()
+        self.alert_queue = queue.Queue(maxsize=ALERT_BACKLOG_LIMIT)
+        self.dropped_alerts = self.untracked_rate_events = 0
         self.tray_command_queue = queue.Queue()
         self.instance_activation_port = activation_port
         self.instance_activation_socket = None
         self.instance_activation_stop = threading.Event()
         self.tray = None
         self.tray_hidden = False
+        self._visibility_generation = 0
         self.sniffing = self.closed = self.is_paused = False
         self.startup_complete = self.startup_running = False
         self.update_check_running = False
@@ -104,6 +108,8 @@ class FirewallMonitorApp(
         self.global_blocks = {}
         self.global_allows = {}
         self.global_ports = {}
+        self.rule_enforcement = {}
+        self.verified_blocked_paths = {}
         self.rule_rows = []
         self.rules_loading = False
         self.rules_generation = 0
@@ -118,8 +124,13 @@ class FirewallMonitorApp(
         self.auto_prompt_dialog = None
         self.auto_prompt_key = None
         self.auto_prompt_generation = 0
+        self.auto_hold_owners = {}
+        self.auto_hold_cleanup = {}
+        self.auto_prompt_connections = {}
         self.firewall_profile_modified = False
         self.settings_save_error = None
+        self.settings_load_error = None
+        self.firewall_ready = False
         self.dns_cache = {}
         self.dns_cache_times = {}
         self.dns_observed_names = {}
@@ -171,7 +182,8 @@ class FirewallMonitorApp(
         self.root.protocol('WM_DELETE_WINDOW', self.minimize_to_tray)
         try:
             self.tray = PyFirewallSystemTray(self.tray_command_queue, filter_all_enabled=self.filter_all_enabled, is_paused=self.is_paused)
-        except Exception:
+        except Exception as exc:
+            log_internal_error('tray_startup', exc)
             self.tray = None
         self._start_instance_activation_listener()
         self.root.after(50, self._start_background_initialization)
@@ -181,6 +193,7 @@ class FirewallMonitorApp(
         """Receive a second launch request without calling Tk off the UI thread."""
         if self.instance_activation_port is None:
             return
+        listener = None
         try:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -188,11 +201,17 @@ class FirewallMonitorApp(
             listener.listen(1)
             listener.settimeout(0.25)
         except OSError as exc:
+            if listener is not None:
+                listener.close()
             log_internal_error('instance_activation_listener', exc)
             return
         self.instance_activation_socket = listener
-        threading.Thread(target=self._run_instance_activation_listener,
-                         name='PyFirewall-Activation', daemon=True).start()
+        try:
+            threading.Thread(target=self._run_instance_activation_listener,
+                             name='PyFirewall-Activation', daemon=True).start()
+        except Exception as exc:
+            self._stop_instance_activation_listener()
+            log_internal_error('instance_activation_start', exc)
 
     def _run_instance_activation_listener(self):
         listener = self.instance_activation_socket
@@ -208,7 +227,23 @@ class FirewallMonitorApp(
     def _handle_instance_activation(self, connection):
         try:
             with connection:
-                if connection.recv(16) == b'SHOW':
+                deadline = time.monotonic() + 0.5
+                command = b''
+                stop = getattr(self, 'instance_activation_stop', None)
+                while len(command) < 4:
+                    if getattr(self, 'closed', False) or (stop is not None and stop.is_set()):
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    connection.settimeout(remaining)
+                    fragment = connection.recv(4 - len(command))
+                    if not fragment:
+                        return
+                    command += fragment
+                    if not b'SHOW'.startswith(command):
+                        return
+                if not getattr(self, 'closed', False) and not (stop is not None and stop.is_set()):
                     self.tray_command_queue.put('show')
         except OSError:
             pass
@@ -315,13 +350,14 @@ class FirewallMonitorApp(
         state = self.root.state()
         if state not in {'normal', 'zoomed'}:
             return
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+        position = [self.root.winfo_x(), self.root.winfo_y()]
         with self.lock:
             self.window_maximized = state == 'zoomed'
             if state == 'normal':
-                width, height = self.root.winfo_width(), self.root.winfo_height()
                 if width > 1 and height > 1:
                     self.window_size = [width, height]
-                    self.window_position = [self.root.winfo_x(), self.root.winfo_y()]
+                    self.window_position = position
 
     def _capture_layout(self):
         """Read Tk on the UI thread before hiding or destroying the window."""
@@ -446,7 +482,7 @@ class FirewallMonitorApp(
     # Tab construction
 
     def _monitor_widths(self):
-        return {'#': (55, tk.CENTER, False), 'Status': (105, tk.CENTER, False), 'PID': (70, tk.CENTER, False), 'Protocol': (70, tk.CENTER, False), 'Local Port': (85, tk.CENTER, False), 'Remote Port': (85, tk.CENTER, False), 'Direction': (85, tk.CENTER, False), 'Process Name': (150, tk.W, True), 'Remote IP': (125, tk.CENTER, True), 'Remote Host': (190, tk.W, True), 'Download (MB)': (110, tk.CENTER, False), 'Upload (MB)': (110, tk.CENTER, False), 'Signal': (70, tk.W, True), 'Exe Path': (300, tk.W, True)}
+        return {'#': (55, tk.CENTER, False), 'Status': (190, tk.CENTER, False), 'PID': (70, tk.CENTER, False), 'Protocol': (70, tk.CENTER, False), 'Local Port': (85, tk.CENTER, False), 'Remote Port': (85, tk.CENTER, False), 'Direction': (85, tk.CENTER, False), 'Process Name': (150, tk.W, True), 'Remote IP': (125, tk.CENTER, True), 'Remote Host': (190, tk.W, True), 'Download (MB)': (110, tk.CENTER, False), 'Upload (MB)': (110, tk.CENTER, False), 'Signal': (70, tk.W, True), 'Exe Path': (300, tk.W, True)}
 
     def _setup_search(self, bar, variable, render):
         variable.trace_add('write', lambda *_: render())
@@ -456,6 +492,8 @@ class FirewallMonitorApp(
         tk.Label(bar, text='Search:').pack(side=tk.RIGHT, before=first_action)
 
     def setup_monitor_tab(self):
+        self.capture_coverage = tk.Label(self.tab_monitor, text='Capture: waiting for an adapter; one adapter at a time.', anchor=tk.W)
+        self.capture_coverage.pack(fill=tk.X, padx=8)
         bar = tk.Frame(self.tab_monitor, pady=8)
         bar.pack(fill=tk.X)
         self._button(bar, 'Add Rule', self.add_monitor_rule, '#2196F3',
@@ -481,13 +519,15 @@ class FirewallMonitorApp(
         self._button(bar, 'Import Rules', self.import_rules)
         self._button(bar, 'Windows Firewall', self.open_windows_firewall)
         self._setup_search(bar, self.rule_search_var, self.render_rules)
-        status_width = max(155, tkfont.nametofont('TkDefaultFont').measure('Blocked (in) (Global)') + 28)
+        status_width = max(155, tkfont.nametofont('TkDefaultFont').measure('Blocked (out) (Global)') + 28)
         self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'Status': (status_width, tk.CENTER, False), 'Application & Global Rules': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Remote Port': (100, tk.CENTER, False), 'Local Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
         self.rules_tree.bind('<Double-1>', lambda e: self.rule_details_from_event(e))
         self.rules_tree.bind('<Delete>', self._on_rules_delete, add='+')
         self.rules_tree.bind('<KP_Delete>', self._on_rules_delete, add='+')
 
     def setup_alerts_tab(self):
+        self.alert_loss_label = tk.Label(self.tab_alerts, text='', anchor=tk.W)
+        self.alert_loss_label.pack(fill=tk.X, padx=8)
         bar = tk.Frame(self.tab_alerts, pady=8)
         bar.pack(fill=tk.X)
         tk.Label(bar, text='Port watches are context signals, not proof of malicious activity.').pack(side=tk.LEFT, padx=5)
@@ -498,7 +538,7 @@ class FirewallMonitorApp(
     def setup_status_bar(self):
         bar = tk.Frame(self.root, pady=4, padx=10)
         bar.pack(fill=tk.X, side=tk.BOTTOM)
-        specs = (('status_state', '● Monitoring', 15), ('status_firewall', 'Firewall: Protected', 25), ('status_connections', 'Connections: 0', 17), ('status_rules', 'Rules: 0', 12), ('status_capture', 'Capture: 0 KB/s • 0 pkt/s', 30), ('status_traffic', 'Total: 0.00 MB Down • 0.00 MB Up', None))
+        specs = (('status_state', 'Starting', 15), ('status_firewall', 'Firewall: Initializing...', 25), ('status_connections', 'Connections: 0', 17), ('status_rules', 'Rules: 0', 12), ('status_capture', 'Capture: 0 KB/s • 0 pkt/s', 30), ('status_traffic', 'Total: 0.00 MB Down • 0.00 MB Up', None))
         for attr, text, width in specs:
             kwargs = {'text': text, 'anchor': tk.W}
             if width:
@@ -514,9 +554,14 @@ class FirewallMonitorApp(
     def _start_background_initialization(self):
         if self.closed or self.startup_running or self.startup_complete:
             return
+        if not hasattr(self, 'native_jobs'):
+            self._start_native_worker()
         self.startup_running = True
         self.root.after_idle(self._update_startup_status)
-        threading.Thread(target=self._background_initialization_worker, daemon=True, name='FirewallStartup').start()
+        if hasattr(self, 'native_jobs'):
+            self._queue_native_job('Initialize firewall', self._background_initialization_worker)
+        else:
+            threading.Thread(target=self._background_initialization_worker, daemon=True, name='FirewallStartup').start()
 
     def _update_startup_status(self):
         if self.closed or not hasattr(self, 'status_firewall'):
@@ -554,6 +599,20 @@ class FirewallMonitorApp(
                 return
             if item[0] == 'dns':
                 continue
+            if item[0] == 'shutdown_complete':
+                self._finish_shutdown(item[1])
+                continue
+            if item[0] == 'reset_complete':
+                self._finish_reset_defaults(item[1])
+                continue
+            if item[0] == 'message':
+                if not self.closed:
+                    getattr(messagebox, item[1])(item[2], item[3], parent=self.root)
+                continue
+            if item[0] == 'rules_changed':
+                if not self.closed:
+                    self.rules_changed()
+                continue
             if item[0] == 'update_check':
                 self._finish_update_check(item[1])
                 continue
@@ -564,7 +623,7 @@ class FirewallMonitorApp(
                     continue
                 if ok:
                     self.startup_complete = True
-                    self.save_settings()
+                    self._save_settings_with_feedback()
                     if self.closed:
                         continue
                     self.refresh_rules(force=True)
@@ -581,11 +640,20 @@ class FirewallMonitorApp(
                     messagebox.showerror('Windows Firewall Setup Failed', f'Could not initialize/restore PyFirewall rules.\n\n{error}', parent=self.root)
                 continue
             if item[0] == 'rules':
-                _, generation, blocked, allowed, blocks, allows = item
-                self._finish_rule_refresh(generation, blocked, allowed, blocks, allows)
+                self._finish_rule_refresh(*item[1:])
+            elif item[0] == 'save_error':
+                if not self.closed:
+                    messagebox.showerror('Settings Not Saved',
+                                         'Changes are active for this run but could not be saved for the next launch.\n'
+                                         + item[1] + '\nRetry Apply Settings or the rule decision to save again.', parent=self.root)
+            elif item[0] == 'close_dialog':
+                try:
+                    item[1].destroy()
+                except tk.TclError:
+                    pass
             elif item[0] == 'rules_error':
                 generation, error = (item[1], item[2])
-                if generation == self.rules_generation:
+                if generation == self.rules_generation and not self.closed:
                     self.rules_loading = False
                     self.rules_tree.delete(*self.rules_tree.get_children())
                     self.rules_tree.insert('', tk.END, values=('Error', 'Firewall rule refresh failed', '', '', '', error), tags=('blocked',))
@@ -626,11 +694,20 @@ class FirewallMonitorApp(
             self.status_firewall.config(text='Firewall: Rules active; Auto-Block unavailable')
         else:
             self.status_state.config(text='Monitoring', fg='#4CAF50')
-            self.status_firewall.config(text='Firewall: Protected')
+            drift = sum(state != 'Verified' for state in getattr(self, 'rule_enforcement', {}).values())
+            self.status_firewall.config(text=f'Firewall: {drift} rule(s) unverified' if drift else 'Firewall: Managed rules active')
         self.status_connections.config(text=f'Connections: {connections:,}')
         self.status_rules.config(text=f'Rules: {rules:,}')
         speed = f'{self.capture_rate / (1024 * 1024):.2f} MB/s' if self.capture_rate >= 1024 * 1024 else f'{self.capture_rate / 1024:.1f} KB/s'
         self.status_capture.config(text=f'Capture: {speed} • {self.capture_pps:.0f} pkt/s')
+        if hasattr(self, 'capture_coverage'):
+            self.capture_coverage.config(text='Capture adapter: ' + (self.capture_interface or 'unavailable')
+                                         + ' | One adapter at a time; other adapters and VPNs may be unmonitored.'
+                                         + (f' | Working: {self.native_operation_label}' if getattr(self, 'native_operation_label', None) else ''))
+        if getattr(self, 'settings_save_error', None):
+            self.status_firewall.config(text='Firewall: Changes not saved')
+        if hasattr(self, 'alert_loss_label'):
+            self.alert_loss_label.config(text=f'Alerts dropped: {self.dropped_alerts:,} | Rate observations not tracked at capacity: {self.untracked_rate_events:,}')
         self.status_traffic.config(text=f'Total: {mb(down)} Down • {mb(up)} Up')
 
     def update_loop(self):
@@ -643,6 +720,8 @@ class FirewallMonitorApp(
                 except queue.Empty:
                     break
                 if command == 'show':
+                    self.show_from_tray()
+                elif command == 'tray_unavailable':
                     self.show_from_tray()
                 elif command == 'settings':
                     self.show_settings_from_tray()
@@ -681,8 +760,16 @@ class FirewallMonitorApp(
             return
         try:
             self._capture_layout()
-            self.tray_hidden = True
+            self._visibility_generation = getattr(self, '_visibility_generation', 0) + 1
+            tray = self.tray
+            if tray is None or (tray._ready.is_set() and not tray.available):
+                self.on_closing()
+                return
+            if not tray.available:
+                self.root.iconify()
+                return
             self.root.withdraw()
+            self.tray_hidden = True
         except tk.TclError:
             pass
 
@@ -690,16 +777,43 @@ class FirewallMonitorApp(
         if self.closed:
             return
         try:
+            state = self.root.state()
+            maximized = state == 'zoomed' or (state in {'iconic', 'withdrawn'} and self.window_maximized)
+            if state in {'iconic', 'withdrawn'}:
+                self.root.deiconify()
+                self.root.state('zoomed' if maximized else 'normal')
             self.tray_hidden = False
-            self.root.deiconify()
-            try:
-                self.root.state('normal')
-            except tk.TclError:
-                pass
+            self._visibility_generation = getattr(self, '_visibility_generation', 0) + 1
+            generation = self._visibility_generation
             self.root.lift()
-            self.root.focus_force()
+            self.root.after_idle(lambda: self._foreground_main_window(generation))
         except tk.TclError:
             pass
+
+    def _foreground_main_window(self, generation):
+        """Run once on Tk's thread after mapping; Windows may refuse activation."""
+        if self.closed or self.tray_hidden or generation != self._visibility_generation:
+            return
+        try:
+            if self.root.state() not in {'normal', 'zoomed'}:
+                return
+            target = self.root.grab_current() or self.root
+            dialog = self.auto_prompt_dialog
+            if target is self.root and dialog is not None and self.keep_notification_foreground:
+                if dialog.winfo_exists():
+                    target = dialog
+            target.lift()
+            user32 = ctypes.windll.user32
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+            hwnd = user32.GetAncestor(target.winfo_id(), 2)  # GA_ROOT: Tk's wrapper HWND.
+            self.foreground_activation_succeeded = bool(hwnd and user32.SetForegroundWindow(hwnd))
+            if self.foreground_activation_succeeded:
+                target.focus_set()
+        except (tk.TclError, OSError) as exc:
+            log_internal_error('window_activation', exc)
 
     def show_settings_from_tray(self):
         if self.closed:
@@ -718,36 +832,57 @@ class FirewallMonitorApp(
         with self.lock:
             self.closed = True
             self.sniffing = False
+        self._invalidate_auto_prompts(close_dialog=True)
         self._stop_instance_activation_listener()
-        shutdown_errors = []
+        if hasattr(self, 'native_jobs'):
+            self.native_shutdown_requested = True
+            self.status_state.config(text='Closing: restoring firewall...', fg='#ff9800')
+            self.shutdown_poll_id = self.root.after(50, self._poll_shutdown)
+        else:
+            self._shutdown_worker()
+            self.drain_ui_queue()
+
+    def _poll_shutdown(self):
+        pending = getattr(self, 'shutdown_poll_id', None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+            self.shutdown_poll_id = None
+        self.drain_ui_queue()
+        if not getattr(self, 'shutdown_finished', False):
+            self.shutdown_poll_id = self.root.after(50, self._poll_shutdown)
+
+    def _shutdown_worker(self):
+        errors = []
         try:
             self.release_auto_holds()
         except Exception as exc:
             log_internal_error('shutdown_auto_holds', exc)
-            shutdown_errors.append(f'Temporary block cleanup: {exc}')
+            errors.append(f'Temporary block cleanup: {exc}')
         try:
             with self.firewall_lock:
                 with self.lock:
-                    profile_modified = self.firewall_profile_modified
-                if profile_modified:
+                    modified = self.firewall_profile_modified
+                if modified:
                     self._restore_firewall_profile_state_locked()
         except Exception as exc:
             log_internal_error('shutdown_profile_restoration', exc)
-            shutdown_errors.append(f'Firewall profile restoration: {error_details(exc)}')
-        if shutdown_errors:
-            messagebox.showerror('Firewall Cleanup Failed', '\n'.join(shutdown_errors) + '\nAny unrestored profile backup is retained for recovery on the next launch.', parent=self.root)
+            errors.append(f'Firewall profile restoration: {error_details(exc)}')
+        if self.save_settings() is False:
+            errors.append('Closing with unsaved changes. The previous saved policy remains on disk.\n'
+                          + (getattr(self, 'settings_save_error', None) or 'Could not write the saved configuration.'))
+        self.ui_queue.put(('shutdown_complete', errors))
+
+    def _finish_shutdown(self, errors):
+        self.shutdown_finished = True
+        if errors:
+            messagebox.showerror('Shutdown Incomplete', '\n'.join(errors)
+                                 + '\nAny unrestored profile backup is retained for the next launch.', parent=self.root)
+        self.dns_stop_event.set()
         try:
-            self.save_settings()
+            if self.tray is not None:
+                self.tray.stop()
+                self.tray.wait(0.5)
         finally:
-            try:
-                self.dns_stop_event.set()
-            except Exception:
-                pass
-            try:
-                if self.tray is not None:
-                    self.tray.stop()
-            except Exception:
-                pass
             try:
                 self.root.destroy()
             except tk.TclError:

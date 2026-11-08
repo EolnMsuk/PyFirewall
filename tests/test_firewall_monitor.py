@@ -9,49 +9,10 @@ import threading
 import types
 import unittest
 from contextlib import ExitStack
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from support import App, NS, patch_dependencies
-
-
-def app():
-    a = App.__new__(App)
-    a.lock = threading.RLock()
-    a.firewall_lock = threading.RLock()
-    a.closed = a.is_paused = False
-    a.dark_mode = NS['DEFAULT_DARK_MODE']
-    a.check_updates_on_startup = NS['DEFAULT_CHECK_UPDATES_ON_STARTUP']
-    a.check_updates_on_startup_var = Mock()
-    a.update_check_running = a.update_check_manual = False
-    a.update_dialog = None
-    a.log_alerts_only = a.auto_block_enabled = True
-    a.keep_notification_foreground = True
-    a.keep_notification_foreground_var = Mock()
-    a.column_widths = {}
-    a.window_size = None
-    a.window_maximized = False
-    a.alert_connections = {}
-    a.auto_prompt_generation = 0
-    a.auto_prompt_keys = set()
-    a.auto_prompt_dialog = a.auto_prompt_key = None
-    a.auto_prompt_active = False
-    a.prompt_queue = queue.Queue()
-    a.allowed_apps = set()
-    a.blocked_paths = {}
-    a.global_blocks = {}
-    a.global_allows = {}
-    a.global_ports = {}
-    a.global_port_traffic = {}
-    a.connection_rates = {}
-    a.upload_alerted = set()
-    a.queue_alert = Mock()
-    a.save_settings = Mock(return_value=True)
-    a.rules_changed = Mock()
-    a.root = Mock()
-    a._show_rule_result = Mock()
-    a.capture_error = None
-    a.capture_healthy = False
-    return a
+from fixtures import app
 
 
 class GlobalTargetDiagnosticsTests(unittest.TestCase):
@@ -225,6 +186,29 @@ function Test-ProfileParameters {
 
 
 class RuleTests(unittest.TestCase):
+    def test_legacy_domain_import_uses_validated_fallback_addresses_offline(self):
+        from fixtures import MemoryFirewall
+        for addresses, succeeds in [(['192.0.2.7'], True), (['not-an-address'], False), (['Any'], False)]:
+            with self.subTest(addresses=addresses), tempfile.TemporaryDirectory() as directory:
+                a = app()
+                native = MemoryFirewall(a)
+                path = pathlib.Path(directory) / 'rules.json'
+                path.write_text(json.dumps({'version': 7, 'global_ip_blocks': [
+                    dict(target='offline.test', addresses=addresses, direction='Both')]}))
+                with patch_dependencies(filedialog=types.SimpleNamespace(askopenfilename=lambda **kw: str(path))), \
+                     patch.object(socket, 'getaddrinfo', side_effect=socket.gaierror('offline')), \
+                     patch.object(NS['messagebox'], 'askyesno', return_value=True), \
+                     patch.object(NS['messagebox'], 'showerror') as error:
+                    a.import_rules()
+                if succeeds:
+                    error.assert_not_called()
+                    self.assertEqual(a.global_blocks['offline.test']['addresses'], ('192.0.2.7',))
+                    self.assertEqual(len([r for r in native.rules.values() if r.get('is_global')]), 2)
+                else:
+                    a._create_rule_batch.assert_not_called()
+                    a.delete_rule_names.assert_not_called()
+                    self.assertEqual(error.call_args.args[0], 'Import Failed')
+
     def test_partial_delete_rolls_back(self):
         a = app()
         previous = [{'name': 'in'}, {'name': 'out'}]
@@ -294,7 +278,7 @@ class RuleTests(unittest.TestCase):
         a.auto_prompt_dialog = Mock()
         a.prompt_queue.put(('pending', other))
         a.get_firewall_rules = Mock(return_value=[])
-        a._replace_rule_records = Mock()
+        a._replace_rule_records = Mock(side_effect=lambda *args, **kwargs: kwargs['commit']())
         self.assertTrue(a.allow_executable(exe, quiet=True))
         self.assertIn(other, a.auto_prompt_keys)
         self.assertEqual(a.prompt_queue.qsize(), 1)
@@ -745,6 +729,141 @@ function Get-NetFirewallAddressFilter {
 
 
 class DecisionTests(unittest.TestCase):
+    def test_failed_decision_save_retries_only_persistence_for_its_own_commit(self):
+        for choice in ('allow', 'both'):
+            with self.subTest(choice=choice):
+                a = app()
+                path = r'C:\demo.exe'
+                key = NS['normalize_path'](path)
+                a.auto_prompt_key = key
+                a.auto_prompt_keys.add(key)
+                a.auto_prompt_connections[key] = (0, {'exe': path, 'dst_ip': '192.0.2.1'})
+                a.get_firewall_rules = Mock(return_value=[])
+                a.add_app_rules = Mock()
+                a.delete_rule_names = Mock()
+                a.save_settings.side_effect = [False, False, True]
+                result = queue.Queue()
+                for expected in (False, False, True):
+                    with patch_dependencies(log_internal_error=Mock()):
+                        a._auto_decision_worker(0, key, path, 'demo', choice, result)
+                    self.assertEqual(result.get_nowait(), expected)
+                    self.assertEqual(a.auto_prompt_key, key)
+                self.assertEqual(a.save_settings.call_count, 3)
+                self.assertEqual(a.get_firewall_rules.call_count, 1)
+                self.assertEqual(a.add_app_rules.call_count, choice == 'both')
+
+    def test_cancellation_during_native_change_rolls_back_before_publishing(self):
+        a = app()
+        path = r'C:\demo.exe'
+        norm = NS['normalize_path'](path)
+        a.auto_prompt_key = norm
+        original = {'name': 'PyFirewall_AutoHold_demo_In', 'path': path, 'normalized_path': norm,
+                    'is_hold': True, 'is_global': False, 'action': 'Block', 'direction': 'Inbound'}
+        state = {original['name']: original}
+        a.get_firewall_rules = lambda: list(state.values())
+        a.delete_rule_names = lambda names: [state.pop(name, None) for name in list(names)]
+        a._restore_app_rule_records = lambda records: state.update((r['name'], r) for r in records)
+        def create(*args, **kwargs):
+            base = a.app_rule_base('demo', path)
+            state[base + '_In'] = dict(original, name=base + '_In', is_hold=False)
+            state[base + '_Out'] = dict(original, name=base + '_Out', is_hold=False, direction='Outbound')
+            a.auto_block_enabled = False
+            a._invalidate_auto_prompts(close_dialog=True)
+        a.add_app_rules = create
+        result = queue.Queue()
+        a._auto_decision_worker(0, norm, path, 'demo', 'both', result)
+        self.assertFalse(result.get_nowait())
+        self.assertEqual(state, {original['name']: original})
+        self.assertFalse(a.blocked_paths or a.allowed_apps)
+        a.save_settings.assert_not_called()
+
+    def test_disable_reenable_cleans_retired_holds_without_deleting_new_owners(self):
+        a = app()
+        path = NS['normalize_path'](r'C:\demo.exe')
+        a.auto_hold_owners = {path: 0}
+        a.auto_prompt_keys = {path}
+        a.auto_prompt_key = path
+        a.auto_prompt_dialog = Mock()
+        a.auto_block_enabled = False
+        a._invalidate_auto_prompts(close_dialog=True)
+        a.auto_block_enabled = True
+        a.remove_auto_holds_locked = Mock()
+        self.assertTrue(a._release_auto_holds_for_generation(0))
+        a.remove_auto_holds_locked.assert_called_once_with(path)
+        self.assertFalse(a.auto_hold_owners or a.auto_hold_cleanup or a.auto_prompt_keys)
+        a.auto_hold_owners = {path: 0}
+        a.auto_hold_cleanup = {path: 0}
+        a.auto_prompt_generation = 1
+        a.active_connections = {}
+        a.install_auto_hold = Mock(return_value=True)
+        a.start_auto_block('demo', path, 1, '192.0.2.1', '', 'Outgoing', 'key', 'upload', '')
+        self.assertEqual(a.auto_hold_owners[path], 1)
+        a.remove_auto_holds_locked.reset_mock()
+        a._release_auto_holds_for_generation(0)
+        a.remove_auto_holds_locked.assert_not_called()
+        self.assertEqual(a.auto_hold_owners[path], 1)
+        self.assertIn(path, a.auto_prompt_keys)
+        self.assertEqual(a.prompt_queue.qsize(), 1)
+
+    def test_cancelled_hold_cleanup_failure_stays_recoverable(self):
+        a = app()
+        path = NS['normalize_path'](r'C:\demo.exe')
+        a.auto_hold_owners = {path: 0}
+        a._invalidate_auto_prompts(close_dialog=True)
+        a.remove_auto_holds_locked = Mock(side_effect=RuntimeError('denied'))
+        with patch_dependencies(log_internal_error=Mock()):
+            self.assertFalse(a._release_auto_holds_for_generation(0))
+        self.assertEqual(a.auto_hold_cleanup[path], 0)
+        a.remove_auto_holds_locked.side_effect = None
+        self.assertTrue(a._release_auto_holds_for_generation(1))
+        self.assertFalse(a.auto_hold_cleanup or a.auto_hold_owners)
+
+    def test_queued_and_open_decisions_recheck_new_scoped_policy_on_firewall_boundary(self):
+        for queued in (True, False):
+            with self.subTest(queued=queued):
+                a = app()
+                path = NS['normalize_path'](r'C:\demo.exe')
+                endpoint = {'exe': path, 'dst_ip': '192.0.2.1', 'lport': 51000, 'dport': 443,
+                            'protocol': 'TCP', 'direction': 'Outgoing'}
+                a.auto_prompt_connections[path] = (0, endpoint)
+                a.auto_hold_owners[path] = 0
+                a.auto_prompt_keys.add(path)
+                a.auto_prompt_key = path
+                a.prompt_queue.put((0, path, 'demo', path, 1, '192.0.2.1', '', 'Outgoing', 'upload', ''))
+                a.global_ports = a._parse_port_rules([dict(scope='remote', port=443, action='Allow', exe=path,
+                                                          direction='Outbound')])
+                a.remove_auto_holds_locked = Mock()
+                a.show_auto_prompt = Mock()
+                a.allow_executable = Mock()
+                if queued:
+                    a.drain_prompt_queue()
+                    a.show_auto_prompt.assert_not_called()
+                else:
+                    a.auto_prompt_dialog = Mock()
+                    result = queue.Queue()
+                    worker = threading.Thread(target=a._auto_decision_worker,
+                        args=(0, path, path, 'demo', 'allow', result))
+                    dialog = a.auto_prompt_dialog
+                    worker.start()
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                    self.assertIsNone(result.get_nowait())
+                    dialog.destroy.assert_not_called()
+                    self.assertEqual(a.ui_queue.get_nowait(), ('close_dialog', dialog))
+                a.allow_executable.assert_not_called()
+                a.remove_auto_holds_locked.assert_called_once_with(path)
+
+    def test_current_generation_cannot_commit_while_paused_or_protection_disabled(self):
+        for attribute in ('is_paused', 'log_alerts_only', 'auto_block_enabled'):
+            a = app()
+            a.auto_prompt_key = 'key'
+            setattr(a, attribute, attribute == 'is_paused')
+            a.allow_executable = Mock()
+            result = queue.Queue()
+            a._auto_decision_worker(0, 'key', r'C:\demo.exe', 'demo', 'allow', result)
+            self.assertIsNone(result.get_nowait())
+            a.allow_executable.assert_not_called()
+
     def test_worker_preserves_direction_and_never_updates_ui(self):
         for choice, direction in [('allow', None), ('in', 'in'), ('both', 'both')]:
             with self.subTest(choice=choice):
@@ -756,10 +875,10 @@ class DecisionTests(unittest.TestCase):
                 a._auto_decision_worker(0, 'key', 'C:/client.exe', 'client', choice, result)
                 self.assertTrue(result.get_nowait())
                 if direction is None:
-                    a.allow_executable.assert_called_once_with('C:/client.exe', refresh=False, quiet=True, update_ui=False)
+                    a.allow_executable.assert_called_once_with('C:/client.exe', refresh=False, quiet=True, update_ui=False, decision_guard=ANY)
                 else:
                     a.block_executable.assert_called_once_with('C:/client.exe', 'client', direction,
-                                                              refresh=False, quiet=True, update_ui=False)
+                                                              refresh=False, quiet=True, update_ui=False, decision_guard=ANY)
 
     def test_stale_or_closed_decision_does_not_mutate(self):
         for generation, closed, key in [(1, False, 'key'), (0, True, 'key'), (0, False, 'other')]:
@@ -777,7 +896,7 @@ class DecisionTests(unittest.TestCase):
         a.auto_prompt_key = exe
         a.auto_prompt_dialog = Mock()
         a.get_firewall_rules = Mock(return_value=[])
-        a._replace_rule_records = Mock()
+        a._replace_rule_records = Mock(side_effect=lambda *args, **kwargs: kwargs['commit']())
         self.assertTrue(a.allow_executable(exe, quiet=True, update_ui=False))
         self.assertIn(exe, a.allowed_apps)
         a.auto_prompt_dialog.destroy.assert_not_called()
@@ -1080,6 +1199,27 @@ class CaptureTests(unittest.TestCase):
 
 
 class DuplicateRuleTests(unittest.TestCase):
+    def test_duplicate_single_rules_retry_failed_persistence_without_native_mutation(self):
+        for kind in ('block', 'allow', 'global'):
+            with self.subTest(kind=kind):
+                a = app()
+                path = r'C:\demo.exe'
+                if kind == 'block':
+                    a.blocked_paths[NS['normalize_path'](path)] = {'path': path, 'in': True, 'out': True}
+                    retry = lambda: a.block_executable(path, quiet=True)
+                elif kind == 'allow':
+                    a.allowed_apps.add(NS['normalize_path'](path))
+                    retry = lambda: a.allow_executable(path, quiet=True)
+                else:
+                    a.global_blocks['192.0.2.1'] = {'direction': 'Both', 'addresses': ('192.0.2.1',)}
+                    retry = lambda: a.add_global_rule('192.0.2.1', False, quiet=True)
+                a.settings_save_error = 'previous save failed'
+                a.get_firewall_rules = Mock()
+                a.run_ps = Mock()
+                self.assertTrue(retry())
+                a.save_settings.assert_called_once()
+                a.get_firewall_rules.assert_not_called()
+                a.run_ps.assert_not_called()
     def setUp(self):
         self.a = app()
         self.a.get_firewall_rules = Mock(side_effect=AssertionError('Unexpected firewall query'))
@@ -1406,8 +1546,8 @@ class ContextGlobalRuleTests(unittest.TestCase):
             menu.add_separator.side_effect = lambda: entries.append('|')
             a._context_menu = Mock(return_value=menu)
             show()
-            self.assertEqual(entries[4:9], ['|', 'Allow Connection', 'Block Incoming',
-                                            'Block Connection', '|'])
+            self.assertEqual(entries[4:12], ['|', 'Allow Connection', 'Allow Outgoing', 'Allow Incoming',
+                                             'Block Incoming', 'Block Outgoing', 'Block Connection', '|'])
             self.assertLess(entries.index('Remove App Rule'), entries.index('Open file location'))
             self.assertEqual(entries[-4:], ['Copy IP Domain', 'Copy details', 'Connection details', 'Open file location'])
             self.assertFalse(any('Port (Global)' in label for label in entries))

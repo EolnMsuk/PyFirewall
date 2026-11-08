@@ -479,14 +479,20 @@ function Get-PyFirewallProcesses {
 
 function Stop-PyFirewallProcesses {
     $processes = @(Get-PyFirewallProcesses)
-    foreach ($process in $processes) {
-        $running = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
-        if (-not $running) { continue }
-        Write-Info "Closing PyFirewall (PID $($process.ProcessId)) before uninstalling components."
-        Stop-Process -InputObject $running -Force -ErrorAction Stop
-        if (-not $running.WaitForExit(10000)) {
-            throw 'PyFirewall did not close. Uninstall was stopped before removing components.'
+    if ($processes.Count) {
+        if (-not (Ask-YesNo 'Exit PyFirewall using tray Close in every Windows session, then continue. Has it exited?')) {
+            throw 'Uninstall cancelled. PyFirewall was left running.'
         }
+        if (@(Get-PyFirewallProcesses).Count) {
+            throw 'PyFirewall is still running. No process was stopped and no components were removed.'
+        }
+    }
+    $script:PolicyMutex = New-Object Threading.Mutex($false, 'Global\PyFirewall_NativePolicy_v1')
+    $script:PolicyMutexOwned = $false
+    try { $script:PolicyMutexOwned = $script:PolicyMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $script:PolicyMutexOwned = $true }
+    if (-not $script:PolicyMutexOwned) {
+        throw 'Another PyFirewall copy or setup owns Windows Firewall, possibly in another session. No components were removed.'
     }
 }
 
@@ -820,5 +826,7 @@ catch {
 }
 
 finally {
+    if ($script:PolicyMutexOwned) { $script:PolicyMutex.ReleaseMutex() }
+    if ($script:PolicyMutex) { $script:PolicyMutex.Dispose() }
     Write-RetainedSummary
 }

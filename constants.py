@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "3.1"
+__version__ = "3.4"
 LATEST_RELEASE_API = 'https://api.github.com/repos/EolnMsuk/PyFirewall/releases/latest'
 LATEST_RELEASE_PAGE = 'https://github.com/EolnMsuk/PyFirewall/releases/latest'
 DEFAULT_CHECK_UPDATES_ON_STARTUP = True
@@ -31,6 +31,7 @@ CRYPTO_WALLETS = (
     ('BNB (BNB Smart Chain Network)', '0x314148b89744663ad9F1Fb8EA6862a62abf2fC93'),
 )
 AUTO_HOLD_PREFIX = 'PyFirewall_AutoHold_'
+NATIVE_OWNER_MUTEX = 'Global\\PyFirewall_NativePolicy_v1'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'firewall_config.json')
 ICON_FILE = os.path.join(SCRIPT_DIR, 'PyFirewall.ico')
@@ -43,4 +44,6 @@ FIREWALL_COMMAND_TIMEOUT = 30.0
 TRAFFIC_MAX_IP_ENTRIES = 8192
 TRAFFIC_MAX_PROC_IP_ENTRIES = 16384
 TRAFFIC_PRUNE_INTERVAL = 30.0
+ALERT_BACKLOG_LIMIT = 1024
+RATE_MAX_KEYS = 8192
 INTERNAL_ERROR_LOG_FILE = os.path.join(SCRIPT_DIR, 'firewall_monitor_errors.log')

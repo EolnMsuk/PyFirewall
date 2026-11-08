@@ -198,7 +198,7 @@ class ToolTip:
 def add_tooltip(widget, text, delay=400):
     widget._tooltip = ToolTip(widget, text, delay)
     return widget._tooltip
-BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for a domain/IP, a local/remote port, or both.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
+BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for domains/IPs, local/remote ports, or all traffic.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
 
 
 class WidgetsMixin:
@@ -211,8 +211,12 @@ class WidgetsMixin:
         self.dark_mode = bool(dark)
         self.colors = {'bg': '#181818' if dark else '#f2f2f2', 'frame': '#1e1e1e' if dark else '#f2f2f2', 'sub': '#242424' if dark else '#ffffff', 'fg': '#e8e8e8' if dark else '#333333', 'muted': '#a8a8a8' if dark else '#757575', 'entry': '#252526' if dark else '#ffffff', 'select': '#3b78c8' if dark else '#0078D7', 'head': '#2d2d30' if dark else '#e0e0e0', 'even': '#252526' if dark else '#f9f9f9', 'odd': '#1e1e1e' if dark else '#ffffff', 'blocked': '#801a1a' if dark else '#ffcaca', 'blocked_in': '#7a4b11' if dark else '#ffcc99', 'global_block': '#593570' if dark else '#dfcdeb', 'global_allow': '#17665f' if dark else '#c3eee7', 'global_block_in': '#71630f' if dark else '#fff1a8', 'allowed': '#294f31' if dark else '#cce8d2', 'watch': '#5b4a16' if dark else '#fff3cd'}
         self.colors['global_rule_button'] = '#704090'
+        self.colors.update(global_block_out=self.colors['global_block'],
+                           global_allow_out=self.colors['global_allow'], global_allow_in=self.colors['global_block_in'])
         self.colors['wallet'] = '#bdbdbd' if dark else '#555555'
         self.colors['text'] = self.colors['fg'] if dark else '#202020'
+        self.colors['menu_edit'] = self.colors['muted'] if dark else '#333333'
+        self.colors['crypto_heading'] = '#cccccc' if dark else '#202020'
         self.root.configure(bg=self.colors['bg'])
         style = ttk.Style(self.root)
         try:
@@ -291,13 +295,13 @@ class WidgetsMixin:
             tree = getattr(self, name, None)
             if tree is None:
                 continue
-            for tag in ('even', 'odd', 'blocked', 'blocked_in', 'global_block', 'global_block_in', 'global_allow', 'allowed', 'watch'):
+            for tag in ('even', 'odd', 'blocked', 'blocked_in', 'global_block', 'global_block_in', 'global_block_out', 'global_allow', 'global_allow_in', 'global_allow_out', 'allowed', 'watch'):
                 tree.tag_configure(tag, background=self.colors[tag], foreground=self.colors['fg'] if self.dark_mode else '#000000')
 
     def on_theme_changed(self):
         with self.lock:
             self.dark_mode = bool(self.dark_mode_var.get())
-        self.save_settings()
+        self._save_settings_with_feedback()
         self.apply_theme()
 
     # Button colors and hover feedback
@@ -452,7 +456,8 @@ class WidgetsMixin:
             width, anchor, stretch = widths.get(column, (180, tk.W, True))
             tree._default_column_widths[column] = width
             width = getattr(self, 'column_widths', {}).get(order_key, {}).get(column, width)
-            tree.heading(column, text=column)
+            label = {'Download (MB)': 'Download', 'Upload (MB)': 'Upload'}.get(column, column) if order_key in {'monitor', 'rules'} else column
+            tree.heading(column, text=label)
             tree.column(column, width=width, anchor=anchor, stretch=False)
         order = self._normalized_column_order(order_key, columns)
         tree['displaycolumns'] = tuple(c for c in order if c not in self.hidden_columns.get(order_key, [])) or (order[0],)
@@ -483,6 +488,8 @@ class WidgetsMixin:
         tree.bind('<Destroy>', cancel_layout, add='+')
         tree.bind('<Control-a>', self.select_all_rows)
         tree.bind('<Control-A>', self.select_all_rows)
+        tree.bind('<Control-c>', self.copy_selected_rows)
+        tree.bind('<Control-C>', self.copy_selected_rows)
         self._bind_tree_headers(tree)
         return tree
 
@@ -570,7 +577,7 @@ class WidgetsMixin:
         with self.lock:
             self.hidden_columns[key] = [c for c in order if c not in selected]
         tree['displaycolumns'] = tuple(selected)
-        self.save_settings()
+        self._save_settings_with_feedback()
         return True
 
     def _hide_column(self, tree, column):
@@ -588,7 +595,7 @@ class WidgetsMixin:
         for column in self._normalized_column_order(tree._column_order_key, tree['columns']):
             variable = tk.BooleanVar(value=column in tree['displaycolumns'])
             variables[column] = variable
-            ttk.Checkbutton(body, text=column, variable=variable).pack(anchor=tk.W, pady=2)
+            ttk.Checkbutton(body, text=tree.heading(column, 'text'), variable=variable).pack(anchor=tk.W, pady=2)
         def apply():
             if self._set_visible_columns(tree, [c for c, v in variables.items() if v.get()]):
                 dialog.destroy()
@@ -675,7 +682,7 @@ class WidgetsMixin:
                 self.column_orders[tree._column_order_key] = [
                     c if c in hidden else next(visible_order)
                     for c in self.column_orders[tree._column_order_key]]
-            self.save_settings()
+            self._save_settings_with_feedback()
         return 'break'
 
     # Mouse selection
@@ -782,6 +789,8 @@ class WidgetsMixin:
             # Keep the same semantic hues with stronger contrast on white menus.
             rule_colors.update(allowed='#26732b', blocked='#c62828', blocked_in='#995900',
                                global_allow='#17665f', global_block='#7040a0', global_block_in='#776400')
+        rule_colors.update(global_allow_out=rule_colors['global_allow'], global_allow_in=rule_colors['global_block_in'],
+                           global_block_out=rule_colors['global_block'])
         color = rule_colors.get(rule_tag, self.colors['fg'])
         options = {}
         tags = getattr(menu, 'rule_tags', None)

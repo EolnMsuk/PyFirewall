@@ -287,6 +287,9 @@ function Register-PyFirewallScheduledTask([string]$PythonExe, [string]$ScriptPat
     if (-not (Test-Path -LiteralPath $PythonExe)) {
         throw "Python executable for Scheduled Task was not found: $PythonExe"
     }
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        throw 'The login task already exists. Use the ownership-checked migration path instead of overwriting it.'
+    }
 
     $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $action = New-ScheduledTaskAction -Execute $PythonExe -Argument ('"{0}"' -f $ScriptPath) -WorkingDirectory $WorkingDirectory
@@ -297,6 +300,7 @@ function Register-PyFirewallScheduledTask([string]$PythonExe, [string]$ScriptPat
         -StartWhenAvailable `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -MultipleInstances IgnoreNew
 
     Register-ScheduledTask `
@@ -312,6 +316,9 @@ function Register-PyFirewallScheduledTask([string]$PythonExe, [string]$ScriptPat
     if (-not $registered) {
         throw 'The PyFirewall scheduled task could not be verified after registration.'
     }
+    if ($registered.Settings.ExecutionTimeLimit -ne 'PT0S') {
+        throw 'The PyFirewall task did not retain unlimited execution (PT0S).'
+    }
     Write-OK "Scheduled Task configured: $taskName (At Login, Highest privileges)."
 }
 
@@ -321,27 +328,56 @@ function Confirm-PyFirewallClosed {
         $_.CommandLine -match '(?i)firewall_monitor\.py(?:"|\s|$)'
     })
     if ($processes.Count -eq 0) { return $true }
-    if (-not (Read-YesNo 'PyFirewall is running. Close it and continue installation?' $false)) {
+    if (-not (Read-YesNo 'Exit PyFirewall using its tray Close command in every Windows session, then choose Yes to continue. Has it exited?' $false)) {
         Write-Host 'Installation cancelled. PyFirewall was left running.' -ForegroundColor Yellow
         return $false
     }
-    foreach ($process in $processes) {
-        $running = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
-        if (-not $running) { continue }
-        Stop-Process -InputObject $running -Force -ErrorAction Stop
-        if (-not $running.WaitForExit(10000)) {
-            throw 'PyFirewall did not close. Installation cannot continue.'
-        }
+    $remaining = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $_.Name -match '^(?i:pythonw?|py)(?:\d+(?:\.\d+)*)?\.exe$' -and
+        $_.CommandLine -match '(?i)firewall_monitor\.py(?:"|\s|$)'
+    })
+    if ($remaining.Count) {
+        throw 'PyFirewall is still running. No process was stopped. Exit it normally and retry setup.'
     }
     Write-OK 'PyFirewall closed.'
     return $true
+}
+
+function Enter-PyFirewallMaintenance {
+    $script:PolicyMutex = New-Object Threading.Mutex($false, 'Global\PyFirewall_NativePolicy_v1')
+    $script:PolicyMutexOwned = $false
+    try { $script:PolicyMutexOwned = $script:PolicyMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $script:PolicyMutexOwned = $true }
+    if (-not $script:PolicyMutexOwned) {
+        throw 'PyFirewall or another setup owns Windows Firewall, possibly in another session. Exit it before setup.'
+    }
+}
+
+function Test-PyFirewallTaskOwner($Task, [string]$PythonExe, [string]$ScriptPath, [string]$WorkingDirectory) {
+    $actions = @($Task.Actions)
+    if ($actions.Count -ne 1) { return $false }
+    $action = $actions[0]
+    return ($action.Execute -ieq $PythonExe -and $action.WorkingDirectory -ieq $WorkingDirectory -and
+            $action.Arguments -in @($ScriptPath, ('"{0}"' -f $ScriptPath)))
 }
 
 function Configure-PyFirewallStartup([string]$PythonExe, [string]$ScriptPath, [string]$WorkingDirectory) {
     $taskName = 'PyFirewall - At Login'
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) {
-        Write-OK 'PyFirewall startup-at-login task already exists; keeping it.'
+        if (-not (Test-PyFirewallTaskOwner $existing $PythonExe $ScriptPath $WorkingDirectory)) {
+            Write-WarnMsg 'The existing login task does not match this installation. It was left unchanged.'
+            return
+        }
+        if ($existing.Settings.ExecutionTimeLimit -ne 'PT0S') {
+            $existing.Settings.ExecutionTimeLimit = 'PT0S'
+            Set-ScheduledTask -TaskName $existing.TaskName -TaskPath $existing.TaskPath -Settings $existing.Settings -ErrorAction Stop | Out-Null
+        }
+        $verified = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        if ($verified.Settings.ExecutionTimeLimit -ne 'PT0S') {
+            throw 'The existing PyFirewall login task could not be migrated to unlimited execution (PT0S).'
+        }
+        Write-OK 'Existing PyFirewall login task kept with unlimited execution; startup choice and other settings preserved.'
     } elseif (Read-YesNo 'Would you like PyFirewall to start automatically when you log in to Windows?') {
         Register-PyFirewallScheduledTask $PythonExe $ScriptPath $WorkingDirectory
     } else {
@@ -351,7 +387,6 @@ function Configure-PyFirewallStartup([string]$PythonExe, [string]$ScriptPath, [s
 
 try {
     Assert-Admin
-    if (-not (Confirm-PyFirewallClosed)) { exit 1223 }
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
 
     Write-Step 'Checking Windows'
@@ -382,6 +417,13 @@ try {
 
     Write-Step 'Checking Python and Tkinter'
     $python = Get-UsablePython
+    # Complete read-only OS, source and interpreter discovery before asking for
+    # an orderly exit. Never force-stop an app and strand its recovery journal.
+    if (-not (Confirm-PyFirewallClosed)) { exit 1223 }
+    Enter-PyFirewallMaintenance
+    if (Test-Path -LiteralPath (Join-Path $ScriptDir 'firewall_profile_backup.json')) {
+        throw 'A firewall profile recovery journal remains. Launch this copy of PyFirewall and exit it normally to recover before retrying setup. The journal was preserved.'
+    }
     if ($python) {
         Write-OK "Python $($python.Version) found at $($python.Path)."
     } else {
@@ -509,7 +551,7 @@ try {
         Write-OK 'Existing application, global IP/domain, global port rules, and column preferences will be preserved.'
         Write-Host 'Use Settings > Manage Settings & Updates > Reset to Defaults to reset rules, column layout, and enable startup update checks.' -ForegroundColor Gray
     } else {
-        Write-OK 'Clean install: Live Monitor and Active use the same default columns, including Status.'
+        Write-OK 'Clean install: Live Monitor shows captured connections and their managed-rule status.'
         Write-Host 'Startup update checks are ON by default; disable them in Settings > Manage Settings & Updates if desired.' -ForegroundColor Gray
     }
 
@@ -517,6 +559,10 @@ try {
     Configure-PyFirewallStartup $pythonw $AppScript $ScriptDir
 
     Write-Step 'Launching PyFirewall'
+    if ($script:PolicyMutexOwned) {
+        $script:PolicyMutex.ReleaseMutex()
+        $script:PolicyMutexOwned = $false
+    }
     Write-Host 'Launching firewall_monitor.py...' -ForegroundColor White
     $process = Start-Process -FilePath $pythonw -ArgumentList @('"' + $AppScript + '"') -WorkingDirectory $ScriptDir -WindowStyle Hidden -PassThru -ErrorAction Stop
     Write-OK "PyFirewall launch requested (PID $($process.Id)). The application will request Administrator privileges if needed."
@@ -528,5 +574,7 @@ catch {
     exit 1
 }
 finally {
+    if ($script:PolicyMutexOwned) { $script:PolicyMutex.ReleaseMutex() }
+    if ($script:PolicyMutex) { $script:PolicyMutex.Dispose() }
     Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
