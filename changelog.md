@@ -1,3 +1,9 @@
+# 3.5
+
+* **Label Changes:** Modifed some labels / system tray elements.
+* **Documentation:** Updated documentation / simplified changelog for previous masssive update.
+* **EOL:** This project is complete / EOL, I plan to only issue bug fixes if issues are reported.
+
 # 3.4
 
 * **Smoother Updates & Shutdown:** Setup and uninstall now close the app cleanly instead of abruptly stopping background processes, and recovery journals are preserved.
