@@ -2,7 +2,7 @@
 
 **Personal Firewall & Network Monitor for Windows**
 
-PyFirewall is a Windows desktop application for monitoring / filtering network connections by creating Windows Defender Firewall rules. **It monitors and configures both incoming and outgoing connections** using process and IP/domain specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
+PyFirewall is a python based Windows desktop application for monitoring / filtering network connections by creating Windows Defender Firewall rules. **It monitors and configures both incoming and outgoing connections** using process / IP / domain / port / protocl specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
 
 ---
 
@@ -15,19 +15,19 @@ PyFirewall is a Windows desktop application for monitoring / filtering network c
 * Live network connection monitoring
 * Auto-Block Protection
 * Per-application allow/block rules
-* Global IP/domain & local/remote port specific rules
+* Global IP/domain/port/protocol specific rules
 * Managed Rules
+* IPv4 and IPv6 address, CIDR, and IP range support
 * Connection-rate and upload-threshold alerts
 * CSV export for connection data
 * JSON export/import for managed firewall rules
 * System-tray support and automatic start at Windows login
 * Dark/light theme support
-* GitHub release update checks
+* Startup update checks and a manual **Check for Updates** button
 
 ## Requirements
 
 * Windows 10 or Windows 11
-* Administrator privileges
 * [Python 3.8+](https://www.python.org/downloads/windows/) w/ Tkinter / psutil / scapy
 * [Npcap](https://npcap.com/)
 
@@ -95,7 +95,7 @@ PyFirewall stores its configuration in `firewall_config.json` beside the applica
 
 ## Troubleshooting
 
-If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator". For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For unexpected errors, check `firewall_monitor_errors.log` beside the application for diagnostic details.
+If double clicking the shortcut on the desktop does not open PyFirewall, right click the shortcut and select "Run as Administrator". For missing live traffic, verify that Npcap is installed and running and that PyFirewall is running with Administrator privileges. For unexpected errors, check `firewall_monitor_errors.log` for diagnostic details.
 
 ## Uninstallation
 
