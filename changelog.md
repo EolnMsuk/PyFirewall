@@ -1,3 +1,23 @@
+# 4.2
+
+* **Upgrade Required:** Before installing 4.2, remove all previous **PyFirewall-managed** Windows Firewall rules, close PyFirewall normally and wait for cleanup to finish, then delete the existing `firewall_config.json`. Keep recovery journals and installation ownership files. Backups using older rule formats cannot be imported; create fresh rules in 4.2.
+* **Auto-Block Tooltips:** Keep every action tooltip above its owner, including live foreground-preference changes, without taking focus or changing prompt behavior.
+* **Text Undo:** Ctrl+Z undoes typing, paste, cut, and deletion separately in each search, global-rule, settings, and legacy target input. Saves and firewall/application actions are outside text history.
+* **Remote Port Rules:** Add and Edit Global Rule place the TCP/UDP selector beside **Remote Port / Protocol:**. Global rules always leave local ports unrestricted, and Managed Rules no longer has a Local Port column.
+* **Global Rule Groups:** Manual creation, editing, import, and Auto-Block connection decisions combine targets only when executable scope, the complete normalized remote-port selection, protocol, action, and direction match. Explicit multi-port rules remain supported. Native rules retain separate executable, protocol, and direction instances, with verified replacement and rollback.
+* **Connection Groups:** Live Monitor and Alerts require consecutive arrivals with the same process name, PID, executable, remote IP, protocol, remote port, and direction. Equal local ports remain visible; differing ports show a dash. Show/Copy Connection Details lists every distinct member local port. Alerts now includes Local Port, Download, and Upload columns. Raw flows, arrival boundaries, every alert event, and unique-flow traffic totals are retained.
+* **Connection Rule Editing:** Visibly prefill the observed IP and associated domain. Connection edits and removals isolate their targets, splitting IPv4/IPv6 subnets, ranges, and all-address coverage while preserving the remainder. Multiple selections apply together after review, preserving shared-IP selections and distinct connection filters. Managed Rules still edits/removes whole groups. Verified transactions preserve rollback, stale-edit checks, and save retries; split traffic history is retained once.
+* **Clean Rule Format:** Global rules use one representation for executable lists, targets with their own saved resolved addresses, and remote-port lists. Configuration uses schema marker `4.1`, and managed-rule backups use format version 8. Old and mixed formats are rejected before native rule changes; legacy rule conversion and native-name compatibility paths were removed.
+
+# 4.0
+
+* **Rule Editors & Search:** Shortened Add/Edit Global Rule help and added right-click Copy/Paste to domain/IP and port inputs and the Live Monitor, Managed Rules, and Alerts search fields.
+* **Settings Links:** Reordered support links to PyFirewall GitHub, Donate via Venmo, then Donate via Crypto.
+* **Capture Status:** Moved capture-adapter status to Settings above Monitor & Filter, with wrapping for long adapter and operation names.
+* **Alerts Layout:** Removed the dropped-alert/untracked-rate capacity-status line while retaining the internal counters and capacity protections.
+* **Connection Decisions:** Added Block Connection and Allow Connection to Auto-Block Protection. These create rules for the executable, exact remote IP, remote port, and captured protocol in both directions, leaving the local port unrestricted. Verification, save retries, and owned temporary-hold cleanup complete before the prompt closes.
+* **Retained Hostnames:** Kept learned names visible for retained connections and alerts, backfilled quiet records after DNS discovery, and avoided repeat lookups for records already displaying a name.
+
 # 3.5
 
 * **Label Changes:** Modifed some labels / system tray elements.

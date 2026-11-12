@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "3.5"
+__version__ = "4.2"
 LATEST_RELEASE_API = 'https://api.github.com/repos/EolnMsuk/PyFirewall/releases/latest'
 LATEST_RELEASE_PAGE = 'https://github.com/EolnMsuk/PyFirewall/releases/latest'
 DEFAULT_CHECK_UPDATES_ON_STARTUP = True
@@ -14,8 +14,6 @@ DEFAULT_DARK_MODE = True
 DEFAULT_MAX_CONNECTIONS_ALERTS = 250
 CREATE_NO_WINDOW = 134217728
 WATCH_PORTS = {23: 'Telnet', 445: 'SMB', 3389: 'RDP', 4444: 'Common remote-control port', 5555: 'Android Debug Bridge', 5900: 'VNC', 6667: 'IRC'}
-GLOBAL_BLOCK_PREFIX = 'PyFirewall_GlobalIP_'
-GLOBAL_ALLOW_PREFIX = 'PyFirewall_GlobalIPAllow_'
 GLOBAL_PORT_PREFIX = 'PyFirewall_GlobalPort_'
 GLOBAL_PURPLE = '#ad79cf'
 GLOBAL_TEAL = '#35b6ac'

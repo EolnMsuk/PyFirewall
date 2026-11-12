@@ -3,9 +3,133 @@
 import ctypes
 import tkinter as tk
 from ctypes import wintypes
-from tkinter import font as tkfont, messagebox, ttk
+from tkinter import font as tkfont, messagebox, simpledialog, ttk
 
 from constants import GLOBAL_PURPLE, GLOBAL_TEAL, GLOBAL_YELLOW
+
+
+class EntryUndo:
+    """Bounded text history around Entry class edits, never application actions.
+
+    Two private bindtags bracket Tk's normal editing bindings. Variable writes
+    outside an edit reset history, including programmatic prefill/load/reset.
+    """
+
+    def __init__(self, entry):
+        self.entry = entry
+        self.history = []
+        self.before = None
+        self.restoring = False
+        self.tags = ('PyFirewallUndoBefore_' + str(entry), 'PyFirewallUndoAfter_' + str(entry))
+        self.bindings = []
+        tags = list(entry.bindtags())
+        index = tags.index(entry.winfo_class()) + 1
+        tags.insert(index, self.tags[1])
+        entry.bindtags((self.tags[0], *tags))
+        self.sequences = ('<KeyPress>', '<<Paste>>', '<<Cut>>', '<<Clear>>', '<<PasteSelection>>')
+        for sequence in self.sequences:
+            self.bindings.append(entry.bind_class(self.tags[0], sequence, self._begin_key if sequence == '<KeyPress>' else self._begin))
+            self.bindings.append(entry.bind_class(self.tags[1], sequence, self._finish))
+        for sequence in ('<Control-z>', '<Control-Z>', '<<Undo>>'):
+            self.bindings.append(entry.bind_class(self.tags[0], sequence, self.undo))
+        variable = str(entry.cget('textvariable'))
+        self.variable = None
+        if not variable:
+            self.variable = tk.StringVar(master=entry, value=entry.get())
+            entry.configure(textvariable=self.variable)
+            variable = str(self.variable)
+        self.variable_name = variable
+        self.trace_command = entry.register(self._written)
+        entry.tk.call('trace', 'add', 'variable', variable, 'write', self.trace_command)
+        entry.bind('<Destroy>', self._destroy, add='+')
+
+    def _editable(self):
+        return str(self.entry.cget('state')) not in {'disabled', 'readonly'}
+
+    def _snapshot(self):
+        entry = self.entry
+        selection = (entry.index(tk.SEL_FIRST), entry.index(tk.SEL_LAST)) if entry.selection_present() else None
+        return entry.get(), entry.index(tk.INSERT), selection
+
+    def _begin_key(self, event):
+        # Clipboard shortcuts generate virtual events which own their edit.
+        control_edit = event.state & 4 and event.keysym.lower() in {'h', 'd', 'k', 'u', 'w', 't'}
+        if (event.char and event.char.isprintable()
+                or event.keysym in {'BackSpace', 'Delete', 'KP_Delete'} or control_edit):
+            self._begin()
+
+    def _begin(self, _event=None):
+        self.before = self._snapshot() if self._editable() else None
+
+    def _finish(self, _event=None):
+        before, self.before = self.before, None
+        if before is not None and before[0] != self.entry.get():
+            self.history.append(before)
+            del self.history[:-100]
+
+    def edit(self, operation):
+        """Make a custom menu's delete+insert one text edit."""
+        self._begin()
+        try:
+            return operation()
+        finally:
+            self._finish()
+
+    def reset(self):
+        self.history.clear()
+        self.before = None
+
+    def _written(self, *_):
+        if self.before is None and not self.restoring:
+            self.reset()
+
+    def undo(self, _event=None):
+        self.before = None
+        if self._editable() and self.history:
+            text, insertion, selection = self.history.pop()
+            self.restoring = True
+            try:
+                self.entry.tk.globalsetvar(self.variable_name, text)
+                self.entry.icursor(insertion)
+                self.entry.selection_clear()
+                if selection:
+                    self.entry.selection_range(*selection)
+            finally:
+                self.restoring = False
+        return 'break'
+
+    def _destroy(self, event):
+        if event.widget != self.entry:
+            return
+        for tag in self.tags:
+            for sequence in (*self.sequences, '<Control-z>', '<Control-Z>', '<<Undo>>'):
+                self.entry.unbind_class(tag, sequence)
+        for binding in self.bindings:
+            self.entry._root().deletecommand(binding)
+        self.entry.tk.call('trace', 'remove', 'variable', self.variable_name, 'write', self.trace_command)
+        self.entry.deletecommand(self.trace_command)
+        self.reset()
+
+
+def enable_entry_undo(entry):
+    if not hasattr(entry, '_text_undo'):
+        entry._text_undo = EntryUndo(entry)
+    return entry._text_undo
+
+
+def ask_undo_string(title, prompt, parent):
+    class StringPrompt(simpledialog.Dialog):
+        def body(self, master):
+            tk.Label(master, text=prompt, justify=tk.LEFT).grid(row=0, sticky='w')
+            self.entry = ttk.Entry(master, width=36)
+            self.entry.grid(row=1, sticky='ew')
+            enable_entry_undo(self.entry)
+            return self.entry
+
+        def apply(self):
+            self.result = self.entry.get()
+
+    return StringPrompt(parent, title).result
 
 
 def screen_work_area(widget, x, y):
@@ -113,7 +237,7 @@ class ThemedContextMenu:
         self.root_bindings.clear()
         if self.window.winfo_exists():
             self.window.destroy()
-            if event is None and self.previous_focus is not None:
+            if (event is None or event.type == tk.EventType.KeyPress) and self.previous_focus is not None:
                 try:
                     self.previous_focus.focus_set()
                 except tk.TclError:
@@ -149,10 +273,39 @@ class ToolTip:
         self.widget, self.text, self.delay = (widget, text, delay)
         self.tip = None
         self.after_id = None
+        self.owner = widget.winfo_toplevel()
+        if not hasattr(self.owner, '_owned_tooltips'):
+            self.owner._owned_tooltips = set()
+            owner = self.owner
+            def dismiss(event):
+                if event.widget is owner:
+                    for tooltip in tuple(owner._owned_tooltips):
+                        tooltip._leave()
+            self.owner.bind('<Unmap>', dismiss, add='+')
+            self.owner.bind('<Destroy>', dismiss, add='+')
+        self.owner._owned_tooltips.add(self)
         widget.bind('<Enter>', self._enter, add='+')
         widget.bind('<Leave>', self._leave, add='+')
         widget.bind('<ButtonPress>', self._leave, add='+')
-        widget.bind('<Destroy>', self._leave, add='+')
+        widget.bind('<Destroy>', self._destroy, add='+')
+
+    def _destroy(self, event):
+        if event.widget is self.widget:
+            self._leave()
+            self.owner._owned_tooltips.discard(self)
+
+    def _sync_stacking(self, event=None):
+        if event is not None and event.widget is not self.tip:
+            return
+        if self.tip is not None:
+            try:
+                if not self.owner.winfo_viewable():
+                    self._leave()
+                    return
+                self.tip.attributes('-topmost', self.owner.attributes('-topmost'))
+                self.tip.lift(self.owner)
+            except tk.TclError:
+                self._leave()
 
     def _enter(self, _=None):
         self._cancel()
@@ -176,33 +329,99 @@ class ToolTip:
             self.after_id = None
 
     def _show(self):
+        self._cancel()
         text = self.text() if callable(self.text) else self.text
         if self.tip or not str(text or '').strip():
             return
         try:
+            if not self.widget.winfo_viewable() or not self.owner.winfo_viewable():
+                return
             # Use the pointer's current position after the hover delay, even if
             # it moved within a wide control. Leave a little room for the cursor.
             x, y = self.widget.winfo_pointerxy()
             x += 12
             y += 18
-            tip = tk.Toplevel(self.widget)
+            tip = tk.Toplevel(self.owner)
+            self.tip = tip
+            tip.withdraw()
+            tip.transient(self.owner)
             tip.wm_overrideredirect(True)
+            # Windows tooltips never participate in focus or prompt grabs.
+            if tip.tk.call('tk', 'windowingsystem') == 'win32':
+                tip.attributes('-disabled', True)
             tip.wm_geometry(f'+{x}+{y}')
             tip.configure(bg='#2b2b2b')
             tk.Label(tip, text=str(text), justify=tk.LEFT, bg='#2b2b2b', fg='#f0f0f0', relief='solid', borderwidth=1, font=('Segoe UI', 9), padx=8, pady=4).pack(ipadx=1)
-            self.tip = tip
+            tip.bind('<Map>', self._sync_stacking, add='+')
+            tip.deiconify()
+            self._sync_stacking()
         except tk.TclError:
-            pass
+            self._leave()
 
 
 def add_tooltip(widget, text, delay=400):
     widget._tooltip = ToolTip(widget, text, delay)
     return widget._tooltip
-BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for domains/IPs, local/remote ports, or all traffic.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
+
+
+def sync_tooltip_stacking(owner):
+    for tooltip in tuple(getattr(owner, '_owned_tooltips', ())):
+        tooltip._sync_stacking()
+BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for domains/IPs, remote ports and TCP/UDP, optionally limited to executables.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
 
 
 class WidgetsMixin:
     """Methods composed into FirewallMonitorApp; state is owned by that application."""
+
+    def _bind_entry_menu(self, entry):
+        """Keep the clicked entry's edit range while the themed popup owns focus."""
+        undo = enable_entry_undo(entry)
+        def show(event):
+            try:
+                insertion = entry.index(tk.INSERT)
+                selection = ((entry.index(tk.SEL_FIRST), entry.index(tk.SEL_LAST))
+                             if entry.selection_present() else None)
+                selected = entry.get()[selection[0]:selection[1]] if selection else None
+                entry.focus_set()
+            except tk.TclError:
+                return 'break'
+
+            def restore():
+                entry.focus_set()
+                entry.icursor(insertion)
+                entry.selection_clear()
+                if selection:
+                    entry.selection_range(*selection)
+
+            def copy():
+                try:
+                    restore()
+                    if selected is not None:
+                        entry.clipboard_clear()
+                        entry.clipboard_append(selected)
+                except tk.TclError:
+                    pass
+
+            def paste():
+                try:
+                    text = entry.clipboard_get()
+                    restore()
+                    def replace():
+                        if selection:
+                            entry.delete(*selection)
+                        entry.insert(selection[0] if selection else insertion, text)
+                    undo.edit(replace)
+                except tk.TclError:
+                    pass
+
+            menu = self._context_menu()
+            menu.add_command(label='Copy', command=copy)
+            menu.add_command(label='Paste', command=paste)
+            menu.post(event.x_root, event.y_root)
+            menu.previous_focus = entry
+            return 'break'
+
+        entry.bind('<Button-3>', show)
 
     # Theme application
 

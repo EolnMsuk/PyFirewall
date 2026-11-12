@@ -1,12 +1,13 @@
 """Temporary protection, threshold decisions and Auto-Block prompts."""
 
 import queue
+import copy
 import threading
 import tkinter as tk
 from tkinter import messagebox
 
-from helpers import log_internal_error, normalize_path
-from widgets import add_tooltip
+from helpers import direction_name, log_internal_error, normalize_path
+from widgets import add_tooltip, sync_tooltip_stacking
 
 class AutoBlockMixin:
     """Methods composed into FirewallMonitorApp; state is owned by that application."""
@@ -124,12 +125,16 @@ class AutoBlockMixin:
         except tk.TclError:
             pass
 
-    def _cancel_app_prompt(self, norm):
+    def _cancel_app_prompt(self, norm, generation=None):
         dialog = None
         with self.lock:
+            if generation is not None and (generation != self.auto_prompt_generation
+                    or getattr(self, 'auto_hold_owners', {}).get(norm, generation) != generation):
+                return
             self.auto_prompt_keys.discard(norm)
             getattr(self, 'auto_prompt_connections', {}).pop(norm, None)
             getattr(self, 'auto_decision_saves', {}).pop(norm, None)
+            getattr(self, 'auto_decision_errors', {}).pop(norm, None)
             getattr(self, 'auto_hold_owners', {}).pop(norm, None)
             getattr(self, 'auto_hold_cleanup', {}).pop(norm, None)
             pending = []
@@ -162,6 +167,7 @@ class AutoBlockMixin:
             self.auto_prompt_keys.clear()
             getattr(self, 'auto_prompt_connections', {}).clear()
             getattr(self, 'auto_decision_saves', {}).clear()
+            getattr(self, 'auto_decision_errors', {}).clear()
             if close_dialog:
                 dialog = self.auto_prompt_dialog
                 self.auto_prompt_dialog = None
@@ -234,9 +240,16 @@ class AutoBlockMixin:
                 self.auto_prompt_keys.discard(prompt_key)
             return
 
-    def _release_auto_hold_locked(self, path, generation):
+    def _release_auto_hold_locked(self, path, generation, resolve_prompt=False):
         """Retire only this owner; a newer hold may already occupy the path."""
         with self.lock:
+            pending = getattr(self, 'auto_decision_saves', {}).get(path)
+            if (not resolve_prompt and pending and pending['kind'] == 'port'
+                    and pending['generation'] == generation == self.auto_prompt_generation
+                    and self.auto_prompt_key == path):
+                # A failed active connection decision retains its hold until
+                # verification/save/cleanup is retried through that prompt.
+                return False
             owner = getattr(self, 'auto_hold_owners', {}).get(path)
             if owner is not None and owner != generation:
                 if getattr(self, 'auto_hold_cleanup', {}).get(path) == generation:
@@ -250,7 +263,7 @@ class AutoBlockMixin:
                     self.auto_hold_cleanup = {}
                 self.auto_hold_cleanup[path] = generation
             log_internal_error('release_auto_hold', exc)
-            self.queue_alert('High', path, '', '', f'Could not release cancelled temporary block: {exc}')
+            self.queue_alert('High', path, '', '', f'Could not release temporary block: {exc}')
             return False
         with self.lock:
             if getattr(self, 'auto_hold_owners', {}).get(path) == generation:
@@ -314,47 +327,130 @@ class AutoBlockMixin:
         """Apply a decision without calling Tk; the prompt owns result delivery."""
         ok = None
         norm = normalize_path(exe)
+        with self.lock:
+            if generation == self.auto_prompt_generation and self.auto_prompt_key == key:
+                getattr(self, 'auto_decision_errors', {}).pop(key, None)
         def own_commit():
             pending = getattr(self, 'auto_decision_saves', {}).get(key)
-            return (pending is not None and pending[0] == generation
-                    and pending[2] == getattr(self, 'app_policy_versions', {}).get(norm))
+            if pending is None or pending['generation'] != generation:
+                return False
+            if pending['kind'] == 'app':
+                return pending['version'] == getattr(self, 'app_policy_versions', {}).get(norm)
+            policy_key = pending['policy_key']
+            policy = getattr(self, 'global_ports', {}).get(policy_key)
+            return policy is pending['policy'] and policy == pending['snapshot']
         def committed(version):
             if not hasattr(self, 'auto_decision_saves'):
                 self.auto_decision_saves = {}
-            self.auto_decision_saves[key] = (generation, choice, version)
+            self.auto_decision_saves[key] = {'generation': generation, 'choice': choice,
+                                           'kind': 'app', 'version': version, 'saved': False}
+        def committed_port(policy_key, policy):
+            if not hasattr(self, 'auto_decision_saves'):
+                self.auto_decision_saves = {}
+            # The actual committed object plus detached contents distinguish a
+            # replacement (even an identical one) and an in-place policy edit.
+            self.auto_decision_saves[key] = {'generation': generation, 'choice': choice,
+                                           'kind': 'port', 'policy_key': policy_key,
+                                           'policy': policy, 'snapshot': copy.deepcopy(policy), 'saved': False}
+        def other_policy(row):
+            pending = self.auto_decision_saves[key]
+            if pending['kind'] != 'port':
+                return False
+            status = self.get_rule_status(row.get('exe'))
+            direction = direction_name(row.get('direction'))
+            app_applies = (status in {'allowed', 'blocked_both'}
+                           or status == 'blocked_in' and direction == 'Inbound'
+                           or status == 'blocked_out' and direction == 'Outbound')
+            return (any(rule_key != pending['policy_key'] and self._policy_verified('port', rule_key)
+                        for rule_key in self.matching_global_port_rules(row))
+                    or self.is_globally_blocked(row.get('dst_ip', ''), row.get('domain', ''), row.get('direction'))
+                    or self.is_globally_allowed(row.get('dst_ip', ''), row.get('domain', ''), row.get('direction'))
+                    or app_applies)
         def current_decision():
             with self.lock:
                 saved = getattr(self, 'auto_prompt_connections', {}).get(key)
+                pending = getattr(self, 'auto_decision_saves', {}).get(key)
+                owned = own_commit()
                 return (generation == self.auto_prompt_generation and self.auto_prompt_key == key
                         and self._auto_block_active()
-                        and (own_commit() or not (saved and saved[0] == generation and self._threshold_has_rule(saved[1]))))
+                        and (owned and not (saved and saved[0] == generation and other_policy(saved[1]))
+                             or pending is None and not (saved and saved[0] == generation and self._threshold_has_rule(saved[1]))))
         current_decision.committed = committed
+        current_decision.committed_port = committed_port
+        def verify_owned_connection():
+            pending = self.auto_decision_saves[key]
+            if pending['kind'] != 'port':
+                return
+            # Ownership survives a refresh failure or native drift. It does not
+            # authorize releasing the hold until the owned filters verify again.
+            expected = self._port_firewall_rules({pending['policy_key']: pending['snapshot']})
+            try:
+                state = self._enforcement_for(expected, self.get_firewall_rules())
+            except Exception as exc:
+                raise RuntimeError(f'Could not verify the connection decision. Temporary protection remains; retry the same choice. {exc}') from exc
+            with self.lock:
+                if not own_commit():
+                    raise RuntimeError('The connection decision changed during verification. Retry to resolve the prompt safely.')
+                if hasattr(self, 'rule_enforcement'):
+                    self.rule_enforcement['port', pending['policy_key']] = state
+            if state != 'Verified':
+                raise RuntimeError('The connection decision is not verified in Windows Firewall. Temporary protection remains. Restore the rule in Managed Rules or retry the same choice after verification succeeds.')
+        def finish_commit():
+            pending = self.auto_decision_saves[key]
+            verify_owned_connection()
+            if not pending['saved']:
+                self._persist_rule_changes()
+                pending['saved'] = True
+            with self.lock:
+                if (self.closed or generation != self.auto_prompt_generation or self.auto_prompt_key != key):
+                    return None
+                if not current_decision():
+                    raise RuntimeError('The connection decision or protection state changed while saving. Retry the same choice to resolve the prompt safely.')
+            if pending['kind'] == 'port':
+                verify_owned_connection()
+                return self._release_auto_hold_locked(norm, generation, resolve_prompt=True)
+            return True
         try:
             with self.firewall_lock:
                 with self.lock:
                     current = (not self.closed and generation == self.auto_prompt_generation
                                and self.auto_prompt_key == key and self._auto_block_active())
-                    saved = getattr(self, 'auto_prompt_connections', {}).get(key)
-                if current and own_commit() and self.auto_decision_saves[key][1] == choice:
-                    # This operation already committed. Retry durability only;
-                    # its own cached policy must not supersede its failed save.
-                    self._persist_rule_changes()
-                    ok = True
-                    return
-                if current and not own_commit() and saved and saved[0] == generation and self._threshold_has_rule(saved[1]):
-                    if self._release_auto_hold_locked(normalize_path(exe), generation):
-                        self._cancel_app_prompt(key)
+                    saved = copy.deepcopy(getattr(self, 'auto_prompt_connections', {}).get(key))
+                    pending = getattr(self, 'auto_decision_saves', {}).get(key)
+                    owned = own_commit()
+                    superseded = bool(pending and not owned)
+                    if owned and saved and saved[0] == generation:
+                        superseded = other_policy(saved[1])
+                if current and (superseded or not owned and saved and saved[0] == generation and self._threshold_has_rule(saved[1])):
+                    if self._release_auto_hold_locked(normalize_path(exe), generation, resolve_prompt=True):
+                        self._cancel_app_prompt(key, generation)
                     else:
                         ok = False
                     current = False
                 if current:
-                    if choice == 'allow':
+                    if owned:
+                        if pending['choice'] != choice:
+                            raise ValueError('A decision is already applied. Retry the same choice to finish saving it and releasing temporary protection.')
+                        ok = finish_commit()
+                    elif choice in {'allow_connection', 'block_connection'}:
+                        if not saved or saved[0] != generation:
+                            raise ValueError('The triggering connection is unavailable. Use an application decision or retry after a complete connection is captured.')
+                        self._apply_auto_connection_rule(saved[1], exe, choice == 'allow_connection', current_decision)
+                        ok = finish_commit()
+                    elif choice == 'allow':
                         ok = self.allow_executable(exe, refresh=False, quiet=True, update_ui=False, decision_guard=current_decision)
-                    else:
+                    elif choice in {'in', 'both'}:
                         ok = self.block_executable(exe, proc_name, 'in' if choice == 'in' else 'both',
                                                    refresh=False, quiet=True, update_ui=False, decision_guard=current_decision)
+                    else:
+                        raise ValueError('Unknown Auto-Block decision.')
         except Exception as exc:
             ok = False
+            with self.lock:
+                if generation == self.auto_prompt_generation and self.auto_prompt_key == key:
+                    if not hasattr(self, 'auto_decision_errors'):
+                        self.auto_decision_errors = {}
+                    self.auto_decision_errors[key] = str(exc)
             log_internal_error('auto_decision', exc)
             self.queue_alert('High', exe, '', '', f'Firewall decision failed: {exc}')
         finally:
@@ -382,7 +478,8 @@ class AutoBlockMixin:
         finished = False
         decision_buttons = []
         result_queue = queue.Queue(maxsize=1)
-        applying = tk.Label(body, text='', anchor=tk.W, bg=self.colors['frame'], fg=self.colors['fg'])
+        applying = tk.Label(body, text='', anchor=tk.W, justify=tk.LEFT, wraplength=470,
+                            bg=self.colors['frame'], fg=self.colors['fg'])
         applying.pack(fill=tk.X)
 
         def poll_decision():
@@ -399,14 +496,18 @@ class AutoBlockMixin:
                            and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key)
             if ok:
                 if current:
-                    self._cancel_app_prompt(key)
+                    self._cancel_app_prompt(key, generation)
             elif current and ok is False:
                 finished = False
                 for button in decision_buttons:
                     button.configure(state=tk.NORMAL)
-                pending_save = key in getattr(self, 'auto_decision_saves', {})
-                text = ('Decision applied but not saved. Retry the same choice to save it.' if pending_save
-                        else 'Could not apply decision. Please retry.')
+                pending_save = getattr(self, 'auto_decision_saves', {}).get(key)
+                error = getattr(self, 'auto_decision_errors', {}).get(key)
+                text = (error if error else
+                        'Decision saved, but temporary protection could not be released. Retry the same choice to finish.'
+                        if pending_save and pending_save['saved'] else
+                        'Decision applied but not saved. Retry the same choice to save it.' if pending_save else
+                        'Could not apply decision. Please retry.')
                 applying.configure(text=text)
                 messagebox.showerror('Firewall Update Failed',
                                      text + '\nReview Alerts for details.', parent=dialog)
@@ -446,10 +547,22 @@ class AutoBlockMixin:
             self._bind_button_hover(button)
             button.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
             add_tooltip(button, tip)
+        connection_buttons = tk.Frame(buttons, bg=self.colors['frame'])
+        connection_buttons.grid(row=1, column=0, columnspan=3, sticky='ew')
+        connection_buttons.grid_columnconfigure((0, 1), weight=1)
+        for column, (label, choice, bg) in enumerate((('Block Connection', 'block_connection', '#c62828'),
+                                                    ('Allow Connection', 'allow_connection', '#4CAF50'))):
+            button = tk.Button(connection_buttons, text=label, command=lambda value=choice: finish(value),
+                               bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat',
+                               font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
+            decision_buttons.append(button)
+            self._bind_button_hover(button)
+            button.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
+            add_tooltip(button, 'Apply only to this executable, exact remote IP, remote port and protocol, in both directions. The local port is unrestricted.')
         cancel = tk.Button(buttons, text='Cancel (Block)', command=lambda: finish('both'), bg=self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
         decision_buttons.append(cancel)
         self._bind_button_hover(cancel)
-        cancel.grid(row=1, column=0, columnspan=3, sticky='ew', padx=3, pady=(0, 0))
+        cancel.grid(row=2, column=0, columnspan=3, sticky='ew', padx=3, pady=(0, 0))
         add_tooltip(cancel, 'Dismiss the prompt and keep the executable blocked.')
         dialog.protocol('WM_DELETE_WINDOW', lambda: finish('both'))
         dialog.update_idletasks()
@@ -463,6 +576,7 @@ class AutoBlockMixin:
             try:
                 if dialog.winfo_exists():
                     dialog.attributes('-topmost', getattr(self, 'keep_notification_foreground', True))
+                    sync_tooltip_stacking(dialog)
             except tk.TclError:
                 pass
         dialog.after(250, release_topmost)

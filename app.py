@@ -38,8 +38,8 @@ class FirewallMonitorApp(
 ):
     """Owns shared application state; feature mixins use the same locks and queues."""
     MONITOR_COLUMNS = ('#', 'Process Name', 'Status', 'Direction', 'Remote IP', 'Remote Host', 'Protocol', 'Remote Port', 'Local Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'PID', 'Exe Path')
-    RULE_COLUMNS = ('Status', 'Application & Global Rules', 'Direction', 'Remote Port', 'Local Port', 'Protocol', 'Download (MB)', 'Upload (MB)', 'Program Path')
-    ALERT_COLUMNS = ('Time', 'Severity', 'Process', 'PID', 'Remote IP', 'Remote Host', 'Reason')
+    RULE_COLUMNS = ('Status', 'Application & Global Rules', 'Direction', 'Remote Port', 'Protocol', 'Download (MB)', 'Upload (MB)', 'Program Path')
+    ALERT_COLUMNS = ('Time', 'Severity', 'Process', 'PID', 'Remote IP', 'Remote Host', 'Reason', 'Local Port', 'Download (MB)', 'Upload (MB)')
     DEFAULT_COLUMN_ORDERS = {'monitor': MONITOR_COLUMNS, 'rules': RULE_COLUMNS, 'alerts': ALERT_COLUMNS}
 
 
@@ -78,6 +78,9 @@ class FirewallMonitorApp(
         self.update_dialog = None
         self.active_connections = {}
         self.next_connection_number = 1
+        self._capture_serial = 0
+        self._last_connection_group = None
+        self.connection_display_groups = {}
         self.connection_rates = {}
         self.selection_anchors = {}
         self.default_column_orders = self.DEFAULT_COLUMN_ORDERS
@@ -105,8 +108,6 @@ class FirewallMonitorApp(
         self.capture_rate = self.capture_pps = 0.0
         self.allowed_apps = set()
         self.blocked_paths = {}
-        self.global_blocks = {}
-        self.global_allows = {}
         self.global_ports = {}
         self.rule_enforcement = {}
         self.verified_blocked_paths = {}
@@ -118,6 +119,8 @@ class FirewallMonitorApp(
         self.pending_rules = []
         self.alerts = deque(maxlen=DEFAULT_MAX_CONNECTIONS_ALERTS)
         self.alert_connections = {}
+        self.alert_display_groups = {}
+        self._last_alert_group = None
         self.next_alert_id = 1
         self.auto_prompt_keys = set()
         self.auto_prompt_active = False
@@ -135,6 +138,8 @@ class FirewallMonitorApp(
         self.dns_cache_times = {}
         self.dns_observed_names = {}
         self.dns_pending = set()
+        self.dns_changed_ips = set()
+        self.dns_notification_pending = False
         self.dns_queue = queue.Queue(maxsize=DNS_MAX_PENDING)
         self.dns_stop_event = threading.Event()
         self.dns_workers = []
@@ -488,12 +493,12 @@ class FirewallMonitorApp(
         variable.trace_add('write', lambda *_: render())
         # Reserve the same right-hand space before laying out toolbar actions.
         first_action = bar.pack_slaves()[0]
-        ttk.Entry(bar, textvariable=variable, width=25).pack(side=tk.RIGHT, padx=5, before=first_action)
+        entry = ttk.Entry(bar, textvariable=variable, width=25)
+        self._bind_entry_menu(entry)
+        entry.pack(side=tk.RIGHT, padx=5, before=first_action)
         tk.Label(bar, text='Search:').pack(side=tk.RIGHT, before=first_action)
 
     def setup_monitor_tab(self):
-        self.capture_coverage = tk.Label(self.tab_monitor, text='Capture: waiting for an adapter; one adapter at a time.', anchor=tk.W)
-        self.capture_coverage.pack(fill=tk.X, padx=8)
         bar = tk.Frame(self.tab_monitor, pady=8)
         bar.pack(fill=tk.X)
         self._button(bar, 'Add Rule', self.add_monitor_rule, '#2196F3',
@@ -520,20 +525,18 @@ class FirewallMonitorApp(
         self._button(bar, 'Windows Firewall', self.open_windows_firewall)
         self._setup_search(bar, self.rule_search_var, self.render_rules)
         status_width = max(155, tkfont.nametofont('TkDefaultFont').measure('Blocked (out) (Global)') + 28)
-        self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'Status': (status_width, tk.CENTER, False), 'Application & Global Rules': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Remote Port': (100, tk.CENTER, False), 'Local Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
+        self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'Status': (status_width, tk.CENTER, False), 'Application & Global Rules': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Remote Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
         self.rules_tree.bind('<Double-1>', lambda e: self.rule_details_from_event(e))
         self.rules_tree.bind('<Delete>', self._on_rules_delete, add='+')
         self.rules_tree.bind('<KP_Delete>', self._on_rules_delete, add='+')
 
     def setup_alerts_tab(self):
-        self.alert_loss_label = tk.Label(self.tab_alerts, text='', anchor=tk.W)
-        self.alert_loss_label.pack(fill=tk.X, padx=8)
         bar = tk.Frame(self.tab_alerts, pady=8)
         bar.pack(fill=tk.X)
         tk.Label(bar, text='Port watches are context signals, not proof of malicious activity.').pack(side=tk.LEFT, padx=5)
         self._button(bar, 'Clear Alerts', self.clear_alerts)
         self._setup_search(bar, self.alert_search_var, self.render_alerts)
-        self.alerts_tree = self._make_tree(self.tab_alerts, self.ALERT_COLUMNS, {'Time': (85, tk.CENTER, False), 'Severity': (90, tk.CENTER, False), 'Process': (170, tk.W, True), 'PID': (70, tk.CENTER, False), 'Remote IP': (170, tk.W, True), 'Remote Host': (180, tk.W, True), 'Reason': (480, tk.W, True)}, 'alerts')
+        self.alerts_tree = self._make_tree(self.tab_alerts, self.ALERT_COLUMNS, {'Time': (85, tk.CENTER, False), 'Severity': (90, tk.CENTER, False), 'Process': (170, tk.W, True), 'PID': (70, tk.CENTER, False), 'Remote IP': (170, tk.W, True), 'Remote Host': (180, tk.W, True), 'Reason': (480, tk.W, True), 'Local Port': (95, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False)}, 'alerts')
 
     def setup_status_bar(self):
         bar = tk.Frame(self.root, pady=4, padx=10)
@@ -592,12 +595,19 @@ class FirewallMonitorApp(
         self.ui_queue.put(('startup_complete', ok, error))
 
     def drain_ui_queue(self):
+        dns_ips = set()
         while True:
             try:
                 item = self.ui_queue.get_nowait()
             except queue.Empty:
-                return
+                break
             if item[0] == 'dns':
+                if len(item) > 1:
+                    dns_ips.add(item[1])
+                with self.dns_lock:
+                    dns_ips.update(getattr(self, 'dns_changed_ips', ()))
+                    self.dns_changed_ips = set()
+                    self.dns_notification_pending = False
                 continue
             if item[0] == 'shutdown_complete':
                 self._finish_shutdown(item[1])
@@ -657,6 +667,12 @@ class FirewallMonitorApp(
                     self.rules_loading = False
                     self.rules_tree.delete(*self.rules_tree.get_children())
                     self.rules_tree.insert('', tk.END, values=('Error', 'Firewall rule refresh failed', '', '', '', error), tags=('blocked',))
+        if dns_ips and not self.closed:
+            live_changed, alerts_changed = self._refresh_retained_hosts(dns_ips)
+            if live_changed and hasattr(self, 'tree'):
+                self.render_monitor()
+            if alerts_changed and hasattr(self, 'alerts_tree'):
+                self.render_alerts()
 
     # Status and periodic updates
 
@@ -706,8 +722,6 @@ class FirewallMonitorApp(
                                          + (f' | Working: {self.native_operation_label}' if getattr(self, 'native_operation_label', None) else ''))
         if getattr(self, 'settings_save_error', None):
             self.status_firewall.config(text='Firewall: Changes not saved')
-        if hasattr(self, 'alert_loss_label'):
-            self.alert_loss_label.config(text=f'Alerts dropped: {self.dropped_alerts:,} | Rate observations not tracked at capacity: {self.untracked_rate_events:,}')
         self.status_traffic.config(text=f'Total: {mb(down)} Down • {mb(up)} Up')
 
     def update_loop(self):
@@ -739,6 +753,7 @@ class FirewallMonitorApp(
                 self.render_monitor()
                 self.render_rule_traffic()
                 self.render_rules()
+                self.render_alerts()
             self.update_status()
         except Exception as exc:
             log_internal_error('update_loop', exc)
@@ -748,7 +763,10 @@ class FirewallMonitorApp(
 
     def clear_list(self):
         with self.lock:
+            self._retain_alert_flow_totals_locked()
             self.active_connections.clear()
+            self._last_connection_group = None
+            self.connection_display_groups = {}
             self.next_connection_number = 1
             self.connection_rates.clear()
         self.tree.delete(*self.tree.get_children())

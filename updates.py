@@ -99,8 +99,9 @@ class UpdatesMixin:
         self._theme_dialog(dialog)
         ttk.Label(dialog, text=f'PyFirewall {version} is available. You are using {__version__}.\n\n'
                   'Download PyFirewall.zip from the release page. Close PyFirewall using the tray Close command and wait for the window to exit. '
-                  'Then extract and replace all application files together in the original folder. Preserve your configuration, recovery journals, '
-                  'and installation ownership file. Relaunch from the desktop shortcut.', wraplength=440, padding=16).pack(fill=tk.X)
+                  'Read and follow the release-specific upgrade instructions before replacing all application files together in the original folder. '
+                  'Some releases require removing previous managed rules and configuration. Preserve recovery journals and the installation ownership file. '
+                  'Relaunch from the desktop shortcut.', wraplength=440, padding=16).pack(fill=tk.X)
 
         def cancel():
             self.update_dialog = None

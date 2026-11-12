@@ -24,9 +24,9 @@ from constants import (
     SCRIPT_DIR,
     __version__,
 )
-from helpers import (direction_name, direction_set, display_path, global_targets,
-                     log_internal_error, normalize_address, normalize_path, normalize_target)
-from widgets import add_tooltip
+from helpers import (direction_name, direction_set, display_path,
+                     log_internal_error, normalize_path)
+from widgets import add_tooltip, sync_tooltip_stacking
 
 class SettingsMixin:
     """Methods composed into FirewallMonitorApp; state is owned by that application."""
@@ -52,6 +52,13 @@ class SettingsMixin:
         """Validate policy before publishing any part of a saved configuration."""
         if not isinstance(config, dict):
             raise ValueError('The saved configuration must be a JSON object.')
+        # 4.2 keeps the compatible 4.1 storage schema and version-8 backups.
+        if config.get('format') != 'PyFirewall configuration' or config.get('version') != '4.1':
+            raise ValueError('This configuration requires the 4.1 format. Follow the README upgrade instructions for older versions.')
+        if {'global_ip_blocks', 'global_ip_allows', 'global_port_rules'} & config.keys():
+            raise ValueError('Old or mixed global-rule formats are not supported.')
+        if 'global_rules' not in config:
+            raise ValueError('The configuration must include a global_rules array.')
         for name in ('rate_threshold', 'saved_rate_threshold', 'max_connections_alerts'):
             if name in config:
                 int(config[name])
@@ -66,31 +73,17 @@ class SettingsMixin:
         if not isinstance(allowed, list) or any(not isinstance(p, str) or not os.path.isabs(p) for p in allowed):
             raise ValueError('Allowed applications must be an array of absolute paths.')
         directions = {'both', 'in', 'inbound', 'incoming', 'out', 'outbound', 'outgoing'}
-        for name in ('managed_rules', 'global_ip_blocks', 'global_ip_allows'):
-            entries = config.get(name, [])
-            if entries is None:  # Older saved files used null for empty collections.
-                entries = config[name] = []
-            if not isinstance(entries, list):
-                raise ValueError(f'{name} must be an array.')
-            for entry in entries:
-                if name == 'managed_rules':
-                    if (not isinstance(entry, dict) or not isinstance(entry.get('path'), str)
-                            or not os.path.isabs(entry['path'])
-                            or str(entry.get('action', 'Block')).casefold() not in {'block', 'allow'}):
-                        raise ValueError('Invalid saved application rule.')
-                else:
-                    target = entry.get('target') if isinstance(entry, dict) else entry
-                    if not isinstance(target, str):
-                        raise ValueError('Invalid saved global target.')
-                    global_targets(target)
-                    addresses = entry.get('addresses', []) if isinstance(entry, dict) else []
-                    if not isinstance(addresses, list):
-                        raise ValueError('Saved global addresses must be an array.')
-                    for address in addresses:
-                        normalize_address(address)
-                if isinstance(entry, dict) and str(entry.get('direction', 'Both')).casefold() not in directions:
-                    raise ValueError('Invalid saved rule direction.')
-        return self._parse_port_rules(config.get('global_port_rules', []))
+        entries = config.get('managed_rules', [])
+        if not isinstance(entries, list):
+            raise ValueError('managed_rules must be an array.')
+        for entry in entries:
+            if (not isinstance(entry, dict) or set(entry) != {'path', 'action', 'direction'}
+                    or not isinstance(entry['path'], str) or not os.path.isabs(entry['path'])
+                    or str(entry['action']).casefold() not in {'block', 'allow'}):
+                raise ValueError('Invalid saved application rule.')
+            if str(entry['direction']).casefold() not in directions:
+                raise ValueError('Invalid saved rule direction.')
+        return self._parse_port_rules(config['global_rules'])
 
     def load_settings(self):
         try:
@@ -134,17 +127,6 @@ class SettingsMixin:
             self.dark_mode = bool(config.get('dark_mode', DEFAULT_DARK_MODE))
             self.check_updates_on_startup = config.get('check_updates_on_startup', DEFAULT_CHECK_UPDATES_ON_STARTUP) is True
             self.firewall_initialized = bool(config.get('firewall_initialized', False))
-            for preference in ('column_orders', 'hidden_columns', 'column_widths'):
-                layouts = config.get(preference, {})
-                saved_rules = layouts.get('rules') if isinstance(layouts, dict) else None
-                old_names = ('Rule / Application', 'Application / Domain IP')
-                if isinstance(saved_rules, dict):
-                    for old_name in old_names:
-                        if old_name in saved_rules:
-                            saved_rules.setdefault('Application & Global Rules', saved_rules.pop(old_name))
-                elif isinstance(saved_rules, (list, tuple)):
-                    layouts['rules'] = ['Application & Global Rules' if c in old_names else c
-                                        for c in saved_rules]
             saved_column_orders = config.get('column_orders', {})
             if isinstance(saved_column_orders, dict):
                 for key, default in self.default_column_orders.items():
@@ -182,10 +164,8 @@ class SettingsMixin:
             self.global_ports = ports
             self.pending_rules = []
             self.blocked_paths = {}
-            for rule in config.get('managed_rules', []) or []:
-                if not isinstance(rule, dict) or not rule.get('path'):
-                    continue
-                if str(rule.get('action', 'Block')).casefold() == 'allow':
+            for rule in config.get('managed_rules', []):
+                if rule['action'].casefold() == 'allow':
                     continue
                 path = display_path(rule.get('path', ''))
                 norm = normalize_path(path)
@@ -195,16 +175,6 @@ class SettingsMixin:
                 self.pending_rules.append({'path': path, 'direction': direction})
                 wanted = direction_set(direction)
                 self.blocked_paths[norm] = {'in': 'in' in wanted, 'out': 'out' in wanted, 'path': path}
-            for entry in config.get('global_ip_blocks', []) or []:
-                target = normalize_target(entry.get('target', '') if isinstance(entry, dict) else entry)
-                if target:
-                    addresses = entry.get('addresses', []) if isinstance(entry, dict) else []
-                    self.global_blocks[target] = {'addresses': tuple((str(a) for a in addresses if str(a).strip())), 'direction': direction_name(entry.get('direction', 'Both') if isinstance(entry, dict) else 'Both')}
-            for entry in config.get('global_ip_allows', []) or []:
-                target = normalize_target(entry.get('target', '') if isinstance(entry, dict) else entry)
-                if target and target not in self.global_blocks:
-                    addresses = entry.get('addresses', []) if isinstance(entry, dict) else []
-                    self.global_allows[target] = {'addresses': tuple((str(a) for a in addresses if str(a).strip())), 'direction': direction_name(entry.get('direction', 'Both') if isinstance(entry, dict) else 'Both')}
         self.rate_threshold_var.set(str(self.rate_threshold))
         self.rate_window_var.set(str(self.rate_window))
         self.upload_threshold_var.set(str(self.upload_threshold_mb))
@@ -225,7 +195,7 @@ class SettingsMixin:
                 with self.lock:
                     managed = [{'action': 'Allow', 'direction': 'Both', 'path': path} for path in sorted(self.allowed_apps)]
                     managed += [{'action': 'Block', 'direction': self._direction_from_flags(data), 'path': data.get('path', normalized)} for normalized, data in sorted(self.blocked_paths.items())]
-                    config = {'filter_all_enabled': self.filter_all_enabled, 'filter_all_saved_alerts': self.filter_all_saved_alerts, 'filter_all_saved_auto_block': self.filter_all_saved_auto_block, 'saved_rate_threshold': self.saved_rate_threshold, 'rate_threshold': self.rate_threshold, 'rate_window': self.rate_window, 'upload_threshold_mb': self.upload_threshold_mb, 'max_connections_alerts': self.max_connections_alerts, 'log_alerts_only_enabled': self.log_alerts_only, 'auto_block_enabled': self.auto_block_enabled, 'allowed_apps': sorted(self.allowed_apps), 'managed_rules': managed, 'global_ip_blocks': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_blocks.items())], 'global_ip_allows': [{'target': target, 'addresses': list(data.get('addresses', ())), 'direction': data.get('direction', 'Both')} for target, data in sorted(self.global_allows.items())], 'global_port_rules': list(getattr(self, 'global_ports', {}).values()), 'hidden_columns': getattr(self, 'hidden_columns', {}), 'dark_mode': bool(self.dark_mode), 'firewall_initialized': self.firewall_initialized, 'column_orders': {key: list(order) for key, order in self.column_orders.items()}}
+                    config = {'format': 'PyFirewall configuration', 'version': '4.1', 'filter_all_enabled': self.filter_all_enabled, 'filter_all_saved_alerts': self.filter_all_saved_alerts, 'filter_all_saved_auto_block': self.filter_all_saved_auto_block, 'saved_rate_threshold': self.saved_rate_threshold, 'rate_threshold': self.rate_threshold, 'rate_window': self.rate_window, 'upload_threshold_mb': self.upload_threshold_mb, 'max_connections_alerts': self.max_connections_alerts, 'log_alerts_only_enabled': self.log_alerts_only, 'auto_block_enabled': self.auto_block_enabled, 'allowed_apps': sorted(self.allowed_apps), 'managed_rules': managed, 'global_rules': list(getattr(self, 'global_ports', {}).values()), 'hidden_columns': getattr(self, 'hidden_columns', {}), 'dark_mode': bool(self.dark_mode), 'firewall_initialized': self.firewall_initialized, 'column_orders': {key: list(order) for key, order in self.column_orders.items()}}
                     config['check_updates_on_startup'] = self.check_updates_on_startup
                     config['keep_notification_foreground'] = getattr(self, 'keep_notification_foreground', True)
                     config['column_widths'] = getattr(self, 'column_widths', {})
@@ -288,6 +258,12 @@ class SettingsMixin:
                 canvas.yview_scroll(-3 if event.delta > 0 else 3, 'units')
                 return 'break'
         self.root.bind('<MouseWheel>', scroll_settings, add='+')
+        self.capture_coverage = tk.Label(
+            outer, text='Capture: waiting for an adapter; one adapter at a time.',
+            anchor=tk.W, justify=tk.LEFT, wraplength=600)
+        self.capture_coverage.pack(fill=tk.X, pady=(0, 18))
+        self.capture_coverage.bind('<Configure>', lambda event: self.capture_coverage.configure(
+            wraplength=max(1, event.width - 4)))
         self.settings_monitor_controls = tk.LabelFrame(
             outer, text='Monitor & Filter', padx=18, pady=14)
         self.settings_monitor_controls.pack(fill=tk.X, pady=(0, 18))
@@ -313,6 +289,7 @@ class SettingsMixin:
         for row, (label, variable, suffix) in enumerate(fields, 3):
             tk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=6)
             entry = ttk.Entry(frame, textvariable=variable, width=10)
+            self._bind_entry_menu(entry)
             entry.grid(row=row, column=1, sticky=tk.W, padx=(12, 0), pady=6)
             if row == 3:
                 self.rate_threshold_entry = entry
@@ -320,7 +297,9 @@ class SettingsMixin:
                 self.rate_window_entry = entry
             tk.Label(frame, text=suffix, fg=self.colors['muted']).grid(row=row, column=2, sticky=tk.W, padx=8)
         tk.Label(frame, text='Max Connections / Alerts').grid(row=6, column=0, sticky=tk.W, pady=6)
-        ttk.Entry(frame, textvariable=self.max_connections_alerts_var, width=10).grid(row=6, column=1, sticky=tk.W, padx=(12, 0), pady=6)
+        entry = ttk.Entry(frame, textvariable=self.max_connections_alerts_var, width=10)
+        self._bind_entry_menu(entry)
+        entry.grid(row=6, column=1, sticky=tk.W, padx=(12, 0), pady=6)
         tk.Label(frame, text='rows retained in Live Monitor and Alerts', fg=self.colors['muted']).grid(row=6, column=2, sticky=tk.W, padx=8)
         self._button(frame, 'Apply Settings', self.apply_settings, '#2196F3', pack=False).grid(row=7, column=0, sticky=tk.W, pady=(12, 0))
         appearance = tk.LabelFrame(outer, text='Appearance', padx=18, pady=14)
@@ -415,7 +394,7 @@ class SettingsMixin:
             cursor='hand2',
             font=('Segoe UI', 10, 'underline')
         )
-        donation_label.grid(row=0, column=1, sticky=tk.SW, pady=2)
+        donation_label.grid(row=1, column=1, sticky=tk.W, pady=2)
         bind_support_link(donation_label, venmo_url)
         add_tooltip(donation_label, 'Open venmo.com/u/rustonrails in your default browser.')
 
@@ -423,7 +402,7 @@ class SettingsMixin:
             support, text='Donate via Crypto',
             bg=self.colors['frame'], fg=self.colors['select'], cursor='hand2',
             font=('Segoe UI', 10, 'underline'))
-        crypto_label.grid(row=1, column=1, sticky=tk.W, pady=2)
+        crypto_label.grid(row=2, column=1, sticky=tk.NW, pady=2)
         crypto_label.bind('<Button-1>', lambda _event: self.show_crypto_wallets())
         add_tooltip(crypto_label, 'View EolnMsuk’s crypto wallets and click an address to copy it for a donation.')
 
@@ -435,7 +414,7 @@ class SettingsMixin:
             cursor='hand2',
             font=('Segoe UI', 10, 'underline')
         )
-        github_label.grid(row=2, column=1, sticky=tk.NW, pady=2)
+        github_label.grid(row=0, column=1, sticky=tk.SW, pady=2)
         bind_support_link(github_label, github_url)
         add_tooltip(github_label, 'Open the PyFirewall GitHub repository.')
         for link in (donation_label, crypto_label, github_label):
@@ -763,6 +742,7 @@ class SettingsMixin:
                 dialog.attributes('-topmost', self.keep_notification_foreground)
                 if self.keep_notification_foreground:
                     dialog.lift()
+                sync_tooltip_stacking(dialog)
             except tk.TclError:
                 pass
         self._save_settings_with_feedback()
@@ -772,6 +752,7 @@ class SettingsMixin:
     def _prune_connection_and_alert_history_locked(self):
         limit = max(1, int(self.max_connections_alerts))
 
+        self._retain_alert_flow_totals_locked()
         if len(self.active_connections) > limit:
             overflow = len(self.active_connections) - limit
             oldest = sorted(
@@ -783,6 +764,10 @@ class SettingsMixin:
 
         if self.alerts.maxlen != limit:
             self.alerts = deque(self.alerts, maxlen=limit)
+        retained = {alert[0] for alert in self.alerts}
+        self.alert_connections = {key: row for key, row in getattr(self, 'alert_connections', {}).items()
+                                  if key in retained}
+        self._prune_display_groups_locked()
 
     def apply_settings(self):
         try:
@@ -866,8 +851,6 @@ class SettingsMixin:
                     self.allowed_apps.clear()
                     self.blocked_paths.clear()
                     self.pending_rules.clear()
-                    self.global_blocks.clear()
-                    self.global_allows.clear()
                     self.global_ports.clear()
                     getattr(self, 'rule_enforcement', {}).clear()
                     getattr(self, 'verified_blocked_paths', {}).clear()
@@ -877,7 +860,11 @@ class SettingsMixin:
                     self.window_size = None
                     self.window_position = None
                     self.window_maximized = False
+                    self._retain_alert_flow_totals_locked()
                     self.active_connections.clear()
+                    self._last_connection_group = None
+                    self._last_alert_group = None
+                    self._prune_display_groups_locked()
                     self.connection_rates.clear()
                     self.proc_ip_upload.clear()
                     self.proc_ip_upload_last_seen.clear()

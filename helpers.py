@@ -48,16 +48,12 @@ def display_path(path):
 
 
 def rule_executables(rule, validate=True):
-    """Read legacy/saved program filters without parsing display-name CSVs."""
-    if 'exes' in rule:
-        values = rule['exes']
-        if not isinstance(values, (list, tuple)):
-            raise ValueError('Global rule executables must be an array of paths.')
-    else:
-        value = rule.get('exe', '')
-        if value is None or value == '':
-            return []
-        values = [value]
+    """Read the current executable selection without parsing display-name CSVs."""
+    if 'exe' in rule:
+        raise ValueError('Global rules require an exes array.')
+    values = rule.get('exes', [])
+    if not isinstance(values, list):
+        raise ValueError('Global rule executables must be an array of paths.')
     paths, seen = [], set()
     for value in values:
         if not isinstance(value, str) or not value.strip():
@@ -75,10 +71,8 @@ def rule_executables(rule, validate=True):
 
 
 def executable_fields(paths):
-    """Keep singleton exports compatible; an empty selection is unrestricted."""
-    if len(paths) == 1:
-        return {'exe': paths[0]}
-    return {'exes': list(paths)} if paths else {}
+    """Use one representation for every executable selection."""
+    return {'exes': list(paths)}
 
 
 def executable_identity(rule):
@@ -168,14 +162,15 @@ def mb(value):
 
 
 def normalize_ports(value):
-    """Keep single-port compatibility; store multiple ports as a canonical CSV."""
+    """Parse editor text or a current port array into one normalized selection."""
     if value is None or isinstance(value, str) and not value.strip():
-        return None
-    parts = [part.strip() for part in str(value).split(',')]
+        return []
+    parts = value if isinstance(value, list) else [part.strip() for part in str(value).split(',')]
+    parts = [str(part) for part in parts]
     if any(not part.isdecimal() or not 1 <= int(part) <= 65535 for part in parts):
         raise ValueError('Port numbers must be integers from 1 to 65535, separated by commas.')
     ports = sorted({int(part) for part in parts})
-    return ports[0] if len(ports) == 1 else ','.join(map(str, ports))
+    return ports
 
 
 def direction_name(value):
