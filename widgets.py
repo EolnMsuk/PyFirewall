@@ -402,8 +402,20 @@ class WidgetsMixin:
                 except tk.TclError:
                     pass
 
+            def cut():
+                try:
+                    restore()
+                    if selected and undo._editable():
+                        entry.clipboard_clear()
+                        entry.clipboard_append(selected)
+                        undo.edit(lambda: entry.delete(*selection))
+                except tk.TclError:
+                    pass
+
             def paste():
                 try:
+                    if not undo._editable():
+                        return
                     text = entry.clipboard_get()
                     restore()
                     def replace():
@@ -415,7 +427,9 @@ class WidgetsMixin:
                     pass
 
             menu = self._context_menu()
-            menu.add_command(label='Copy', command=copy)
+            if selected:
+                menu.add_command(label='Cut', command=cut)
+                menu.add_command(label='Copy', command=copy)
             menu.add_command(label='Paste', command=paste)
             menu.post(event.x_root, event.y_root)
             menu.previous_focus = entry

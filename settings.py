@@ -52,7 +52,7 @@ class SettingsMixin:
         """Validate policy before publishing any part of a saved configuration."""
         if not isinstance(config, dict):
             raise ValueError('The saved configuration must be a JSON object.')
-        # 4.2 keeps the compatible 4.1 storage schema and version-8 backups.
+        # Release versions are independent of the 4.1 schema and version-8 backups.
         if config.get('format') != 'PyFirewall configuration' or config.get('version') != '4.1':
             raise ValueError('This configuration requires the 4.1 format. Follow the README upgrade instructions for older versions.')
         if {'global_ip_blocks', 'global_ip_allows', 'global_port_rules'} & config.keys():

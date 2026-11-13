@@ -1,3 +1,9 @@
+# 4.3
+
+* **Text Menus:** Added right-click Cut. Cut and Copy appear only when text is selected.
+* **Auto-Block Details:** Prompts show the connection's remote port, protocol, and available hostname. Hostnames can appear while you decide, without delaying protection or waiting to open the prompt.
+* **Allow Process Fix:** Allowing an app now creates its Managed Rules entry on the first attempt, without having to block it first.
+
 # 4.2
 
 * **Upgrade Required:** Before installing 4.2, remove all previous **PyFirewall-managed** Windows Firewall rules, close PyFirewall normally and wait for cleanup to finish, then delete the existing `firewall_config.json`. Keep recovery journals and installation ownership files. Backups using older rule formats cannot be imported; create fresh rules in 4.2.

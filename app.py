@@ -125,6 +125,7 @@ class FirewallMonitorApp(
         self.auto_prompt_keys = set()
         self.auto_prompt_active = False
         self.auto_prompt_dialog = None
+        self.auto_prompt_details = None
         self.auto_prompt_key = None
         self.auto_prompt_generation = 0
         self.auto_hold_owners = {}
@@ -669,6 +670,7 @@ class FirewallMonitorApp(
                     self.rules_tree.insert('', tk.END, values=('Error', 'Firewall rule refresh failed', '', '', '', error), tags=('blocked',))
         if dns_ips and not self.closed:
             live_changed, alerts_changed = self._refresh_retained_hosts(dns_ips)
+            self._refresh_auto_prompt_host(dns_ips)
             if live_changed and hasattr(self, 'tree'):
                 self.render_monitor()
             if alerts_changed and hasattr(self, 'alerts_tree'):

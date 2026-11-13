@@ -348,7 +348,7 @@ if($null -eq $rules){"[]"}else{@($rules)|ConvertTo-Json -Compress}
 
     @staticmethod
     def _port_firewall_rules(ports, all_directions=False):
-        """Keep native fan-out and the compatible 4_1 native-name format in 4.2."""
+        """Keep native fan-out and the compatible 4_1 native-name format."""
         rules = []
         for key, rule in ports.items():
             digest = hashlib.sha256(key.encode()).hexdigest()[:32]
@@ -1241,7 +1241,7 @@ foreach ($rule in $rules) {
                 self.connection_rates = {key: value for key, value in self.connection_rates.items() if key[0] not in apps}
                 self.upload_alerted = {key for key in self.upload_alerted if key[0] not in apps or not apps[key[0]][1]}
                 self._invalidate_rule_snapshot_locked()
-        if planned or previous or affected or decision_guard is not None:
+        if apps or planned or previous or affected or decision_guard is not None:
             self._replace_rule_records(previous, [rule['name'] for rule in planned], create, commit=commit)
         return apps, any(request[3] for request in requests)
 
@@ -1319,6 +1319,14 @@ foreach ($rule in $rules) {
                     self._unsaved_target_edit = None
                     return True
                 pending, duplicates = [], []
+                with self.lock:
+                    # The generic transaction leaves holds alone. Retire only
+                    # the manual selection's captured owner at this boundary.
+                    owners = dict(getattr(self, 'auto_hold_cleanup', {}))
+                    owners.update(getattr(self, 'auto_hold_owners', {}))
+                    prompt_generation = self.auto_prompt_generation
+                cleanup_failed = False
+                global_changed = False
                 port_pending = list(ports.values())
                 for request in selected.values():
                     if request[3] or replace_rule or not self._rule_is_duplicate(*request):
@@ -1336,9 +1344,16 @@ foreach ($rule in $rules) {
                     apps, global_changed = self._commit_rule_batch(pending, **options)
                     if global_changed:
                         self._invalidate_auto_prompts(close_dialog=True)
-                    else:
-                        for norm in apps:
-                            self._cancel_app_prompt(norm)
+                if not global_changed:
+                    for path, _, _, global_target in selected.values():
+                        if global_target:
+                            continue
+                        norm = normalize_path(path)
+                        owner = owners.get(norm)
+                        if owner is not None and not self._release_auto_hold_locked(norm, owner, resolve_prompt=True):
+                            cleanup_failed = True
+                            continue
+                        self._cancel_app_prompt(norm, owner if owner is not None else prompt_generation)
             if pending or port_pending or target_edits:
                 if target_edits:
                     self._unsaved_target_edit = copy.deepcopy((target_edits, self.global_ports, request_identity))
@@ -1348,6 +1363,8 @@ foreach ($rule in $rules) {
                     self._unsaved_target_edit = None
             elif duplicates and getattr(self, 'settings_save_error', None):
                 self._persist_rule_changes()
+            if cleanup_failed:
+                raise RuntimeError('The application rule was applied, but its temporary block could not be released. Retry the same rule action to finish cleanup.')
         except Exception as exc:
             details = error_details(exc)
             log_internal_error('rule_batch', exc)

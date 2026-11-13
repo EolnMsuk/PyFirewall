@@ -149,6 +149,7 @@ class AutoBlockMixin:
                 self.prompt_queue.put(item)
             if self.auto_prompt_key == norm:
                 dialog = self.auto_prompt_dialog
+                self.auto_prompt_details = None
                 self.auto_prompt_dialog = None
                 self.auto_prompt_key = None
                 self.auto_prompt_active = False
@@ -168,6 +169,7 @@ class AutoBlockMixin:
             getattr(self, 'auto_prompt_connections', {}).clear()
             getattr(self, 'auto_decision_saves', {}).clear()
             getattr(self, 'auto_decision_errors', {}).clear()
+            self.auto_prompt_details = None
             if close_dialog:
                 dialog = self.auto_prompt_dialog
                 self.auto_prompt_dialog = None
@@ -458,19 +460,104 @@ class AutoBlockMixin:
 
     # Decision dialog
 
+    def _auto_prompt_endpoint_identity(self, row):
+        return (self._host_endpoint(row), row.get('direction'), row.get('key'), self._flow_identity(row))
+
+    def _auto_prompt_details_current_locked(self, state):
+        if (state is not getattr(self, 'auto_prompt_details', None) or state['answered'] or self.closed
+                or state['generation'] != self.auto_prompt_generation
+                or self.auto_prompt_key != state['key'] or self.auto_prompt_dialog is not state['dialog']):
+            return False
+        saved = getattr(self, 'auto_prompt_connections', {}).get(state['key'])
+        if state['source'] is None:
+            return saved is None
+        return (saved is not None and saved[0] == state['generation'] and saved[1] is state['source']
+                and self._auto_prompt_endpoint_identity(saved[1]) == state['identity'])
+
+    def _refresh_auto_prompt_host(self, ips=None, discover=False):
+        """Enrich only the active, never-selected dialog; enforcement owns its own snapshot."""
+        with self.lock:
+            state = getattr(self, 'auto_prompt_details', None)
+            if state is None or not self._auto_prompt_details_current_locked(state):
+                return
+            row = copy.deepcopy(state['row'])
+            if ips is not None and row.get('dst_ip') not in ips:
+                return
+        # Never take dns_lock under the application lock or resolve on Tk.
+        host = self._retain_remote_host(row, discover=discover and hasattr(self, 'dns_queue'))
+        with self.lock:
+            if not self._auto_prompt_details_current_locked(state) or not host or host == state['host']:
+                return
+            try:
+                widget = state['host_widget']
+                widget.configure(state=tk.NORMAL)
+                widget.delete('1.0', tk.END)
+                widget.insert('1.0', host)
+                widget.configure(state=tk.DISABLED)
+                state['row'] = row
+                state['host'] = host
+            except tk.TclError:
+                self.auto_prompt_details = None
+
     def show_auto_prompt(self, generation, key, proc_name, exe, pid, remote_ip, reason, detail):
         dialog = tk.Toplevel(self.root)
         with self.lock:
             self.auto_prompt_dialog = dialog
             self.auto_prompt_key = key
+            saved = getattr(self, 'auto_prompt_connections', {}).get(key)
+            source = saved[1] if saved and saved[0] == generation else None
+            endpoint = copy.deepcopy(source) if source is not None else {'exe': exe, 'pid': pid, 'dst_ip': remote_ip}
         dialog.title('Auto-Block Protection')
         dialog.resizable(False, False)
         dialog.withdraw()
         self._theme_dialog(dialog)
-        message = f"{proc_name} reached an Auto-Block threshold.\n\nRemote target: {remote_ip}\nTrigger: {reason.title()}{(f' ({detail})' if detail else '')}\n\nTemporary protection is already blocking this executable while you decide."
+        message = f"{proc_name} reached an Auto-Block threshold.\nTrigger: {reason.title()}{(f' ({detail})' if detail else '')}\n\nTemporary protection is already blocking this executable while you decide."
         body = tk.Frame(dialog, bg=self.colors['frame'])
         body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(16, 10))
         tk.Label(body, text=message, justify=tk.LEFT, anchor=tk.W, wraplength=470, bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10)).pack(fill=tk.X)
+        raw_port = endpoint.get('dport')
+        try:
+            if isinstance(raw_port, bool) or not str(raw_port).isdigit() or not 1 <= int(raw_port) <= 65535:
+                raise ValueError('Invalid remote port')
+            port = str(int(raw_port))
+        except (TypeError, ValueError):
+            port = 'Unknown'
+        protocol = str(endpoint.get('protocol', '')).upper()
+        protocol = protocol if protocol in {'TCP', 'UDP'} else 'Unknown'
+        tk.Label(body, text=f"Remote IP: {endpoint.get('dst_ip') or 'Unknown'}\nRemote port: {port}\nProtocol: {protocol}\nDomain/host:",
+                 justify=tk.LEFT, anchor=tk.W, wraplength=470, bg=self.colors['frame'], fg=self.colors['fg'],
+                 font=('Segoe UI', 10)).pack(fill=tk.X, pady=(10, 0))
+        host_area = tk.Frame(body, bg=self.colors['frame'])
+        host_area.pack(fill=tk.X)
+        scrollbar = tk.Scrollbar(host_area, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Reserve a wrapped, scrollable area so late/long names never move the
+        # buttons or resize/recenter the dialog while the user is deciding.
+        host_widget = tk.Text(host_area, height=3, width=1, wrap=tk.CHAR, bd=0, highlightthickness=0,
+                              bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10),
+                              takefocus=False, yscrollcommand=scrollbar.set)
+        host_widget.insert('1.0', 'Not available')
+        host_widget.configure(state=tk.DISABLED)
+        host_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scrollbar.configure(command=host_widget.yview)
+        state = {'generation': generation, 'key': key, 'dialog': dialog, 'source': source,
+                 'identity': self._auto_prompt_endpoint_identity(endpoint), 'row': endpoint,
+                 'host_widget': host_widget, 'host': '', 'answered': False}
+        with self.lock:
+            self.auto_prompt_details = state
+        topmost_after = None
+        def destroyed(event):
+            if event.widget is dialog:
+                if topmost_after is not None:
+                    try:
+                        dialog.after_cancel(topmost_after)
+                    except tk.TclError:
+                        pass
+                with self.lock:
+                    if getattr(self, 'auto_prompt_details', None) is state:
+                        self.auto_prompt_details = None
+        dialog.bind('<Destroy>', destroyed, add='+')
+        self._refresh_auto_prompt_host(discover=True)
         buttons = tk.Frame(dialog, bg=self.colors['frame'])
         buttons.pack(fill=tk.X, padx=16, pady=(0, 14))
         buttons.grid_columnconfigure((0, 1, 2), weight=1)
@@ -518,7 +605,10 @@ class AutoBlockMixin:
             if finished:
                 return
             with self.lock:
-                current = generation == self.auto_prompt_generation and not self.closed
+                current = (generation == self.auto_prompt_generation and not self.closed
+                           and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key)
+                if current:
+                    state['answered'] = True  # Stay frozen even when a failed choice becomes retryable.
             if not current:
                 return
             finished = True
@@ -573,10 +663,12 @@ class AutoBlockMixin:
         dialog.attributes('-topmost', True)
 
         def release_topmost():
+            nonlocal topmost_after
+            topmost_after = None
             try:
                 if dialog.winfo_exists():
                     dialog.attributes('-topmost', getattr(self, 'keep_notification_foreground', True))
                     sync_tooltip_stacking(dialog)
             except tk.TclError:
                 pass
-        dialog.after(250, release_topmost)
+        topmost_after = dialog.after(250, release_topmost)
