@@ -53,7 +53,6 @@
 
 * **Label Changes:** Modifed some labels / system tray elements.
 * **Documentation:** Updated documentation / simplified changelog for previous masssive update.
-* **EOL:** This project is complete / EOL, I plan to only issue bug fixes if issues are reported.
 
 # 3.4
 
