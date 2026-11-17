@@ -412,7 +412,7 @@ class SettingsMixin:
         )
         donation_label.grid(row=1, column=1, sticky=tk.W, pady=2)
         bind_support_link(donation_label, venmo_url)
-        add_tooltip(donation_label, 'Open venmo.com/u/EolnMsuk in your default browser.')
+        add_tooltip(donation_label, 'Open venmo.com/u/rustonrails in your default browser.')
 
         crypto_label = tk.Label(
             support, text='Donate via Crypto',
@@ -927,6 +927,11 @@ class SettingsMixin:
                 for column, width in getattr(tree, '_default_column_widths', {}).items():
                     tree.column(column, width=width)
                 tree._fill_column = None
+                tree._fit_viewport = None
+                if tree._autosize_pending is not None:
+                    tree.after_cancel(tree._autosize_pending)
+                    tree._autosize_pending = None
+                tree._autosize_job = None
         self.rate_threshold_var.set(str(self.rate_threshold))
         self.rate_window_var.set(str(DEFAULT_RATE_WINDOW))
         self.upload_threshold_var.set(str(DEFAULT_UPLOAD_THRESHOLD_MB))

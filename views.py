@@ -48,7 +48,7 @@ class ViewsMixin:
                 return
             self.rules_refresh_worker_running = True
         self.rules_tree.delete(*self.rules_tree.get_children())
-        self.rules_tree.insert('', tk.END, iid='__loading__', values=('Loading', 'Reading Windows Firewall...', '', '', '', ''), tags=('even',))
+        self.rules_tree.insert('', tk.END, iid='__loading__', values=('', 'Loading', 'Reading Windows Firewall...', '', '', '', '', '', ''), tags=('even',))
         try:
             if hasattr(self, 'native_jobs'):
                 if not self._queue_native_job('Refresh rules', self._refresh_rules_worker):
@@ -80,7 +80,12 @@ class ViewsMixin:
                     with self.lock:
                         if self.closed:
                             continue
-                    blocked, allowed, blocks, allows, ports = self._reconcile_native_rules_locked(records)
+                    result = self._reconcile_native_rules_locked(records)
+                    if result is None:
+                        with self.lock:
+                            self.rules_refresh_pending = True
+                        continue
+                    blocked, allowed, blocks, allows, ports = result
                 self.ui_queue.put(('rules', generation, blocked, allowed, blocks, allows, ports))
             except Exception as exc:
                 self._invalidate_native_observation()
@@ -107,19 +112,19 @@ class ViewsMixin:
         ports = ', '.join(map(str, rule['ports'])) or 'All'
         names = ', '.join(os.path.basename(path) for path in rule_executables(rule))
         process = names + ' | ' if names else ''
-        return f"{process}{target} | Remote ports: {ports} | Protocol: {rule['protocol']}"
+        return f"{process}{target} | Ports: {ports} | Protocol: {rule['protocol']}"
 
     def _make_rule_rows(self, blocked, allowed, blocks, allows, ports=None):
         rows = []
         for path in sorted(allowed):
             rows.append({'iid': f'app:allow:{path}', 'status': 'Allowed', 'rule': os.path.basename(path) or path,
                          'action': 'Allow', 'direction': 'Both', 'path': path, 'normalized_path': path,
-                         'remote_port': 'All', 'protocol': 'Any', 'download': 0, 'upload': 0})
+                         'port': 'All', 'protocol': 'Any', 'download': 0, 'upload': 0})
         for path, data in sorted(blocked.items()):
             direction = self._direction_from_flags(data)
             rows.append({'iid': f'app:block:{path}', 'status': 'Blocked' if direction != 'Inbound' else 'Blocked (in)',
                          'rule': os.path.basename(data['path']) or data['path'], 'action': 'Block', 'direction': direction,
-                         'path': data['path'], 'normalized_path': path, 'remote_port': 'All',
+                         'path': data['path'], 'normalized_path': path, 'port': 'All',
                          'protocol': 'Any', 'download': 0, 'upload': 0})
         if ports is None:
             with self.lock:
@@ -127,16 +132,19 @@ class ViewsMixin:
         for key, rule in sorted(ports.items()):
             description = self._global_rule_description(rule)
             paths = rule_executables(rule)
-            program_display = (paths[0] if len(paths) == 1 else
-                               ', '.join(os.path.basename(path) for path in paths) if paths else description)
+            if len(paths) > 1:
+                raise ValueError('Saved global policies must contain at most one executable.')
+            program_display = paths[0] if paths else description
             rows.append({'iid': f'port:{key}', 'status': self._global_status(rule['action'], rule['direction']),
-                         'rule': description, 'remote_port': ', '.join(map(str, rule['ports'])) or 'All',
+                         'rule': description, 'port': ', '.join(map(str, rule['ports'])) or 'All',
                          'protocol': rule['protocol'], 'action': rule['action'], 'direction': rule['direction'],
                          'path': key, 'normalized_path': key, 'display_path': program_display,
                          'executable_paths': paths, 'global_type': rule['action'].lower(), 'is_port': True,
                          'download': 0, 'upload': 0})
         for row in rows:
             key = row['normalized_path']
+            row['order_id'] = ('port:' if row.get('is_port') else
+                               'observed:' if blocked.get(key, {}).get('_native_only') and row['action'] == 'Block' else 'app:') + key
             if row.get('is_port'):
                 state = ports[key].get('_enforcement', 'Verified')
             elif row['action'] == 'Allow':
@@ -147,6 +155,18 @@ class ViewsMixin:
             if state not in {'Verified', 'Observed'}:
                 origin = 'observed' if blocked.get(key, {}).get('_native_only') else 'intended'
                 row['status'] = f"{row['action']} {origin} ({state.lower()})"
+        with self.lock:
+            self._sync_rule_order_locked()
+            identities = {row['order_id'] for row in rows}
+            observed = {value for value in identities if value.startswith('observed:')}
+            self.observed_rule_order = [value for value in getattr(self, 'observed_rule_order', []) if value in observed]
+            self.observed_rule_order.extend(sorted(observed - set(self.observed_rule_order)))
+            self._sync_rule_order_locked(preferred=self.observed_rule_order)
+            order = [value for value in self.rule_order if value in identities]
+            order.extend(sorted(identities - set(order)))
+        numbers = {value: index for index, value in enumerate(order, 1)}
+        for row in rows:
+            row['number'] = numbers[row['order_id']]
         return rows
 
     def _finish_rule_refresh(self, generation, blocked, allowed, blocks, allows, ports=None):
@@ -184,9 +204,11 @@ class ViewsMixin:
             return None
         dialog = tk.Toplevel(self.root)
         self.rule_editor_dialog = dialog
+        self._diagnostic_event('manual editor opened', dialog)
 
         def release(event):
             if event.widget is dialog and self.rule_editor_dialog is dialog:
+                self._diagnostic_event('manual editor destroyed', dialog)
                 self.rule_editor_dialog = None
 
         dialog.bind('<Destroy>', release, add='+')
@@ -195,29 +217,29 @@ class ViewsMixin:
     def add_custom_rule(self):
         if self._focus_rule_editor():
             return
-        path = filedialog.askopenfilename(title='Select Executable', filetypes=[('Executable Files', '*.exe'), ('All files', '*.*')])
-        if not path:
+        selected = filedialog.askopenfilenames(title='Select Executable', filetypes=[('Executable Files', '*.exe')])
+        if not selected:
             return
-        proc = os.path.splitext(os.path.basename(path))[0] or 'Process'
-        self.edit_app_rule(path, proc)
+        try:
+            paths = rule_executables({'exes': list(selected)})
+        except ValueError as exc:
+            messagebox.showwarning('App Rule', str(exc), parent=self.root)
+            return
+        action = self._choose_option('App Rule', '\n'.join(paths) + '\n\nChoose the application rule:', (
+            ('Allow', 'allow', '#4CAF50'), ('Block', 'both', '#c62828'), ('Block Incoming', 'in', '#ff9800')))
+        if action:
+            self._apply_rule_batch([(path, action == 'allow', 'both' if action == 'allow' else action, False)
+                                    for path in paths], report=True)
 
     def add_monitor_rule(self):
         rows = self.selected_connection_data(self.tree)
         choice = self._choose_option('Create Rule', 'Choose a rule type:', (
             ('App Rule', 'app', '#4CAF50'), ('Global Rule', 'global', GLOBAL_PURPLE)))
         if choice == 'app':
-            paths = {}
-            for row in rows:
-                if row.get('exe'):
-                    paths.setdefault(normalize_path(row['exe']), row)
-            if not paths:
-                self.add_custom_rule()
-            else:
-                for row in paths.values():
-                    self.edit_app_rule(row['exe'], row.get('name', 'Process'))
+            self.add_custom_rule()
         elif choice == 'global':
             if rows:
-                self.prompt_connection_globals(rows, True)
+                self._combined_connection_global_editor(rows)
             else:
                 self.add_global_rule_dialog()
 
@@ -270,11 +292,11 @@ class ViewsMixin:
             target, ports, protocol, action, paths = values
             targets = [{'target': normalize_target(value), 'addresses': []} for value in target.split(',')
                        if is_global_target(normalize_target(value))] if target else []
-            return next(iter(self._parse_port_rules([{
+            return list(self._parse_port_rules([{
                 'targets': targets, 'ports': ports, 'protocol': protocol, 'exes': paths,
                 'action': action.split()[0], 'direction': 'Inbound' if action.endswith('Incoming') else
-                'Outbound' if action.endswith('Outgoing') else 'Both'}]).values()))
-        candidate = draft(fields)
+                'Outbound' if action.endswith('Outgoing') else 'Both'}]).values())
+        candidates = draft(fields)
         def filters(rule):
             return (frozenset(item['target'] for item in rule['targets']),
                     tuple(rule['ports']), executable_identity(rule))
@@ -286,29 +308,34 @@ class ViewsMixin:
         removals = {}
         contexts = [review[2] for review in pending_reviews or ()] + [target_context]
         for context in contexts:
-            if context:
-                removals.setdefault(context['source'], []).extend(context['selections'])
+            for item in self._target_contexts(context):
+                removals.setdefault(item['source'], []).extend(item['selections'])
         policies = [(key, self._connection_target_remainder(rule, removals[key]) if key in removals else rule)
                     for key, rule in policies]
-        policies.extend((None, draft(review[0])) for review in pending_reviews or ())
-        for key, existing in policies:
-            if existing is None or replace_rule == ('port', key) or filters(candidate) != filters(existing):
-                continue
-            if not protocols(candidate) & protocols(existing):
-                continue
-            wanted, present = direction_set(candidate['direction']), direction_set(existing['direction'])
-            if not wanted & present:
-                continue
-            if candidate['protocol'] != existing['protocol']:
-                return (f"Overlapping protocol: {candidate['protocol']} and {existing['protocol']} cover "
-                        'some of the same traffic. Choose protocols or directions that do not overlap.')
-            if wanted != present:
-                return ('Conflicting direction: a matching rule already applies to '
-                        f"{existing['direction']}. Both overlaps Incoming and Outgoing.")
-            if candidate['action'] != existing['action']:
-                return ('Conflicting rule: a matching rule already has the opposite action '
-                        f"({existing['action']}) for the same direction.")
+        policies.extend((None, rule) for review in pending_reviews or () for rule in draft(review[0]))
+        for candidate in candidates:
+            for key, existing in policies:
+                if existing is None or replace_rule == ('port', key) or filters(candidate) != filters(existing):
+                    continue
+                if not protocols(candidate) & protocols(existing):
+                    continue
+                wanted, present = direction_set(candidate['direction']), direction_set(existing['direction'])
+                if not wanted & present:
+                    continue
+                if candidate['protocol'] != existing['protocol']:
+                    return (f"Overlapping protocol: {candidate['protocol']} and {existing['protocol']} cover "
+                            'some of the same traffic. Choose protocols or directions that do not overlap.')
+                if wanted != present:
+                    return ('Conflicting direction: a matching rule already applies to '
+                            f"{existing['direction']}. Both overlaps Incoming and Outgoing.")
+                if candidate['action'] != existing['action']:
+                    return ('Conflicting rule: a matching rule already has the opposite action '
+                            f"({existing['action']}) for the same direction.")
         return None
+
+    @staticmethod
+    def _target_contexts(context):
+        return context if isinstance(context, list) else [context] if context else []
 
     def _ask_global_rule_fields(self, initial=None):
         initial = initial or {}
@@ -316,210 +343,356 @@ class ViewsMixin:
         dialog = self._new_rule_editor()
         if dialog is None:
             return None
-        dialog.withdraw()
-        dialog.title('Edit Global Rule' if initial.get('editing') else 'Add Global Rule')
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        self._theme_dialog(dialog)
-        fields = ttk.Frame(dialog, padding=16)
-        fields.pack(fill=tk.BOTH, expand=True)
-        text_options = {} if self.dark_mode else {'foreground': '#222222'}
-        ttk.Label(fields, text='Action:', **text_options).grid(row=0, column=0, sticky='w')
-        action = ttk.Combobox(fields, values=('Allow', 'Allow Outgoing', 'Allow Incoming', 'Block Incoming', 'Block Outgoing', 'Block'), state='readonly', width=30)
-        action.set(initial.get('action', 'Allow'))
-        action.grid(row=0, column=1, sticky='ew', pady=(0, 12))
-        ttk.Label(fields, text='Executable (optional):', **text_options).grid(row=1, column=0, sticky='w', padx=(0, 12))
-        exe_frame = ttk.Frame(fields)
-        exe_frame.grid(row=1, column=1, sticky='ew', pady=4)
-        # Keep invalid prefilled paths visible until Save validates them.
-        selected_paths = rule_executables(initial, validate=False)
-        exe_names = tk.StringVar(master=dialog, value=', '.join(os.path.basename(path) for path in selected_paths))
-        exe = ttk.Entry(exe_frame, width=30, state='readonly', textvariable=exe_names, **text_options)
-        exe.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        try:
+            dialog.withdraw()
+            dialog.title('Edit Global Rule' if initial.get('editing') else 'Add Global Rule')
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            self._theme_dialog(dialog)
+            fields = ttk.Frame(dialog, padding=16)
+            fields.pack(fill=tk.BOTH, expand=True)
+            text_options = {} if self.dark_mode else {'foreground': '#222222'}
+            ttk.Label(fields, text='Action:', **text_options).grid(row=0, column=0, sticky='w')
+            action = ttk.Combobox(fields, values=('Allow', 'Allow Outgoing', 'Allow Incoming', 'Block Incoming', 'Block Outgoing', 'Block'), state='readonly', width=30)
+            action.set(initial.get('action', 'Allow'))
+            action.grid(row=0, column=1, sticky='ew', pady=(0, 12))
+            ttk.Label(fields, text='Executable (optional):', **text_options).grid(row=1, column=0, sticky='w', padx=(0, 12))
+            exe_frame = ttk.Frame(fields)
+            exe_frame.grid(row=1, column=1, sticky='ew', pady=4)
+            # Keep invalid prefilled paths visible until Save validates them.
+            selected_paths = rule_executables(initial, validate=False)
+            variables = [tk.StringVar(master=dialog, value=', '.join(os.path.basename(path) for path in selected_paths))]
+            dialog.bind('<Destroy>', lambda event: variables.clear() if event.widget is dialog else None, add='+')
+            exe = ttk.Entry(exe_frame, width=30, state='readonly', textvariable=variables[0], **text_options)
+            exe.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        def display_executables():
-            exe_names.set(', '.join(os.path.basename(path) for path in selected_paths))
+            def display_executables():
+                variables[0].set(', '.join(os.path.basename(path) for path in selected_paths))
 
-        def browse_executable():
-            path = filedialog.askopenfilename(parent=dialog, title='Select Executable',
-                                             filetypes=[('Executable Files', '*.exe')])
-            if path:
-                if normalize_path(path) not in {normalize_path(item) for item in selected_paths}:
-                    selected_paths.append(display_path(path))
-                    display_executables()
+            def browse_executable():
+                paths = filedialog.askopenfilenames(parent=dialog, title='Select Executable',
+                                                 filetypes=[('Executable Files', '*.exe')])
+                for path in paths:
+                    if normalize_path(path) not in {normalize_path(item) for item in selected_paths}:
+                        selected_paths.append(display_path(path))
+                        display_executables()
 
-        def clear_executables():
-            selected_paths.clear()
-            display_executables()
+            def clear_executables():
+                selected_paths.clear()
+                display_executables()
 
-        ttk.Button(exe_frame, text='Browse', command=browse_executable).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(exe_frame, text='Clear', command=clear_executables).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(fields, text='Domains or IP addresses:', **text_options).grid(row=2, column=0, sticky='w', padx=(0, 12))
-        target = ttk.Entry(fields, width=36, **text_options)
-        self._bind_entry_menu(target)
-        target.insert(0, ', '.join(item['target'] for item in initial.get('targets', [])))
-        target.grid(row=2, column=1, sticky='ew', pady=4)
-        ttk.Label(fields, text='Remote Port / Protocol:', **text_options).grid(row=3, column=0, sticky='w')
-        port_frame = ttk.Frame(fields)
-        port_frame.grid(row=3, column=1, sticky='ew', pady=4)
-        port = ttk.Entry(port_frame, width=18, **text_options)
-        self._bind_entry_menu(port)
-        port.insert(0, ', '.join(map(str, initial.get('ports', []))))
-        port.pack(side=tk.LEFT)
-        ttk.Label(port_frame, text='(1-65535)', **text_options).pack(side=tk.LEFT, padx=6)
-        protocol = ttk.Combobox(port_frame, values=('TCP/UDP', 'TCP', 'UDP'), state='readonly', width=10)
-        protocol.set(initial.get('protocol', 'TCP/UDP'))
-        protocol.pack(side=tk.RIGHT, fill=tk.X, expand=True)
-        ttk.Label(fields, text='Separate targets and remote ports with commas; use start-end for IP ranges.\nLeave targets blank for all domains/IPs; leave remote ports blank for all remote ports.', **text_options).grid(row=4, column=0, columnspan=2, sticky='w', pady=8)
+            ttk.Button(exe_frame, text='Browse', command=browse_executable).pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Button(exe_frame, text='Clear', command=clear_executables).pack(side=tk.LEFT, padx=(4, 0))
+            ttk.Label(fields, text='Domains or IP addresses:', **text_options).grid(row=2, column=0, sticky='w', padx=(0, 12))
+            target = ttk.Entry(fields, width=36, **text_options)
+            self._bind_entry_menu(target)
+            target.insert(0, ', '.join(item['target'] for item in initial.get('targets', [])))
+            target.grid(row=2, column=1, sticky='ew', pady=4)
+            ttk.Label(fields, text='Port / Protocol:', **text_options).grid(row=3, column=0, sticky='w')
+            port_frame = ttk.Frame(fields)
+            port_frame.grid(row=3, column=1, sticky='ew', pady=4)
+            port = ttk.Entry(port_frame, width=18, **text_options)
+            self._bind_entry_menu(port)
+            port.insert(0, ', '.join(map(str, initial.get('ports', []))))
+            port.pack(side=tk.LEFT)
+            ttk.Label(port_frame, text='(1-65535)', **text_options).pack(side=tk.LEFT, padx=6)
+            protocol = ttk.Combobox(port_frame, values=('TCP/UDP', 'TCP', 'UDP'), state='readonly', width=10)
+            protocol.set(initial.get('protocol', 'TCP/UDP'))
+            protocol.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+            ttk.Label(fields, text='Separate targets and ports with commas; use start-end for IP ranges.\nLeave targets blank for all domains/IPs; leave ports blank for all ports.\nAssigned port numbers represent either Local or Remote ports.', **text_options).grid(row=4, column=0, columnspan=2, sticky='w', pady=8)
 
-        def submit():
-            try:
-                paths = rule_executables({'exes': selected_paths})
-            except ValueError as exc:
-                messagebox.showwarning(dialog.title(), str(exc), parent=dialog)
-                dialog.focus_set()
-                return
-            try:
-                # Validate shared fields now; individual targets are processed independently.
-                raw_target = target.get().strip()
-                _, numbers = self._validate_global_rule_fields('192.0.2.1' if raw_target else '', port.get())
-                proposed = (raw_target, numbers, protocol.get(), action.get(), paths)
-                conflict = self._global_editor_conflict(proposed, initial.get('_replace_rule'),
-                                                        initial.get('_target_context'), initial.get('_pending_reviews'))
-                if conflict:
-                    messagebox.showwarning('Global Rule Not Saved', conflict +
-                                           '\n\nChange the rule settings or cancel this editor.', parent=dialog)
+            def submit():
+                try:
+                    paths = rule_executables({'exes': selected_paths})
+                except ValueError as exc:
+                    messagebox.showwarning(dialog.title(), str(exc), parent=dialog)
+                    dialog.focus_set()
                     return
-                result[0] = proposed
-            except ValueError as exc:
-                if not messagebox.askokcancel('Add Global Rule', str(exc), icon='warning', parent=dialog):
-                    dialog.destroy()
-                return
-            dialog.destroy()
+                try:
+                    # Validate shared fields now; individual targets are processed independently.
+                    raw_target = target.get().strip()
+                    syntax_target = raw_target if initial.get('_replace_rule') or initial.get('_target_context') else '192.0.2.1' if raw_target else ''
+                    _, numbers = self._validate_global_rule_fields(syntax_target, port.get())
+                    proposed = (raw_target, numbers, protocol.get(), action.get(), paths)
+                    conflict = self._global_editor_conflict(proposed, initial.get('_replace_rule'),
+                                                            initial.get('_target_context'), initial.get('_pending_reviews'))
+                    if conflict:
+                        messagebox.showwarning('Global Rule Not Saved', conflict +
+                                               '\n\nChange the rule settings or cancel this editor.', parent=dialog)
+                        return
+                    sources, snapshots = self._global_editor_sources(initial)
+                    if not self._global_sources_available(sources):
+                        raise ValueError('This global rule is updating. Wait for completion before saving.')
+                    if not initial.get('_review_only'):
+                        initial['_operation_id'] = self._reserve_global_operation(sources, snapshots, initial.get('_source_versions'))
+                    result[0] = proposed
+                except ValueError as exc:
+                    if initial.get('editing'):
+                        messagebox.showwarning('Global Rule Not Saved', str(exc), parent=dialog)
+                        return
+                    if not messagebox.askokcancel('Add Global Rule', str(exc), icon='warning', parent=dialog):
+                        dialog.destroy()
+                    return
+                dialog.destroy()
 
-        buttons = ttk.Frame(fields)
-        buttons.grid(row=5, column=1, pady=(12, 0))
-        ttk.Button(buttons, text='Save', command=submit).pack(side=tk.LEFT, padx=4)
-        ttk.Button(buttons, text='Cancel', command=dialog.destroy).pack(side=tk.LEFT, padx=4)
-        dialog.bind('<Return>', lambda _: submit())
-        dialog.bind('<Escape>', lambda _: dialog.destroy())
-        self._position_dialog_near_pointer(dialog)
-        dialog.deiconify()
-        target.focus_set()
-        self.root.wait_window(dialog)
-        return result[0]
+            buttons = ttk.Frame(fields)
+            buttons.grid(row=5, column=1, pady=(12, 0))
+            ttk.Button(buttons, text='Save', command=submit).pack(side=tk.LEFT, padx=4)
+            ttk.Button(buttons, text='Cancel', command=dialog.destroy).pack(side=tk.LEFT, padx=4)
+            dialog.bind('<Return>', lambda _: submit())
+            dialog.bind('<Escape>', lambda _: dialog.destroy())
+            self._position_dialog_near_pointer(dialog)
+            dialog.deiconify()
+            target.focus_set()
+            self.root.wait_window(dialog)
+            return result[0]
+        except Exception:
+            if dialog.winfo_exists():
+                dialog.destroy()
+            self._complete_global_operation(initial.get('_operation_id'), False)
+            raise
+
+    def _global_editor_sources(self, initial):
+        initial = initial or {}
+        snapshots = {item['source']: item['snapshot'] for item in self._target_contexts(initial.get('_target_context'))}
+        if initial.get('_replace_rule'):
+            key = initial['_replace_rule'][1]
+            snapshots[key] = initial.get('_source_snapshot')
+        return set(snapshots), snapshots
 
     def add_global_rule_dialog(self, initial=None, replace_rule=None, target_context=None, review=None, pending_reviews=None):
+        initial = copy.deepcopy(initial or {})
         if replace_rule:
-            initial = dict(initial or {}, _replace_rule=replace_rule)
+            with self.lock:
+                snapshot = self.global_ports.get(replace_rule[1])
+            if snapshot is None:
+                self._native_message('showwarning', 'Global Rule', 'This global rule changed or was removed. Refresh Managed Rules.')
+                return False
+            initial.update(_replace_rule=replace_rule, _source_snapshot=copy.deepcopy(snapshot))
         if target_context:
-            initial = dict(initial or {}, _target_context=copy.deepcopy(target_context))
+            initial['_target_context'] = copy.deepcopy(target_context)
         if pending_reviews:
-            initial = dict(initial or {}, _pending_reviews=copy.deepcopy(pending_reviews))
+            initial['_pending_reviews'] = copy.deepcopy(pending_reviews)
+        if review is not None:
+            initial['_review_only'] = True
+        sources, snapshots = self._global_editor_sources(initial)
+        with self.lock:
+            initial.setdefault('_source_versions', {key: getattr(self, 'global_policy_versions', {}).get(key) for key in sources})
+        if not self._global_sources_available(sources):
+            self._native_message('showinfo', 'Global Rule Updating', 'This global rule is updating. Wait for completion before editing it again.')
+            return False
+        retry = getattr(self, 'retry_global_fields', None)
+        if retry and not self._global_draft_current(retry):
+            self.retry_global_fields = retry = None
+        if retry and retry[2:4] == (replace_rule, target_context):
+            draft, _ = self._prepare_global_rule_fields(retry[0], retry[1], replace_rule[1] if replace_rule else None)
+            initial.update(draft, action=retry[0][3])
+        elif target_context:
+            for draft_fields, draft_initial, draft_context in getattr(self, 'retry_connection_reviews', ()):
+                if draft_context == target_context and self._global_draft_current(
+                        (draft_fields, dict(draft_initial, _target_context=draft_context), None, draft_context, 0)):
+                    contexts = self._target_contexts(target_context)
+                    draft, _ = self._prepare_global_rule_fields(draft_fields, draft_initial,
+                        contexts[0]['source'] if len(contexts) == 1 else None)
+                    initial.update(draft, action=draft_fields[3])
+                    break
         fields = self._ask_global_rule_fields(initial)
         if fields is None:
+            if retry and retry[2:4] == (replace_rule, target_context):
+                self.retry_global_fields = None
+            self.retry_connection_reviews = [item for item in getattr(self, 'retry_connection_reviews', ())
+                                             if item[2] != target_context]
             return
         if review is not None:
-            reviewed_initial = {key: value for key, value in (initial or {}).items() if key != '_pending_reviews'}
+            reviewed_initial = {key: value for key, value in initial.items() if key not in {'_pending_reviews', '_review_only'}}
             review(copy.deepcopy((fields, reviewed_initial, target_context)))
             return
+        operation_id = initial.get('_operation_id')
+        if operation_id is None:
+            try:
+                operation_id = self._reserve_global_operation(sources, snapshots, initial.get('_source_versions'))
+            except ValueError as exc:
+                retry = getattr(self, 'retry_global_fields', None)
+                if retry and not self._global_draft_current(retry):
+                    self.retry_global_fields = None
+                self._native_message('showwarning', 'Global Rule', str(exc))
+                return False
+        with self.lock:
+            operation = self.global_operations.get(operation_id)
+            if operation is not None:
+                initial['_source_versions'] = copy.deepcopy(operation['source_versions'])
+                operation['draft'] = copy.deepcopy((fields, initial, replace_rule, target_context, operation_id))
         if self._native_ui_call():
-            snapshot = copy.deepcopy((fields, initial, replace_rule, target_context))
-            self._queue_native_job('Global rule update', lambda: self._apply_global_rule_fields(*snapshot))
-            return
-        return self._apply_global_rule_fields(fields, initial, replace_rule, target_context)
+            snapshot = copy.deepcopy((fields, initial, replace_rule, target_context, operation_id))
+            if not self._queue_native_job('Global rule update', lambda: self._apply_global_rule_fields(*snapshot)):
+                self.retry_global_fields = snapshot
+                self._complete_global_operation(operation_id, False)
+                self._native_message('showwarning', 'Global Rule', 'The edit was not queued. Its draft was retained; reopen the rule to retry.')
+                return False
+            if retry and retry[2:4] == (replace_rule, target_context):
+                self.retry_global_fields = None
+            return None
+        return self._apply_global_rule_fields(fields, initial, replace_rule, target_context, operation_id)
 
     def _prepare_global_rule_fields(self, fields, initial=None, source=None):
-        """Validate/resolve reviewed fields without retiring any saved policy."""
+        """Syntax only. Every forward lookup belongs to the native transaction."""
         target, ports, protocol, action, paths = fields
-        entry = next(iter(self._parse_port_rules([{
-            'targets': [], 'ports': ports, 'protocol': protocol, 'exes': paths,
-            'action': action.split()[0], 'direction': 'Inbound' if action.endswith('Incoming') else
-            'Outbound' if action.endswith('Outgoing') else 'Both'}]).values()))
+        entry = {'targets': [], 'ports': ports, 'protocol': protocol, 'exes': paths,
+                 'action': action.split()[0], 'direction': 'Inbound' if action.endswith('Incoming') else
+                 'Outbound' if action.endswith('Outgoing') else 'Both'}
+        self._parse_port_rules([entry])
         with self.lock:
-            policies = copy.deepcopy(getattr(self, 'global_ports', {}))
-        saved = {item['target']: item['addresses'] for item in (initial or {}).get('targets', [])}
-        targets, failures = [], []
+            saved_policy = self.global_ports.get(source, {}) if source is not None else initial or {}
+        saved = {item['target']: list(item['addresses']) for item in (initial or {}).get('targets', [])}
+        saved.update({item['target']: list(item['addresses']) for item in saved_policy.get('targets', [])})
+        failures = []
         for value in dict.fromkeys(target.split(',')) if target else []:
             name = normalize_target(value)
-            try:
-                if not is_global_target(name):
-                    raise ValueError('Not a valid domain or IP address.')
-                observed = list(saved.get(name, ()))
-                try:
-                    addresses = list(self.resolve_global_target(name, observed))
-                    if not addresses:
-                        raise ValueError('No addresses found.')
-                except ValueError:
-                    # A successful lookup keeps its own effective coverage.
-                    # Only failed preflight needs the writer's saved fallback.
-                    fallback = self._saved_global_target_addresses(
-                        dict(entry, targets=[{'target': name, 'addresses': observed}]), policies, source)
-                    addresses = fallback.get(name, [])
-                    if not addresses:
-                        raise
-                targets.append({'target': name, 'addresses': addresses})
-            except Exception as exc:
-                failures.append(f'{value.strip() or "(empty target)"}: {exc}')
-        entry['targets'] = targets
+            if not is_global_target(name):
+                failures.append(f'{value.strip() or "(empty target)"}: Not a valid domain or IP address.')
+            else:
+                entry['targets'].append({'target': name, 'addresses': saved.get(name, [])})
         return entry, failures
 
-    def _apply_global_rule_fields(self, fields, initial=None, replace_rule=None, target_context=None):
-        receipt = getattr(self, '_unsaved_target_edit', None)
-        if (target_context and receipt and receipt[1] == self.global_ports
-                and getattr(self, '_unsaved_connection_fields', None) == (fields, target_context)):
-            return self._apply_rule_batch([], target_edits=copy.deepcopy(receipt[0]), report=True)
+    def _apply_global_rule_fields(self, fields, initial=None, replace_rule=None, target_context=None, operation_id=None):
+        if isinstance(target_context, list):
+            return self._apply_connection_reviews([(fields, initial or {}, target_context)], operation_id)
+        outcome = self._rule_operation_outcome(operation_id)
         source = target_context['source'] if target_context else replace_rule[1] if replace_rule else None
-        entry, failures = self._prepare_global_rule_fields(fields, initial, source)
-        targets, target = entry['targets'], fields[0]
-        applied = False
-        if (targets or not target) and not (target_context and failures):
+        try:
+            entry, failures = self._prepare_global_rule_fields(fields, initial, source)
+            if failures and (replace_rule or target_context):
+                self._native_message('showwarning', 'Global Rule Update',
+                    'No rules were changed. The existing rule was kept.\n\nTargets not added:\n' + '\n'.join(failures))
+                self._complete_global_operation(operation_id, False)
+                return False
+            if not entry['targets'] and fields[0]:
+                self._native_message('showwarning', 'Global Rule Update', 'No rules were changed.\n\n' + '\n'.join(failures))
+                self._complete_global_operation(operation_id, False)
+                return False
+            if replace_rule:
+                with self.lock:
+                    old = self.global_ports.get(source)
+                parsed = self._parse_port_rules([entry])
+                if old is not None and len(parsed) == 1 and self._editable_policy(next(iter(parsed.values()))) == self._editable_policy(old) and self._policy_verified('port', source):
+                    receipt = getattr(self, '_unsaved_rule_batch', None)
+                    if getattr(self, 'settings_save_error', None) and self._receipt_current(receipt):
+                        identity = receipt['identity']
+                        return self._apply_rule_batch(identity[0], port_updates=identity[1], observed_addresses=identity[2],
+                            replace_rule=identity[3], target_edits=identity[4], order_hint=identity[5],
+                            allow_partial_targets=identity[6], operation_id=operation_id, report=True)
+                    self._complete_global_operation(operation_id, True)
+                    return True
+            # Receipt data retains the original submitted fields after a native
+            # commit, even though its source key may already have been retired.
+            retry = getattr(self, '_unsaved_global_fields', None)
+            receipt = getattr(self, '_unsaved_rule_batch', None)
+            if receipt and retry and retry[:4] == (fields, initial, replace_rule, target_context) and self._receipt_current(receipt):
+                return self._apply_rule_batch(*copy.deepcopy(retry[4]), operation_id=operation_id,
+                                               allow_partial_targets=receipt['identity'][6])
             if target_context:
-                edit = dict(copy.deepcopy(target_context), replacement=entry)
-                applied = self._apply_rule_batch([], target_edits=[edit], report=True)
-                receipt = getattr(self, '_unsaved_target_edit', None)
-                if applied is False and receipt and receipt[0] == [edit]:
-                    self._unsaved_connection_fields = copy.deepcopy((fields, target_context))
+                args = ([], False, None, None, None, True, [dict(copy.deepcopy(target_context), replacement=entry)], None)
             else:
-                applied = self._apply_rule_batch([], port_updates=[entry], replace_rule=replace_rule, report=not failures)
-        if failures:
-            summary = (f'{len(targets)} valid target(s) processed.' if applied else 'No rules were changed.')
-            if targets and not applied:
-                summary = 'The valid targets could not all be applied and saved. See the error details.'
-            if (replace_rule and not targets) or target_context:
-                summary += ' The existing rule was kept.'
-            self._native_message('showwarning', 'Global Rule Update', summary + '\n\nTargets not added:\n' + '\n'.join(failures), parent=self.root)
-        return applied
-
-    def _apply_connection_reviews(self, reviews):
-        """Commit all accepted connection dialogs together, including shared IPs."""
-        if self._native_ui_call():
-            snapshot = copy.deepcopy(reviews)
-            self._queue_native_job('Connection rule updates', lambda: self._apply_connection_reviews(snapshot))
-            return
-        receipt = getattr(self, '_unsaved_target_edit', None)
-        if (receipt and receipt[1] == self.global_ports
-                and getattr(self, '_unsaved_connection_reviews', None) == reviews):
-            return self._apply_rule_batch([], port_updates=list(receipt[2][1].values()),
-                                          target_edits=copy.deepcopy(receipt[0]), report=True)
-        updates, edits, failures = [], [], []
-        for fields, initial, context in reviews:
-            entry, errors = self._prepare_global_rule_fields(fields, initial, context['source'] if context else None)
-            failures.extend(errors)
-            if context:
-                edits.append(dict(copy.deepcopy(context), replacement=entry))
-            else:
-                updates.append(entry)
-        if failures:
-            self._native_message('showwarning', 'Global Rule Update',
-                                 'No rules were changed. Existing target slices were kept.\n\nTargets not added:\n'
-                                 + '\n'.join(failures), parent=self.root)
+                args = ([], False, [entry], None, replace_rule, not failures, None, None)
+            self._last_global_target_failures = []
+            applied = self._apply_rule_batch(*args, operation_id=operation_id,
+                                             allow_partial_targets=not (replace_rule or target_context),
+                                             lookup_feedback=bool(replace_rule or target_context), outcome=outcome)
+            if applied is False and getattr(self, '_unsaved_rule_batch', None):
+                self._unsaved_global_fields = copy.deepcopy((fields, initial, replace_rule, target_context, args))
+            failures.extend(outcome['target_failures'])
+            if failures and not (applied is False and outcome['applied']):
+                processed = len(entry['targets']) - len(outcome['target_failures'])
+                summary = f'{processed} valid target(s) processed.' if applied else 'No rules were changed.'
+                text = (summary + '\n\nTargets not added:\n' + '\n'.join(failures)
+                        + '\nCheck the names or remove rejected targets before retrying.')
+                self.queue_alert('Warning', 'Global rule lookup', '', '', text)
+                self._native_message('showwarning', 'Global Rule Update', text)
+            return applied
+        except Exception as exc:
+            if not isinstance(exc, ValueError):
+                log_internal_error('global_rule_fields', exc)
+                self.queue_alert('High', 'Global rule update', '', '', str(exc))
+            self._complete_global_operation(operation_id, False)
+            self._native_message('showerror', 'Global Rule Update', str(exc) + '\n\n' + self._rule_outcome_text(outcome))
             return False
-        applied = self._apply_rule_batch([], port_updates=updates, target_edits=edits, report=True)
-        receipt = getattr(self, '_unsaved_target_edit', None)
-        if applied is False and edits and receipt and receipt[0] == edits:
-            self._unsaved_connection_reviews = copy.deepcopy(reviews)
-        return applied
+
+    def _apply_connection_reviews(self, reviews, operation_id=None):
+        """Validate all reviewed slices, reserve together, then enqueue one writer."""
+        updates, edits, failures = [], [], []
+        try:
+            for fields, initial, context in reviews:
+                contexts = self._target_contexts(context)
+                entry, errors = self._prepare_global_rule_fields(fields, initial, contexts[0]['source'] if len(contexts) == 1 else None)
+                failures.extend(errors)
+                if contexts:
+                    edits.extend(dict(copy.deepcopy(item), replacement=entry) for item in contexts)
+                else:
+                    updates.append(entry)
+            if failures:
+                self._native_message('showwarning', 'Global Rule Update',
+                                     'No rules were changed. Existing target slices were kept.\n\nTargets not added:\n' + '\n'.join(failures))
+                self._complete_global_operation(operation_id, False)
+                return False
+            retry = getattr(self, '_unsaved_connection_reviews', None)
+            receipt = getattr(self, '_unsaved_rule_batch', None)
+            if receipt and retry == reviews and self._receipt_current(receipt):
+                identity = receipt['identity']
+                return self._apply_rule_batch(identity[0], port_updates=identity[1], observed_addresses=identity[2],
+                    replace_rule=identity[3], target_edits=identity[4], order_hint=identity[5],
+                    allow_partial_targets=identity[6], operation_id=operation_id, report=True)
+            for fields, initial, context in reviews:
+                if not self._global_draft_current((fields, dict(initial, _target_context=context), None, context, 0)):
+                    raise ValueError('This global rule changed or was removed. Reopen the connection editor before retrying.')
+            applied = self._apply_rule_batch([], port_updates=updates, target_edits=edits,
+                                              operation_id=operation_id, report=True)
+            if applied is False:
+                self.retry_connection_reviews = copy.deepcopy(reviews)
+            else:
+                self.retry_connection_reviews = []
+            if applied is False and getattr(self, '_unsaved_rule_batch', None):
+                self._unsaved_connection_reviews = copy.deepcopy(reviews)
+            return applied
+        except Exception as exc:
+            if not isinstance(exc, ValueError):
+                log_internal_error('connection_reviews', exc)
+                self.queue_alert('High', 'Global rule update', '', '', str(exc))
+            self._complete_global_operation(operation_id, False)
+            self._native_message('showerror', 'Global Rule Update', str(exc))
+            return False
+
+    def _combined_connection_global_editor(self, rows):
+        """Review shared fields once, replacing only the captured source target slices."""
+        targets, paths, ports, protocols, contexts = {}, {}, set(), set(), {}
+        all_matched = True
+        try:
+            for row in copy.deepcopy(rows):
+                members = row.get('_members') or [row]
+                for member in members:
+                    path, = rule_executables({'exes': [member.get('exe')]})
+                    paths[normalize_path(path)] = path
+                    selections = self._connection_target_selections(member)
+                    raw_port, protocol = str(member.get('dport', '')), str(member.get('protocol', '')).upper()
+                    if not selections or not raw_port.isdecimal() or not 1 <= int(raw_port) <= 65535 or protocol not in {'TCP', 'UDP'}:
+                        raise ValueError('Every selected connection needs a valid remote IP, port, protocol and full executable path.')
+                    ports.add(int(raw_port)); protocols.add(protocol)
+                    for item in selections:
+                        for target in self._connection_global_targets(item['remote'], item['domain']):
+                            targets.setdefault(target, set()).add(item['remote'])
+                    matches = self.connection_global_rules(member)
+                    all_matched = all_matched and bool(matches)
+                    for rule in matches:
+                        context = self._connection_target_context(member, rule)
+                        saved = contexts.setdefault(context['source'], dict(context, selections=[]))
+                        saved['selections'].extend(context['selections'])
+            initial = {'exes': [paths[key] for key in sorted(paths)], 'ports': sorted(ports),
+                       'protocol': next(iter(protocols)) if len(protocols) == 1 else 'TCP/UDP',
+                       'action': 'Allow', 'editing': all_matched,
+                       'targets': [{'target': target, 'addresses': sorted(addresses)} for target, addresses in sorted(targets.items())]}
+        except ValueError as exc:
+            messagebox.showwarning('Global Rule', str(exc), parent=self.root)
+            return False
+        return self.add_global_rule_dialog(initial, target_context=list(contexts.values()) or None)
 
     def bulk_remote_ports(self, tree, allow):
         ports = set()
@@ -596,12 +769,18 @@ class ViewsMixin:
         if state[0] == column:
             state[1] = not state[1]
         else:
-            state[:] = [column, column in {'#', 'Download (MB)', 'Upload (MB)', 'Time', 'PID'}]
+            state[:] = [column, column in {'#', 'Download (MB)', 'Upload (MB)', 'Time', 'PID'}
+                        and not (tree is self.rules_tree and column == '#')]
         renderer()
 
     @staticmethod
     def search_text(row):
-        return ' '.join(map(str, (row.get('name', ''), row.get('pid', ''), row.get('direction', ''), row.get('protocol', ''), row.get('_local_ports', row.get('lport', '')), row.get('dst_ip', ''), row.get('remote_host', row.get('domain', '')), row.get('dport', ''), mb(row.get('_down', 0)), mb(row.get('_up', 0)), row.get('signal', ''), row.get('exe', '')))).casefold()
+        return ' '.join(map(str, (ViewsMixin._connection_time_text(row), row.get('name', ''), row.get('pid', ''), row.get('direction', ''), row.get('protocol', ''), row.get('_local_ports', row.get('lport', '')), row.get('dst_ip', ''), row.get('remote_host', row.get('domain', '')), row.get('dport', ''), mb(row.get('_down', 0)), mb(row.get('_up', 0)), row.get('signal', ''), row.get('exe', '')))).casefold()
+
+    @staticmethod
+    def _connection_time_text(row):
+        stamp = row.get('run_created_at', row.get('created_at'))
+        return time.strftime('%H:%M:%S', time.localtime(stamp)) if stamp is not None else '—'
 
     def _aggregate_connection_rows(self, members, key=None):
         row = dict(members[0])
@@ -644,7 +823,10 @@ class ViewsMixin:
 
     def sort_monitor_rows(self, rows, state):
         column, reverse = state
-        fields = {'#': lambda r: r['number'], 'Process Name': lambda r: r['name'].casefold(), 'Status': lambda r: self.connection_status(r).casefold(), 'PID': lambda r: r['pid'], 'Direction': lambda r: r['direction'].casefold(), 'Protocol': lambda r: r['protocol'].casefold(), 'Local Port': lambda r: int(self._connection_local_port(r)) if str(self._connection_local_port(r)).isdecimal() else -1, 'Remote IP': lambda r: self._ip_sort_key(r['dst_ip']), 'Remote Host': lambda r: r.get('remote_host', r.get('domain', '')).casefold(), 'Remote Port': lambda r: r['dport'], 'Download (MB)': lambda r: r.get('_down', 0), 'Upload (MB)': lambda r: r.get('_up', 0), 'Signal': lambda r: r.get('signal', '').casefold(), 'Exe Path': lambda r: r['exe'].casefold()}
+        fields = {'#': lambda r: r['number'], 'Process Name': lambda r: r['name'].casefold(), 'Status': lambda r: (r['_render_status'] if '_render_status' in r else self.connection_status(r)).casefold(), 'PID': lambda r: r['pid'], 'Direction': lambda r: r['direction'].casefold(), 'Protocol': lambda r: r['protocol'].casefold(), 'Local Port': lambda r: int(self._connection_local_port(r)) if str(self._connection_local_port(r)).isdecimal() else -1, 'Remote IP': lambda r: self._ip_sort_key(r['dst_ip']), 'Remote Host': lambda r: r.get('remote_host', r.get('domain', '')).casefold(), 'Remote Port': lambda r: r['dport'], 'Download (MB)': lambda r: r.get('_down', 0), 'Upload (MB)': lambda r: r.get('_up', 0), 'Signal': lambda r: r.get('signal', '').casefold(), 'Exe Path': lambda r: r['exe'].casefold()}
+        fields['Time'] = lambda r: r.get('run_created_at', r.get('created_at', 0))
+        fields['Remote Port'] = lambda r: int(r['dport']) if str(r.get('dport', '')).isdecimal() else -1
+        rows.sort(key=lambda r: (r.get('name', '').casefold(), normalize_path(r.get('exe')), str(r.get('key', ''))))
         rows.sort(key=fields.get(column, lambda r: ''), reverse=reverse)
 
     @staticmethod
@@ -663,9 +845,12 @@ class ViewsMixin:
         search = search_var.get().casefold().strip()
         self._refresh_retained_hosts(alerts=False, discover=True)
         with self.lock:
-            rows = self._connection_groups([dict(row) for row in self.active_connections.values()])
-            self.connection_display_groups = {row['key']: row for row in rows}
+            members = [dict(row) for row in self.active_connections.values()]
+        rows = self._connection_groups(members)
+        snapshot = self._connection_render_snapshot()
+        self.connection_display_groups = {row['key']: row for row in rows}
         for row in rows:
+            row['_render_tag'], row['_render_status'] = self._connection_presentation(row, snapshot)
             row['remote_host'] = self.remote_host(row)
             row['_down'] = row.get('download', 0)
             row['_up'] = row.get('upload', 0)
@@ -675,7 +860,7 @@ class ViewsMixin:
         selected = set(tree.selection())
         tree.delete(*tree.get_children())
         for index, row in enumerate(rows):
-            tree.insert('', tk.END, iid=row['key'], values=self.connection_values(row, include_status=True), tags=(self.connection_tag(row, index),))
+            tree.insert('', tk.END, iid=row['key'], values=self.connection_values(row, include_status=True), tags=(row['_render_tag'] or ('watch' if row.get('signal') else 'even' if index % 2 == 0 else 'odd'),))
         if selected:
             tree.selection_set([iid for iid in selected if tree.exists(iid)])
 
@@ -683,7 +868,7 @@ class ViewsMixin:
         self._render_connections(self.tree, self.search_var, self.monitor_sort)
 
     def connection_values(self, row, include_status=True):
-        values = {'#': row['number'], 'Process Name': row['name'], 'Status': self.connection_status(row),
+        values = {'#': row['number'], 'Time': self._connection_time_text(row), 'Process Name': row['name'], 'Status': row['_render_status'] if '_render_status' in row else self.connection_status(row),
                   'PID': row['pid'], 'Direction': row['direction'], 'Protocol': row['protocol'],
                   'Local Port': self._connection_local_port(row), 'Remote IP': row['dst_ip'], 'Remote Host': self.remote_host(row) or '—',
                   'Remote Port': row['dport'], 'Download (MB)': mb(row.get('_down', 0)),
@@ -700,43 +885,61 @@ class ViewsMixin:
         suffix = {'Inbound': ' (in)', 'Outbound': ' (out)'}.get(direction_name(direction), '')
         return f'{action.title()}ed{suffix} (Global)'
 
+    def _connection_render_snapshot(self):
+        for attempt in range(2):
+            matching = self._matching_snapshot()
+            with self.lock:
+                if matching[0] != self._policy_revision_locked():
+                    continue
+                return (matching, dict(getattr(self, 'rule_enforcement', {})) if hasattr(self, 'rule_enforcement') else None,
+                        {key: dict(value) for key, value in getattr(self, 'verified_blocked_paths', self.blocked_paths).items()},
+                        frozenset(self.allowed_apps), frozenset(self.blocked_paths), frozenset(self.auto_prompt_keys))
+        return None
+
+    def _connection_presentation(self, row, snapshot):
+        if snapshot is None:
+            return '', 'Policy updating'
+        matching, states, blocked, allowed, intended, pending = snapshot
+        results = []
+        for member in row.get('_members') or [row]:
+            path = normalize_path(member.get('exe', ''))
+            if path in pending:
+                results.append(('blocked', 'Blocked (Pending)'))
+                continue
+            rules = self._match_endpoint(member, matching[1])
+            verified = [rule for key, rule in rules.items() if states is None or states.get(('port', key)) == 'Verified']
+            app = blocked.get(path, {})
+            direction = direction_name(member.get('direction'))
+            app_block = (app.get('in') and direction != 'Outbound' or app.get('out') and direction != 'Inbound')
+            found = None
+            for action in ('Block', 'Allow'):
+                if action == 'Allow' and app_block:
+                    tag = 'blocked_in' if app.get('in') and not app.get('out') else 'blocked'
+                    found = (tag, 'Blocked (in)' if tag == 'blocked_in' else 'Blocked')
+                    break
+                choices = [rule for rule in verified if rule['action'] == action]
+                if choices:
+                    rule = next((rule for rule in choices if rule['direction'] == 'Both'), choices[0])
+                    found = (self._global_tag(action, rule['direction']), self._global_status(action, rule['direction']))
+                    break
+            if found is None:
+                if path in allowed:
+                    found = ('allowed', 'Allowed')
+                elif rules and any(states is not None and states.get(('port', key)) != 'Verified' for key in rules):
+                    found = ('', 'Policy drift')
+                elif path in intended:
+                    found = ('', 'Block intended (unverified)')
+                else:
+                    found = ('', '—')
+            results.append(found)
+        return results[0] if all(result == results[0] for result in results) else ('', 'Mixed coverage')
+
     def connection_status(self, row):
-        tag = self.connection_tag(row)
-        with self.lock:
-            if normalize_path(row.get('exe', '')) in self.auto_prompt_keys:
-                return 'Blocked (Pending)'
-        if tag.startswith('global_'):
-            _, action, *side = tag.split('_')
-            return self._global_status(action, side[0] if side else 'Both')
-        if tag in {'blocked', 'blocked_in', 'allowed'}:
-            return self.get_rule_status_display(row.get('exe', ''))
-        if any(not self._policy_verified(kind, key) for kind, key, _ in self.connection_global_rules(row)):
-            return 'Policy drift'
-        if normalize_path(row.get('exe')) in self.blocked_paths:
-            return 'Block intended (unverified)'
-        return '\u2014'
+        return self._connection_presentation(row, self._connection_render_snapshot())[1]
 
     def connection_tag(self, row, index=0):
-        # Matching blocks win over allows; a global block wins a block tie.
-        with self.lock:
-            if normalize_path(row.get('exe', '')) in self.auto_prompt_keys:
-                return 'blocked'
-        status = self.get_rule_status(row.get('exe', ''))
-        rules = [data for kind, key, data in self.connection_global_rules(row)
-                 if self._policy_verified(kind, key)]
-        for action in ('Block', 'Allow'):
-            if action == 'Allow':
-                if status == 'blocked_in' and direction_name(row.get('direction')) != 'Outbound':
-                    return 'blocked_in'
-                if status == 'blocked_both' or (status == 'blocked_out' and direction_name(row.get('direction')) != 'Inbound'):
-                    return 'blocked'
-            matching = [rule for rule in rules if rule['action'] == action]
-            if matching:
-                rule = next((rule for rule in matching if direction_name(rule.get('direction')) == 'Both'), matching[0])
-                return self._global_tag(action, rule.get('direction', 'Both'))
-        if status == 'allowed':
-            return 'allowed'
-        return 'watch' if row.get('signal') else 'even' if index % 2 == 0 else 'odd'
+        tag, _ = self._connection_presentation(row, self._connection_render_snapshot())
+        return tag or ('watch' if row.get('signal') else 'even' if index % 2 == 0 else 'odd')
 
     def alert_tag(self, values, iid=None):
         row = self.alert_connection_row(values, iid) if iid else self.alert_context(values)[0]
@@ -761,15 +964,27 @@ class ViewsMixin:
         if not hasattr(self, 'rules_tree'):
             return
         search = self.rule_search_var.get().casefold().strip()
-        rows = list(self.rule_rows)
+        rows = [dict(row) for row in self.rule_rows]
+        with self.lock:
+            pending = set(getattr(self, 'pending_global_sources', {}))
+            states = dict(getattr(self, 'rule_enforcement', {}))
+        for row in rows:
+            if row.get('is_port'):
+                key = row['normalized_path']
+                state = 'Updating' if key in pending else states.get(('port', key), row.get('enforcement', 'Verified'))
+                row['status'] = (self._global_status(row['action'], row['direction']) if state == 'Verified' else
+                                 f"{row['action']} intended ({state.lower()})")
         if search:
-            rows = [row for row in rows if search in ' '.join(map(str, (row['status'], row['rule'], row['action'], row['direction'], row.get('display_path', row['path']), row.get('remote_port', ''), row.get('protocol', ''), ' '.join(row.get('executable_paths', ())), mb(row.get('download', 0)), mb(row.get('upload', 0))))).casefold()]
+            rows = [row for row in rows if search in ' '.join(map(str, (row.get('number', ''), row['status'], row['rule'], row['action'], row['direction'], row.get('display_path', row['path']), row.get('port', ''), row.get('protocol', ''), ' '.join(row.get('executable_paths', ())), mb(row.get('download', 0)), mb(row.get('upload', 0))))).casefold()]
         column, reverse = self.rule_sort
         if column:
-            fields = {'Status': lambda r: r['status'].casefold(), 'Application & Global Rules': lambda r: r['rule'].casefold(), 'Direction': lambda r: r['direction'].casefold(), 'Download (MB)': lambda r: r.get('download', 0), 'Upload (MB)': lambda r: r.get('upload', 0), 'Program Path': lambda r: r.get('display_path', r['path']).casefold()}
-            for label, key in (('Remote Port', 'remote_port'),):
-                fields[label] = lambda r, key=key: int(r[key]) if str(r.get(key, '')).isdecimal() else -1
+            fields = {'#': lambda r: r.get('number', 0), 'Status': lambda r: r['status'].casefold(), 'Application & Global Rules': lambda r: r['rule'].casefold(), 'Direction': lambda r: r['direction'].casefold(), 'Download (MB)': lambda r: r.get('download', 0), 'Upload (MB)': lambda r: r.get('upload', 0), 'Program Path': lambda r: r.get('display_path', r['path']).casefold()}
+            for label, key in (('Port', 'port'),):
+                fields[label] = lambda r, key=key: tuple(int(value.strip()) for value in str(r.get(key, '')).split(',')
+                                                       if value.strip().isdecimal())
             fields['Protocol'] = lambda r: r.get('protocol', '').casefold()
+            rows.sort(key=lambda r: ((os.path.basename(r['executable_paths'][0]) if r.get('executable_paths') else
+                                     r['rule']).casefold(), normalize_path(r.get('display_path', r['path'])), r['iid']))
             rows.sort(key=fields.get(column, lambda r: ''), reverse=reverse)
         selected = set(self.rules_tree.selection())
         self.rules_tree.delete(*self.rules_tree.get_children())
@@ -777,7 +992,7 @@ class ViewsMixin:
             tag = self._global_tag(row['action'], row['direction']) if row.get('global_type') else 'allowed' if row['status'] == 'Allowed' else 'blocked_in' if row['status'] == 'Blocked (in)' else 'blocked'
             down = mb(row.get('download', 0))
             up = mb(row.get('upload', 0))
-            self.rules_tree.insert('', tk.END, iid=row['iid'], values=(row['status'], row['rule'], row['direction'], row.get('remote_port') or 'All', row.get('protocol', ''), down, up, row.get('display_path', row['path'])), tags=(tag,))
+            self.rules_tree.insert('', tk.END, iid=row['iid'], values=(row.get('number', ''), row['status'], row['rule'], row['direction'], row.get('port') or 'All', row.get('protocol', ''), down, up, row.get('display_path', row['path'])), tags=(tag,))
         if selected:
             self.rules_tree.selection_set([iid for iid in selected if self.rules_tree.exists(iid)])
 
@@ -787,47 +1002,35 @@ class ViewsMixin:
         search = self.alert_search_var.get().casefold().strip()
         self._refresh_retained_hosts(live=False, discover=True)
         with self.lock:
-            self._retain_alert_flow_totals_locked()
-            runs = []
-            last = None
-            for alert in self.alerts:
-                saved = getattr(self, 'alert_connections', {}).get(alert[0])
-                signature = self._connection_group_signature(saved) if saved else None
-                boundary = (signature, saved.get('_alert_run_id') if saved else None)
-                if signature is not None and runs and boundary == last:
-                    runs[-1].append((alert, saved))
-                else:
-                    runs.append([(alert, saved)])
-                last = boundary
-            rows = []
-            self.alert_display_groups = {}
-            severity_order = {'Critical': 5, 'High': 4, 'Warning': 3, 'Medium': 3, 'Watch': 2, 'Info': 1}
-            for run in runs:
-                events = [item[0] for item in run]
-                first = events[0]
-                members = [dict(item[1]) for item in run if item[1]]
-                group_id = (run[0][1] or {}).get('_alert_run_id', first[0])
-                iid = f'alert_{group_id}'
-                if members:
-                    row = self._aggregate_connection_rows(members)
-                    row['_grouped'] = len(events) > 1
-                else:
-                    row = {'name': first[3], 'pid': first[4], 'exe': '', 'dst_ip': self._alert_remote_ip(first[5]),
-                           'domain': '', 'protocol': '', 'direction': '', 'lport': '', 'dport': '',
-                           '_local_ports': [], '_down': 0, '_up': 0, '_grouped': False}
-                row['_events'] = events
-                row['_has_connection_totals'] = any(
-                    '_flow_totals' in member or 'download' in member or 'upload' in member for member in members)
-                self.alert_display_groups[iid] = row
-                severe = max(events, key=lambda event: severity_order.get(event[2], 0))
-                data = {'Time': time.strftime('%H:%M:%S', time.localtime(first[1])), 'Severity': severe[2],
-                        'Process': first[3], 'PID': first[4] if str(first[4]).isdecimal() else '—',
-                        'Remote IP': first[5] or '—', 'Remote Host': next((event[6] for event in events if event[6]), '—'),
-                        'Reason': severe[7], 'Local Port': self._connection_local_port(row),
-                        'Download (MB)': mb(row['_down']) if row['_has_connection_totals'] else '—',
-                        'Upload (MB)': mb(row['_up']) if row['_has_connection_totals'] else '—'}
-                values = tuple(data[column] for column in self.ALERT_COLUMNS)
-                rows.append((iid, first[1], data, values, row))
+            events = list(self.alerts)
+            connections = {key: dict(row, **({'_flow_totals': dict(row['_flow_totals'])} if '_flow_totals' in row else {}))
+                           for key, row in getattr(self, 'alert_connections', {}).items()}
+        policy_snapshot = self._connection_render_snapshot()
+        self._retain_alert_flow_totals_locked()
+        rows = []
+        self.alert_display_groups = {}
+        for event in events:
+            iid = f'alert_{event[0]}'
+            saved = connections.get(event[0])
+            if saved:
+                snapshot = dict(saved, run_created_at=saved.get('created_at'))
+                row = self._aggregate_connection_rows([snapshot])
+            else:
+                row = {'name': event[3], 'pid': event[4], 'exe': '', 'dst_ip': self._alert_remote_ip(event[5]),
+                       'domain': '', 'protocol': '', 'direction': '', 'lport': '', 'dport': '',
+                       '_local_ports': [], '_down': 0, '_up': 0, '_grouped': False}
+            row['_events'] = [event]
+            row['_has_connection_totals'] = bool(saved and any(
+                field in saved for field in ('_flow_totals', 'download', 'upload')))
+            self.alert_display_groups[iid] = row
+            data = {'Time': time.strftime('%H:%M:%S', time.localtime(event[1])), 'Severity': event[2],
+                    'Process': event[3], 'PID': event[4] if str(event[4]).isdecimal() else '—',
+                    'Remote IP': event[5] or '—', 'Remote Host': event[6] or '—',
+                    'Reason': event[7], 'Local Port': self._connection_local_port(row),
+                    'Download (MB)': mb(row['_down']) if row['_has_connection_totals'] else '—',
+                    'Upload (MB)': mb(row['_up']) if row['_has_connection_totals'] else '—'}
+            values = tuple(data[column] for column in self.ALERT_COLUMNS)
+            rows.append((iid, event[1], data, values, row))
         column, reverse = self.alert_sort
         def sort_value(item):
             if column == 'Time':
@@ -840,6 +1043,7 @@ class ViewsMixin:
             if column == 'Remote IP':
                 return self._ip_sort_key(item[4].get('dst_ip'))
             return str(item[2].get(column, '')).casefold()
+        rows.sort(key=lambda item: (str(item[2]['Process']).casefold(), normalize_path(item[4].get('exe')), item[4]['_events'][0][0]))
         rows.sort(key=sort_value, reverse=reverse)
         selected = set(self.alerts_tree.selection())
         rendered = []
@@ -848,7 +1052,7 @@ class ViewsMixin:
             searchable += ' ' + ' '.join(str(event) for event in row['_events'])
             if search and search not in searchable.casefold():
                 continue
-            rendered.append((iid, values, self.alert_tag(values, iid)))
+            rendered.append((iid, values, self._connection_presentation(row, policy_snapshot)[0]))
         self.alerts_tree.delete(*self.alerts_tree.get_children())
         for iid, values, tag in rendered:
             self.alerts_tree.insert('', tk.END, iid=iid, values=values, tags=(tag,) if tag else ())
@@ -890,19 +1094,8 @@ class ViewsMixin:
                 self.next_alert_id += 1
                 if len(alert) == 8:
                     connection = alert[-1]
-                    signature = self._connection_group_signature(connection)
-                    last = getattr(self, '_last_alert_group', None)
-                    reused = last and any(
-                        saved.get('_alert_run_id') == last[1]
-                        and self._host_endpoint(saved) == self._host_endpoint(connection)
-                        and self._flow_identity(saved) != self._flow_identity(connection)
-                        for saved in self.alert_connections.values())
-                    connection['_alert_run_id'] = last[1] if signature is not None and last and last[0] == signature and not reused else alert_id
-                    self._last_alert_group = (signature, connection['_alert_run_id'])
                     self.alert_connections[alert_id] = connection
                     alert = alert[:-1]
-                else:
-                    self._last_alert_group = None
                 self.alerts.append((alert_id, *alert))
                 changed = True
             if changed:
@@ -917,7 +1110,6 @@ class ViewsMixin:
             self.alerts.clear()
             self.alert_connections = {}
             self.alert_display_groups = {}
-            self._last_alert_group = None
             while True:
                 try:
                     self.alert_queue.get_nowait()
@@ -986,9 +1178,17 @@ class ViewsMixin:
     def _connection_target_context(self, row, rule):
         _, key, data = rule
         return {'source': key, 'snapshot': copy.deepcopy(data),
-                'selections': self._connection_target_selections(row)}
+                'selections': self._connection_target_selections(self._policy_connection_members(row, key))}
+
+    def _policy_connection_members(self, row, key):
+        snapshot = self._matching_snapshot()
+        members = [member for member in row.get('_members') or [row] if key in self._match_endpoint(member, snapshot[1])]
+        if not members:
+            raise ValueError('This connection no longer matches the selected policy.')
+        return dict(members[0], _members=members) if len(members) > 1 else members[0]
 
     def edit_connection_global_rule(self, row, rule, action=None, review=None, pending_reviews=None):
+        row = self._policy_connection_members(row, rule[1])
         data = rule[2]
         action = action or self._global_action_label(data['action'] == 'Allow', data['direction'])
         draft = dict(self._connection_global_draft(row, action), editing=True)
@@ -1041,7 +1241,7 @@ class ViewsMixin:
     def prompt_selected_global_rules(self, allow, direction='both'):
         action = self._global_action_label(allow, direction)
         for iid, values in self.selected_rows(self.rules_tree):
-            if values and self._managed_rule_category(values[0], values[-1]) != 'app':
+            if values and self._managed_rule_category(self._rule_value(values, 'Status'), values[-1]) != 'app':
                 self.edit_selected_managed_rule(iid, action=action)
 
     def edit_connection_app_rules(self, rows):
@@ -1053,28 +1253,92 @@ class ViewsMixin:
         for row in paths.values():
             self.edit_app_rule(row['exe'], row.get('name', 'Process'))
 
-    def edit_app_rule(self, path, name='Process'):
+    def _choose_connection_app_rule(self, path, name, status, current, endpoint):
+        result = [None]
+        dialog = self._new_rule_editor()
+        if dialog is None:
+            return None
+        try:
+            dialog.withdraw()
+            dialog.title('App Rule')
+            dialog.transient(self.root)
+            dialog.resizable(False, False)
+            self._theme_dialog(dialog)
+            message = (f'{name}\n{path}\n\nCurrent application rule: {status}\n'
+                       'Choose an application rule or an exact connection rule.\n'
+                       'Connection rules are independent; Allow does not override matching blocks.')
+            _, host_widget = self._connection_rule_body(dialog, message, endpoint)
+            host = self.remote_host(endpoint)
+            if host:
+                host_widget.configure(state=tk.NORMAL)
+                host_widget.delete('1.0', tk.END)
+                host_widget.insert('1.0', host)
+                host_widget.configure(state=tk.DISABLED)
+            finished = False
+
+            def choose(action):
+                nonlocal finished
+                if finished:
+                    return
+                value = action
+                if action in {'allow_connection', 'block_connection'}:
+                    try:
+                        value = self._exact_connection_policy(endpoint, path, action == 'allow_connection')
+                    except ValueError as exc:
+                        messagebox.showwarning('Connection Rule', str(exc), parent=dialog)
+                        return
+                finished = True
+                result[0] = value
+                dialog.destroy()
+
+            self._connection_rule_actions(dialog, choose, dialog.destroy, current=current)
+            dialog.protocol('WM_DELETE_WINDOW', dialog.destroy)
+            dialog.bind('<Escape>', lambda _: dialog.destroy())
+            self._position_dialog_near_pointer(dialog)
+            dialog.deiconify()
+            self.root.wait_window(dialog)
+            return result[0]
+        except Exception:
+            if dialog.winfo_exists():
+                dialog.destroy()
+            raise
+
+    def edit_app_rule(self, path, name='Process', connection=None):
         if not path:
             messagebox.showinfo('App Rule', 'The executable path is unavailable. No rule was changed.', parent=self.root)
             return
         status = self.get_rule_status_display(path) if self.application_has_rule(path) else 'No existing rule'
         current = {'allowed': 'allow', 'blocked_both': 'both', 'blocked_in': 'in'}.get(self.get_rule_status(path))
-        action = self._choose_option('App Rule', f'{name}\n{path}\n\nCurrent rule: {status}\nChoose the application rule:', (
-            ('Allow', 'allow', '#4CAF50'), ('Block', 'both', '#c62828'), ('Block Incoming', 'in', '#ff9800')), current=current)
-        if action:
+        endpoint = copy.deepcopy(connection) if connection is not None else None
+        if endpoint is not None:
+            members = endpoint.get('_members') or [endpoint]
+            identities = {(normalize_path(row.get('exe')), str(row.get('dst_ip', '')),
+                           str(row.get('dport', '')), str(row.get('protocol', '')).upper())
+                          for row in [endpoint, *members]}
+            if len(identities) != 1:
+                endpoint = None  # No arbitrary endpoint for a bulk/mixed selection.
+        if endpoint is not None:
+            action = self._choose_connection_app_rule(path, name, status, current, endpoint)
+        else:
+            action = self._choose_option('App Rule', f'{name}\n{path}\n\nCurrent rule: {status}\nChoose the application rule:', (
+                ('Allow', 'allow', '#4CAF50'), ('Block', 'both', '#c62828'), ('Block Incoming', 'in', '#ff9800')), current=current)
+        if isinstance(action, dict):
+            self._apply_rule_batch((), port_updates=[action], report=True)
+        elif action:
             self._apply_rule_batch([(path, action == 'allow', 'both' if action == 'allow' else action, False)], report=True)
 
     def edit_connection_rule(self, row):
+        row = copy.deepcopy(row)  # Also freeze the endpoint across the type chooser.
         rule = self.effective_connection_rule(row)
         if rule and rule[0] != 'app':
             self.edit_connection_global_rule(row, rule)
         elif rule:
-            self.edit_app_rule(row.get('exe', ''), row.get('name', 'Process'))
+            self.edit_app_rule(row.get('exe', ''), row.get('name', 'Process'), connection=row)
         else:
             choice = self._choose_option('Create Rule', 'This connection has no managed rule. Choose a rule type:', (
                 ('App Rule', 'app', '#4CAF50'), ('Global Rule', 'global', GLOBAL_PURPLE)))
             if choice == 'app':
-                self.edit_app_rule(row.get('exe', ''), row.get('name', 'Process'))
+                self.edit_app_rule(row.get('exe', ''), row.get('name', 'Process'), connection=row)
             elif choice == 'global':
                 self.add_global_rule_dialog(self._connection_global_draft(row, 'Allow'))
 
@@ -1150,7 +1414,7 @@ class ViewsMixin:
         return self._remove_rule_batch(requests)
 
     def _show_rule_result(self, title, text):
-        self._native_message('showinfo', title, text, parent=self.root)
+        self._native_message('showinfo', title, text)
 
     def selected_rows(self, tree):
         rows = [(iid, tree.item(iid, 'values')) for iid in tree.selection() if tree.item(iid, 'values')]
@@ -1164,6 +1428,9 @@ class ViewsMixin:
         if str(iid).startswith('port:') and values:
             return (*values[:-1], str(iid)[5:])
         return values
+
+    def _rule_value(self, values, column):
+        return dict(zip(self.RULE_COLUMNS, values)).get(column, '')
 
     def open_file_location_from_tree(self, tree, iid):
         if not iid or not tree.exists(iid):
@@ -1297,9 +1564,9 @@ class ViewsMixin:
         if not iid:
             return self.show_empty_rows_menu(event, self.rules_tree)
         values = self._managed_rule_values(iid, self.rules_tree.item(iid, 'values'))
-        status = str(values[0]).casefold() if values else ''
+        status = str(self._rule_value(values, 'Status')).casefold()
         menu = self._context_menu()
-        direction = str(values[2]) if len(values) > 2 else 'Both'
+        direction = str(self._rule_value(values, 'Direction')) or 'Both'
         category = self._managed_rule_category(status, values[-1] if values else '')
         global_port = category == 'port'
         global_rule = category != 'app'
@@ -1409,16 +1676,18 @@ class ViewsMixin:
     def selected_connection_data(self, tree):
         result = []
         with self.lock:
-            for iid, values in self.selected_rows(tree):
-                row = getattr(self, 'connection_display_groups', {}).get(iid) or self.active_connections.get(iid)
-                if row:
-                    result.append(self._aggregate_connection_rows(row['_members'], iid)
-                                  if row.get('_members') else dict(row))
-                elif values:
-                    columns = tuple(tree['columns'])
-                    mapping = dict(zip(columns, values))
-                    pid_value = mapping.get('PID', 0)
-                    result.append({'key': iid, 'number': mapping.get('#', 0), 'name': mapping.get('Process Name', 'Process'), 'pid': int(pid_value) if str(pid_value).isdigit() else 0, 'direction': mapping.get('Direction', 'Both'), 'protocol': mapping.get('Protocol', ''), 'lport': mapping.get('Local Port', ''), 'dst_ip': mapping.get('Remote IP', ''), 'domain': '' if mapping.get('Remote Host', '—') == '—' else mapping.get('Remote Host', ''), 'dport': mapping.get('Remote Port', ''), 'signal': '' if mapping.get('Signal', '—') == '—' else mapping.get('Signal', ''), 'exe': mapping.get('Exe Path', '')})
+            groups = dict(getattr(self, 'connection_display_groups', {}))
+            connections = {key: dict(row) for key, row in self.active_connections.items()}
+        for iid, values in self.selected_rows(tree):
+            row = groups.get(iid) or connections.get(iid)
+            if row:
+                result.append(self._aggregate_connection_rows(row['_members'], iid)
+                              if row.get('_members') else dict(row))
+            elif values:
+                columns = tuple(tree['columns'])
+                mapping = dict(zip(columns, values))
+                pid_value = mapping.get('PID', 0)
+                result.append({'key': iid, 'number': mapping.get('#', 0), 'name': mapping.get('Process Name', 'Process'), 'pid': int(pid_value) if str(pid_value).isdigit() else 0, 'direction': mapping.get('Direction', 'Both'), 'protocol': mapping.get('Protocol', ''), 'lport': mapping.get('Local Port', ''), 'dst_ip': mapping.get('Remote IP', ''), 'domain': '' if mapping.get('Remote Host', '—') == '—' else mapping.get('Remote Host', ''), 'dport': mapping.get('Remote Port', ''), 'signal': '' if mapping.get('Signal', '—') == '—' else mapping.get('Signal', ''), 'exe': mapping.get('Exe Path', '')})
         return result
 
     def block_process(self, tree=None, direction=None):
@@ -1455,7 +1724,7 @@ class ViewsMixin:
         for _, values in self.selected_rows(self.rules_tree):
             if len(values) < 6:
                 continue
-            category = self._managed_rule_category(values[0], values[-1])
+            category = self._managed_rule_category(self._rule_value(values, 'Status'), values[-1])
             if category == 'port':
                 skipped.append(values[-1])
                 continue
@@ -1465,7 +1734,7 @@ class ViewsMixin:
 
     def remove_selected_rule(self, event=None):
         rows = self.selected_rows(self.rules_tree)
-        self._remove_rules_with_feedback((values[0], values[-1]) for _, values in rows if len(values) >= 6)
+        self._remove_rules_with_feedback((self._rule_value(values, 'Status'), values[-1]) for _, values in rows if len(values) == len(self.RULE_COLUMNS))
 
     def remove_selected_connection_rules(self, tree):
         rows = self.selected_connection_data(tree)
@@ -1530,7 +1799,7 @@ class ViewsMixin:
             paths = rule_executables(data)
             if paths:
                 fields.append('Process: ' + ', '.join(paths))
-            fields.append(f"Remote Port: {', '.join(map(str, data['ports'])) or 'Any'}")
+            fields.append(f"Ports: {', '.join(map(str, data['ports'])) or 'Any'}")
             fields.append(f"Direction: {data['direction']}")
             rules.append(' | '.join(fields))
         return rules
@@ -1544,7 +1813,7 @@ class ViewsMixin:
         remote = row.get('dst_ip') or '—'
         if row.get('dport'):
             remote = f"[{remote}]:{row['dport']}" if ':' in remote else f"{remote}:{row['dport']}"
-        text = f"Process: {row.get('name') or '—'}\nPID: {row.get('pid') or '—'}\nExecutable: {row.get('exe') or '—'}\n\nProtocol: {row.get('protocol') or '—'} ({row.get('direction') or '—'})\nLocal Port: {ports}\nRemote: {remote}\nRemote Host: {self.remote_host(row) or 'Unresolved'}\nSignal: {row.get('signal') or 'None'}\n\nActive Connections: {active_count}\nProcess Download: {mb(stats.get('download', 0))}\nProcess Upload: {mb(stats.get('upload', 0))}"
+        text = f"Process: {row.get('name') or '—'}\nPID: {row.get('pid') or '—'}\nTime: {self._connection_time_text(row)}\nExecutable: {row.get('exe') or '—'}\n\nProtocol: {row.get('protocol') or '—'} ({row.get('direction') or '—'})\nLocal Port: {ports}\nRemote: {remote}\nRemote Host: {self.remote_host(row) or 'Unresolved'}\nSignal: {row.get('signal') or 'None'}\n\nActive Connections: {active_count}\nProcess Download: {mb(stats.get('download', 0))}\nProcess Upload: {mb(stats.get('upload', 0))}"
         available = row.get('_has_connection_totals', 'download' in row or 'upload' in row or '_flow_totals' in row)
         text += '\nConnection Download: ' + (mb(row.get('download', 0)) if available else '—')
         text += '\nConnection Upload: ' + (mb(row.get('upload', 0)) if available else '—')
@@ -1609,7 +1878,7 @@ class ViewsMixin:
             return None
         values = dict(zip(self.RULE_COLUMNS, rows[0][1]))
         path = values['Program Path']
-        extra = f"\nRemote Port: {values['Remote Port'] or '-'}\nProtocol: {values['Protocol']}"
+        extra = f"\nPort: {values['Port'] or '-'}\nProtocol: {values['Protocol']}"
         with self.lock:
             policy = copy.deepcopy(getattr(self, 'global_ports', {}).get(path))
         if policy:
@@ -1619,7 +1888,7 @@ class ViewsMixin:
                 extra += '\nExecutable Paths:\n' + '\n'.join(paths)
             for item in policy['targets']:
                 extra += f"\n{item['target']}: " + (', '.join(item['addresses']) or 'Unresolved')
-        return (f"Status: {values['Status']}\nRule: {values['Application & Global Rules']}"
+        return (f"#: {values['#']}\nStatus: {values['Status']}\nRule: {values['Application & Global Rules']}"
                 f"\nDirection: {values['Direction']}\nDownload: {values['Download (MB)']}"
                 f"\nUpload: {values['Upload (MB)']}\nPath/Target: {path}{extra}")
 
@@ -1747,11 +2016,14 @@ class ViewsMixin:
             return
         try:
             with self.lock:
-                policies = list(self._parse_port_rules(list(getattr(self, 'global_ports', {}).values())).values())
-                data = {'format': 'PyFirewall managed rules', 'version': 8, 'global_rules': policies,
+                policies = copy.deepcopy(list(getattr(self, 'global_ports', {}).values()))
+                self._sync_rule_order_locked()
+                data = {'format': 'PyFirewall managed rules', 'version': 10, 'global_rules': policies,
+                        'rule_order': [value for value in self.rule_order if not value.startswith('observed:')],
                         'exported_at': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                         'rules': [{'action': 'Allow', 'direction': 'Both', 'path': value} for value in sorted(self.allowed_apps)] +
                                  [{'action': 'Block', 'direction': self._direction_from_flags(value), 'path': value['path']} for value in self.blocked_paths.values()]}
+            data['global_rules'] = list(self._parse_port_rules(data['global_rules'], canonical=True).values())
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
             messagebox.showinfo('Export Complete', f'Exported managed rules to:\n{path}')
@@ -1765,13 +2037,14 @@ class ViewsMixin:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            permitted = {'format', 'version', 'global_rules', 'rules', 'exported_at'}
+            permitted = {'format', 'version', 'global_rules', 'rules', 'exported_at', 'rule_order'}
             if (not isinstance(data, dict) or data.get('format') != 'PyFirewall managed rules' or
-                    data.get('version') != 8 or set(data) - permitted or
+                    data.get('version') != 10 or set(data) - permitted or
                     'rules' not in data or 'global_rules' not in data):
-                raise ValueError('Only clean PyFirewall 4.1 rule backups (version 8) can be imported.')
+                raise ValueError('Only PyFirewall managed-rule backups in version 10 can be imported. Older or mixed formats are not supported.')
             rules = data['rules']
-            ports = list(self._parse_port_rules(data['global_rules']).values())
+            policies = self._parse_port_rules(data['global_rules'], canonical=True)
+            ports = list(policies.values())
             if not isinstance(rules, list):
                 raise ValueError('Rule collections must be JSON arrays.')
             requests = []
@@ -1782,12 +2055,15 @@ class ViewsMixin:
                     raise ValueError('Invalid imported application rule.')
                 paths = rule_executables({'exes': [rule['path']]})
                 requests.append((paths[0], rule['action'] == 'Allow', rule['direction'], False))
+            if len({normalize_path(request[0]) for request in requests}) != len(requests):
+                raise ValueError('Duplicate imported application rule.')
+            order = self._validate_rule_order(data.get('rule_order'), [request[0] for request in requests], policies)
             if not requests and not ports:
                 messagebox.showerror('Import Rules', 'No valid managed rules were found.')
                 return
             if not messagebox.askyesno('Import Rules', f'Apply {len(requests) + len(ports)} imported rule(s)?'):
                 return
-            options = {'port_updates': ports}
+            options = {'port_updates': ports, 'order_hint': order}
             if self._native_ui_call():
                 self._queue_native_job('Import rules', lambda: self._import_rule_batch(requests, options))
             else:

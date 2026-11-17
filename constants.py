@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "4.3"
+__version__ = "4.7"
 LATEST_RELEASE_API = 'https://api.github.com/repos/EolnMsuk/PyFirewall/releases/latest'
 LATEST_RELEASE_PAGE = 'https://github.com/EolnMsuk/PyFirewall/releases/latest'
 DEFAULT_CHECK_UPDATES_ON_STARTUP = True
@@ -45,3 +45,5 @@ TRAFFIC_PRUNE_INTERVAL = 30.0
 ALERT_BACKLOG_LIMIT = 1024
 RATE_MAX_KEYS = 8192
 INTERNAL_ERROR_LOG_FILE = os.path.join(SCRIPT_DIR, 'firewall_monitor_errors.log')
+UI_DIAGNOSTIC_LOG_FILE = os.path.join(SCRIPT_DIR, 'firewall_monitor_diagnostics.log')
+FAULT_LOG_FILE = os.path.join(SCRIPT_DIR, 'firewall_monitor_faults.log')

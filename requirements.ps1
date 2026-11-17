@@ -409,7 +409,7 @@ try {
     }
     # Releases include the entry point and its sibling implementation modules.
     foreach ($module in 'app.py','widgets.py','tray.py','firewall.py','settings.py',
-                        'monitoring.py','auto_block.py','views.py','updates.py','constants.py','helpers.py') {
+                        'monitoring.py','auto_block.py','views.py','updates.py','constants.py','helpers.py','diagnostics.py') {
         if (-not (Test-Path -LiteralPath (Join-Path $ScriptDir $module) -PathType Leaf)) {
             throw "Required application module is missing: $module. Extract all PyFirewall files into the same directory."
         }

@@ -124,39 +124,55 @@ def main():
     """Elevate and start one GUI instance when explicitly launched."""
     if os.name != 'nt':
         raise SystemExit('This application requires Windows.')
-    hide_console()
-    elevate()
-    if not acquire_single_instance():
-        return
-
-    # Delay application/dependency imports until after the startup guards.
-    try:
-        from app import FirewallMonitorApp
-    except ImportError as exc:
-        raise SystemExit(f'Missing dependency or application module: {exc}. '
-                         'Keep all PyFirewall files together and install psutil, scapy, and Npcap first.') from exc
-    import tkinter as tk
-    from constants import ICON_FILE
-
-    root = tk.Tk()
-    if os.path.exists(ICON_FILE):
-        try:
-            root.iconbitmap(default=ICON_FILE)
-        except tk.TclError:
-            pass
+    from diagnostics import RuntimeDiagnostics
+    diagnostics = RuntimeDiagnostics()
     application = None
+    owned = False
     try:
-        application = FirewallMonitorApp(root, activation_port=instance_activation_port())
+        diagnostics.install()
+        hide_console()
+        elevate()
+        owned = acquire_single_instance()
+        if not owned:
+            return
+        diagnostics.enable_faults()
+        # Delay application/dependency imports until after the startup guards.
+        try:
+            from app import FirewallMonitorApp
+        except ImportError as exc:
+            diagnostics.report_exception('startup_import', exc, exc.__traceback__)
+            raise SystemExit(f'Missing dependency or application module: {exc}. '
+                             'Keep all PyFirewall files together and install psutil, scapy, and Npcap first.') from exc
+        import tkinter as tk
+        from constants import ICON_FILE
+
+        root = tk.Tk()
+        diagnostics.attach(root)
+        if os.path.exists(ICON_FILE):
+            try:
+                root.iconbitmap(default=ICON_FILE)
+            except tk.TclError:
+                pass
+        application = FirewallMonitorApp(root, activation_port=instance_activation_port(), diagnostics=diagnostics)
         root.mainloop()
+    except Exception as exc:
+        diagnostics.report_exception('main/startup', exc, exc.__traceback__)
+        raise
     finally:
-        worker = getattr(application, 'native_worker', None)
-        if isinstance(worker, threading.Thread) and worker.is_alive():
-            if not application.closed:
-                application.on_closing()
-            # Even an exceptional mainloop exit cannot release native ownership
-            # while a transaction or profile restoration is still running.
-            worker.join()
-        release_single_instance()
+        try:
+            worker = getattr(application, 'native_worker', None)
+            if isinstance(worker, threading.Thread) and worker.is_alive():
+                try:
+                    if not application.closed:
+                        application.on_closing()
+                finally:
+                    # Keep ownership until outstanding transactions/restoration end,
+                    # including on an exceptional mainloop exit.
+                    worker.join()
+            if owned:
+                release_single_instance()
+        finally:
+            diagnostics.close()
 
 
 if __name__ == '__main__':

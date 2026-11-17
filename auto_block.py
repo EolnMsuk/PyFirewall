@@ -3,11 +3,13 @@
 import queue
 import copy
 import threading
+import time
+from collections import OrderedDict
 import tkinter as tk
 from tkinter import messagebox
 
 from helpers import direction_name, log_internal_error, normalize_path
-from widgets import add_tooltip, sync_tooltip_stacking
+from widgets import sync_tooltip_stacking
 
 class AutoBlockMixin:
     """Methods composed into FirewallMonitorApp; state is owned by that application."""
@@ -31,9 +33,183 @@ class AutoBlockMixin:
         return dict(connection, exe=exe, dst_ip=remote_ip, domain=domain, direction=direction, key=key)
 
     def _threshold_has_rule(self, row):
-        return self.connection_has_rule(row.get('exe'), row.get('dst_ip', ''), row.get('domain', ''),
-                                        row.get('direction'), row.get('lport'), row.get('dport'),
-                                        row.get('protocol', 'TCP'))
+        cached = row.get('_coverage')
+        if cached and cached[0] == self._policy_revision_locked():
+            return cached[1]
+        if self.lock._is_owned():
+            # Unknown coverage retains requests/holds. Callers refresh detached
+            # endpoints outside the lock before admitting or retiring work.
+            return False
+        row['_coverage'] = self._connection_coverage(row)
+        return row['_coverage'][1]
+
+    def _connection_coverage(self, row, snapshot=None):
+        snapshot = snapshot if snapshot is not None else self._matching_snapshot()
+        revision, _ = snapshot
+        matching = self.matching_global_port_rules(row, snapshot)
+        with self.lock:
+            keys = frozenset(key for key in matching if self._policy_verified('port', key))
+            status = self.get_rule_status(row.get('exe'))
+        direction = direction_name(row.get('direction'))
+        covered = bool(keys) or status in {'allowed', 'blocked_both'} or status == 'blocked_in' and direction == 'Inbound' or status == 'blocked_out' and direction == 'Outbound'
+        return revision, covered, keys
+
+    def _refresh_pending_coverage(self, key=None):
+        with self.lock:
+            rows = [row for path, pending in getattr(self, 'auto_pending_requests', {}).items()
+                    if key is None or path == key for row in pending.values()]
+            rows.extend(saved[1] for path, saved in getattr(self, 'auto_prompt_connections', {}).items() if key is None or path == key)
+            rows.extend(saved[1] for (path, _), saved in getattr(self, 'auto_detection_requests', {}).items() if key is None or path == key)
+        snapshot = self._matching_snapshot()
+        values = [(row, self._connection_coverage(row, snapshot)) for row in rows]
+        with self.lock:
+            if snapshot[0] == self._policy_revision_locked():
+                for row, coverage in values:
+                    row['_coverage'] = coverage
+
+    @staticmethod
+    def _auto_request_identity(row):
+        return (str(row.get('dst_ip', '')).casefold(), str(row.get('lport', '')), str(row.get('dport', '')),
+                str(row.get('protocol', '')).upper(), direction_name(row.get('direction')))
+
+    def _admit_auto_request_locked(self, row, reason='connection', detail=''):
+        """Admission is capture-side state, independent of a discardable worker job."""
+        key = normalize_path(row.get('exe'))
+        if not key or self._threshold_has_rule(row) or not self._auto_block_active():
+            return False
+        if not hasattr(self, 'auto_pending_requests'):
+            self.auto_pending_requests = {}
+        identity = self._auto_request_identity(row)
+        pending = self.auto_pending_requests.get(key, {})
+        if identity in pending:
+            return True
+        if (len(pending) >= 128 or sum(map(len, self.auto_pending_requests.values())) >= 2048
+                or key not in self.auto_pending_requests and len(self.auto_pending_requests) >= 128):
+            self.dropped_auto_requests = getattr(self, 'dropped_auto_requests', 0) + 1
+            return False
+        self.auto_request_serial = getattr(self, 'auto_request_serial', 0) + 1
+        snapshot = copy.deepcopy(row)
+        snapshot.update(_request_id=self.auto_request_serial, _prompt_reason=reason, _prompt_detail=detail)
+        self.auto_pending_requests.setdefault(key, {})[identity] = snapshot
+        self.auto_prompt_keys.add(key)
+        return True
+
+    def _observe_auto_request_locked(self, row, now):
+        """Bounded detection-window snapshots also cover sub-threshold arrivals."""
+        if not self._auto_block_active() or self._threshold_has_rule(row):
+            return
+        if not hasattr(self, 'auto_detection_requests'):
+            self.auto_detection_requests = OrderedDict()
+        history = self.auto_detection_requests
+        window = getattr(self, 'rate_window', 5.0)
+        while history and now - next(iter(history.values()))[0] > window:
+            history.popitem(last=False)
+        key = normalize_path(row.get('exe'))
+        identity = (key, self._auto_request_identity(row))
+        history.pop(identity, None)
+        if len(history) >= 2048:
+            history.popitem(last=False)
+        history[identity] = (now, copy.deepcopy(row))
+        if key in self.auto_prompt_keys:
+            self._admit_auto_request_locked(row)
+
+    def _auto_request_id_locked(self, key):
+        saved = getattr(self, 'auto_prompt_connections', {}).get(key)
+        return saved[1].get('_request_id') if saved else None
+
+    def _publish_auto_request_locked(self, key, generation):
+        if key in self.auto_prompt_connections or getattr(self, 'auto_hold_ready', {}).get(key) != generation:
+            return
+        pending = getattr(self, 'auto_pending_requests', {}).get(key, {})
+        for row in pending.values():
+            if not self._threshold_has_rule(row):
+                self.auto_prompt_connections[key] = (generation, row)
+                self.prompt_queue.put((generation, key, row.get('name', 'Process'), row['exe'], row.get('pid', 0),
+                                       row.get('dst_ip', ''), row.get('domain', ''), row.get('direction'),
+                                       row.get('_prompt_reason', 'connection'), row.get('_prompt_detail', ''), row['_request_id']))
+                return
+
+    def _remaining_auto_requests_locked(self, key, request_id=None):
+        return [row for row in getattr(self, 'auto_pending_requests', {}).get(key, {}).values()
+                if row.get('_request_id') != request_id and not self._threshold_has_rule(row)]
+
+    def _finish_auto_request(self, key, generation, request_id=None):
+        """Close exactly this request; later requests retain their application hold."""
+        self._refresh_pending_coverage(key)
+        with self.lock:
+            if generation != self.auto_prompt_generation or self._auto_request_id_locked(key) != request_id:
+                return
+            pending = getattr(self, 'auto_pending_requests', {}).get(key, {})
+            for identity, row in list(pending.items()):
+                if self._threshold_has_rule(row):
+                    pending.pop(identity)
+                elif row.get('_request_id') == request_id:
+                    # An incoming-only app choice can leave this outgoing request unresolved.
+                    self.auto_request_serial = getattr(self, 'auto_request_serial', 0) + 1
+                    pending[identity] = dict(row, _request_id=self.auto_request_serial)
+            self.auto_prompt_connections.pop(key, None)
+            getattr(self, 'auto_decision_saves', {}).pop(key, None)
+            getattr(self, 'auto_decision_errors', {}).pop(key, None)
+            if pending:
+                if self.auto_hold_cleanup.get(key) == generation and self.auto_hold_owners.get(key) == generation:
+                    self.auto_hold_cleanup.pop(key, None)
+                self._publish_auto_request_locked(key, generation)
+            else:
+                getattr(self, 'auto_pending_requests', {}).pop(key, None)
+                self.auto_prompt_keys.discard(key)
+        self._dismiss_auto_dialog((generation, key, request_id))
+
+    def _schedule_auto_hold(self, key, generation):
+        self._refresh_pending_coverage(key)
+        with self.lock:
+            if (generation != self.auto_prompt_generation or key not in self.auto_prompt_keys
+                    or getattr(self, 'auto_hold_ready', {}).get(key) == generation):
+                return
+            pending = getattr(self, 'auto_pending_requests', {}).get(key, {})
+            for identity, candidate in list(pending.items()):
+                if self._threshold_has_rule(candidate):
+                    pending.pop(identity)
+            if not pending:
+                self.auto_prompt_keys.discard(key)
+                getattr(self, 'auto_pending_requests', {}).pop(key, None)
+                return
+            row = next(iter(pending.values()))
+        args = (row.get('name', 'Process'), row['exe'], row.get('pid', 0), row['dst_ip'],
+                row.get('domain', ''), row.get('direction'), row.get('key', ''),
+                row.get('_prompt_reason', 'connection'), row.get('_prompt_detail', ''), row)
+        if hasattr(self, 'native_jobs') and threading.current_thread() is not self.native_worker:
+            self._queue_native_job('Auto-Block hold', lambda: self._install_pending_auto_hold(*args),
+                                   key=('hold', key, generation))
+        else:
+            self._install_pending_auto_hold(*args)
+
+    def _install_pending_auto_hold(self, *args):
+        with self.firewall_lock:
+            self._start_auto_block_locked(*args)
+
+    def _reconcile_auto_requests(self, owners, generation):
+        """A saved manual policy retires only requests it actually covers."""
+        ok = True
+        for key in owners:
+            self._refresh_pending_coverage(key)
+            with self.lock:
+                if generation != self.auto_prompt_generation or self.auto_hold_owners.get(key, owners[key]) != owners[key]:
+                    continue
+                saved = self.auto_prompt_connections.get(key)
+                pending = getattr(self, 'auto_pending_requests', {}).get(key, {})
+                active = saved[1] if saved and saved[0] == generation else None
+                uncovered = any(not self._threshold_has_rule(row) for row in pending.values())
+                uncovered = uncovered or active is not None and not self._threshold_has_rule(active)
+            if not uncovered:
+                with self.lock:
+                    has_hold = key in self.auto_hold_owners or key in self.auto_hold_cleanup
+                if has_hold and not self._release_auto_hold_locked(key, owners[key], resolve_prompt=True):
+                    ok = False
+                    continue
+                self._cancel_app_prompt(key, owners[key])
+            elif active is not None and self._threshold_has_rule(active):
+                self._finish_auto_request(key, generation, active.get('_request_id'))
+        return ok
 
     def handle_threshold(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail, connection=None):
         row = self._threshold_connection(exe, remote_ip, domain, direction, key, connection)
@@ -79,14 +255,14 @@ class AutoBlockMixin:
         try:
             with self.firewall_lock:
                 self._require_valid_policy_settings()
+                row = connection or self._threshold_connection(exe, remote_ip, domain, direction, '')
+                row['_coverage'] = self._connection_coverage(row)
                 with self.lock:
                     if not self.log_alerts_only or not self.auto_block_enabled or self.is_paused or self.closed:
                         return False
                     if norm in self.allowed_apps:
                         return False
                     if prompt_generation is not None and prompt_generation != self.auto_prompt_generation:
-                        return False
-                    if self.is_globally_blocked(remote_ip, domain, direction) or self.is_globally_allowed(remote_ip, domain, direction):
                         return False
                     if connection is not None and (not self._threshold_current(connection) or self._threshold_has_rule(connection)):
                         return False
@@ -114,29 +290,50 @@ class AutoBlockMixin:
 
     # Prompt cancellation and publication
 
-    def _dismiss_auto_dialog(self, dialog):
-        if dialog is None:
-            return
+    def _dismiss_auto_dialog(self, identity):
         if threading.get_ident() != getattr(self, 'ui_thread_id', threading.main_thread().ident):
-            self.ui_queue.put(('close_dialog', dialog))
+            self.ui_queue.put(('close_auto_dialog', identity))
             return
+        self._close_auto_dialog(identity)
+
+    def _close_auto_dialog(self, identity):
+        current = getattr(self, 'auto_prompt_identity', None)
+        if current is None:
+            return
+        if identity[0] == 'before':
+            if current[0] >= identity[1]:
+                return
+        elif identity != current:
+            return
+        dialog = self.auto_prompt_dialog
+        self.auto_prompt_details = self.auto_prompt_dialog = self.auto_prompt_key = None
+        self.auto_prompt_identity = None
+        self.auto_prompt_active = False
         try:
-            dialog.destroy()
+            if dialog is not None:
+                dialog.destroy()
         except tk.TclError:
             pass
 
     def _cancel_app_prompt(self, norm, generation=None):
-        dialog = None
         with self.lock:
             if generation is not None and (generation != self.auto_prompt_generation
                     or getattr(self, 'auto_hold_owners', {}).get(norm, generation) != generation):
                 return
+            identity = (self.auto_prompt_generation, norm, self._auto_request_id_locked(norm))
             self.auto_prompt_keys.discard(norm)
             getattr(self, 'auto_prompt_connections', {}).pop(norm, None)
+            getattr(self, 'auto_pending_requests', {}).pop(norm, None)
+            history = getattr(self, 'auto_detection_requests', {})
+            for identity in [identity for identity in history if identity[0] == norm]:
+                history.pop(identity, None)
             getattr(self, 'auto_decision_saves', {}).pop(norm, None)
             getattr(self, 'auto_decision_errors', {}).pop(norm, None)
-            getattr(self, 'auto_hold_owners', {}).pop(norm, None)
-            getattr(self, 'auto_hold_cleanup', {}).pop(norm, None)
+            owner = getattr(self, 'auto_hold_owners', {}).pop(norm, None)
+            if owner is not None:
+                # Cancellation retires protection; failed cleanup remains a worker obligation.
+                self.auto_hold_cleanup[norm] = owner
+            getattr(self, 'auto_hold_ready', {}).pop(norm, None)
             pending = []
             while True:
                 try:
@@ -147,16 +344,9 @@ class AutoBlockMixin:
                     pending.append(item)
             for item in pending:
                 self.prompt_queue.put(item)
-            if self.auto_prompt_key == norm:
-                dialog = self.auto_prompt_dialog
-                self.auto_prompt_details = None
-                self.auto_prompt_dialog = None
-                self.auto_prompt_key = None
-                self.auto_prompt_active = False
-        self._dismiss_auto_dialog(dialog)
+        self._dismiss_auto_dialog(identity)
 
     def _invalidate_auto_prompts(self, close_dialog=False):
-        dialog = None
         with self.lock:
             if not hasattr(self, 'auto_hold_cleanup'):
                 self.auto_hold_cleanup = {}
@@ -167,36 +357,47 @@ class AutoBlockMixin:
             self.upload_alerted.clear()
             self.auto_prompt_keys.clear()
             getattr(self, 'auto_prompt_connections', {}).clear()
+            getattr(self, 'auto_pending_requests', {}).clear()
+            getattr(self, 'auto_detection_requests', {}).clear()
             getattr(self, 'auto_decision_saves', {}).clear()
             getattr(self, 'auto_decision_errors', {}).clear()
-            self.auto_prompt_details = None
-            if close_dialog:
-                dialog = self.auto_prompt_dialog
-                self.auto_prompt_dialog = None
-                self.auto_prompt_key = None
-                self.auto_prompt_active = False
+            generation = self.auto_prompt_generation
             while True:
                 try:
                     self.prompt_queue.get_nowait()
                 except queue.Empty:
                     break
-        self._dismiss_auto_dialog(dialog)
+        if close_dialog:
+            self._dismiss_auto_dialog(('before', generation))
 
     def start_auto_block(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail, connection=None):
         row = self._threshold_connection(exe, remote_ip, domain, direction, key, connection)
+        row['_coverage'] = self._connection_coverage(row)
+        self._refresh_pending_coverage(normalize_path(exe))
         with self.lock:
             row.setdefault('_detection_token', self._detection_token_locked())
-        if hasattr(self, 'native_jobs') and threading.current_thread() is not self.native_worker:
-            self._queue_native_job('Auto-Block hold', lambda: self.start_auto_block(
-                proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail, row),
-                key=('hold', normalize_path(exe) or key, key, row['_detection_token']))
-            return
-        with self.firewall_lock:
-            self._start_auto_block_locked(proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail, row)
+            row.setdefault('name', proc_name)
+            row.setdefault('pid', pid)
+            if not self._threshold_current(row):
+                return
+            prompt_key = normalize_path(exe)
+            generation = self.auto_prompt_generation
+            dropped = getattr(self, 'dropped_auto_requests', 0)
+            if prompt_key not in self.auto_prompt_keys:
+                now = time.monotonic()
+                for (path, _), (seen, snapshot) in getattr(self, 'auto_detection_requests', {}).items():
+                    if path == prompt_key and now - seen <= getattr(self, 'rate_window', 5.0):
+                        self._admit_auto_request_locked(snapshot, reason, detail)
+            self._admit_auto_request_locked(row, reason, detail)
+            overflow = getattr(self, 'dropped_auto_requests', 0) > dropped
+        if overflow:
+            self.queue_alert('High', proc_name, pid, remote_ip, 'Auto-Block request capacity reached. Resolve pending requests; additional requests were not admitted.')
+        self._schedule_auto_hold(prompt_key, generation)
 
     def _start_auto_block_locked(self, proc_name, exe, pid, remote_ip, domain, direction, key, reason, detail, connection=None):
         prompt_key = normalize_path(exe) or key
         row = self._threshold_connection(exe, remote_ip, domain, direction, key, connection)
+        row['_coverage'] = self._connection_coverage(row)
         with self.lock:
             if not self._threshold_current(row):
                 return
@@ -204,11 +405,8 @@ class AutoBlockMixin:
                 return
             if not self.log_alerts_only or not self.auto_block_enabled or self.is_paused or self.closed:
                 return
-            if prompt_key in self.auto_prompt_keys:
-                return
-            if len(self.auto_prompt_keys) >= 128:
-                self.queue_alert('High', proc_name, pid, remote_ip,
-                                 'Auto-Block prompt capacity reached. Resolve pending decisions; this hold was not installed.')
+            if getattr(self, 'auto_hold_ready', {}).get(prompt_key) == self.auto_prompt_generation:
+                self._publish_auto_request_locked(prompt_key, self.auto_prompt_generation)
                 return
             generation = self.auto_prompt_generation
             self.auto_prompt_keys.add(prompt_key)
@@ -219,7 +417,6 @@ class AutoBlockMixin:
                 self._release_auto_hold_locked(prompt_key, generation)
             with self.lock:
                 current = generation == self.auto_prompt_generation
-                self.auto_prompt_keys.discard(prompt_key)
                 active_now = self.log_alerts_only and self.auto_block_enabled and (not self.is_paused) and (not self.closed)
             if current and active_now and not self._threshold_has_rule(row):
                 self.queue_alert('High', proc_name, pid, remote_ip, 'Threshold reached, but the temporary Auto-Block hold could not be installed.')
@@ -232,10 +429,14 @@ class AutoBlockMixin:
                 stale = True
             else:
                 stale = False
+                if not hasattr(self, 'auto_hold_ready'):
+                    self.auto_hold_ready = {}
+                self.auto_hold_ready[prompt_key] = generation
+                if self.auto_hold_cleanup.get(prompt_key) == generation:
+                    self.auto_hold_cleanup.pop(prompt_key, None)
                 if not hasattr(self, 'auto_prompt_connections'):
                     self.auto_prompt_connections = {}
-                self.auto_prompt_connections[prompt_key] = (generation, row)
-                self.prompt_queue.put((generation, prompt_key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail))
+                self._publish_auto_request_locked(prompt_key, generation)
         if stale:
             self._release_auto_hold_locked(prompt_key, generation)
             with self.lock:
@@ -248,7 +449,7 @@ class AutoBlockMixin:
             pending = getattr(self, 'auto_decision_saves', {}).get(path)
             if (not resolve_prompt and pending and pending['kind'] == 'port'
                     and pending['generation'] == generation == self.auto_prompt_generation
-                    and self.auto_prompt_key == path):
+                    and self._auto_request_id_locked(path) == pending.get('request_id')):
                 # A failed active connection decision retains its hold until
                 # verification/save/cleanup is retried through that prompt.
                 return False
@@ -270,6 +471,8 @@ class AutoBlockMixin:
         with self.lock:
             if getattr(self, 'auto_hold_owners', {}).get(path) == generation:
                 self.auto_hold_owners.pop(path, None)
+            if getattr(self, 'auto_hold_ready', {}).get(path) == generation:
+                self.auto_hold_ready.pop(path, None)
             if getattr(self, 'auto_hold_cleanup', {}).get(path) == generation:
                 self.auto_hold_cleanup.pop(path, None)
         return True
@@ -280,11 +483,20 @@ class AutoBlockMixin:
             self._invalidate_auto_prompts(close_dialog=True)
             with self.lock:
                 getattr(self, 'auto_hold_owners', {}).clear()
+                getattr(self, 'auto_hold_ready', {}).clear()
                 getattr(self, 'auto_hold_cleanup', {}).clear()
 
     # UI dispatch and background decisions
 
     def drain_prompt_queue(self):
+        self._refresh_pending_coverage()
+        with self.lock:
+            waiting = [(key, self.auto_prompt_generation) for key in self.auto_prompt_keys
+                       if key not in self.auto_prompt_connections]
+        for key, generation in waiting:
+            self._schedule_auto_hold(key, generation)
+            with self.lock:
+                self._publish_auto_request_locked(key, generation)
         with self.lock:
             if self.auto_prompt_active:
                 return
@@ -292,7 +504,8 @@ class AutoBlockMixin:
             item = self.prompt_queue.get_nowait()
         except queue.Empty:
             return
-        generation, key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail = item
+        generation, key, proc_name, exe, pid, remote_ip, domain, direction, reason, detail = item[:10]
+        request_id = item[10] if len(item) > 10 else None
         # Never wait for native work on Tk. Obsolete holds remain represented by
         # their owner until the worker can retire them.
         if not self.firewall_lock.acquire(blocking=False):
@@ -302,20 +515,23 @@ class AutoBlockMixin:
             with self.lock:
                 current_generation = generation == self.auto_prompt_generation and key in self.auto_prompt_keys
                 saved = getattr(self, 'auto_prompt_connections', {}).get(key)
+                if request_id is not None and (not saved or saved[1].get('_request_id') != request_id):
+                    return
                 row = saved[1] if saved and saved[0] == generation else self._threshold_connection(exe, remote_ip, domain, direction, key)
             if not current_generation or not self._auto_block_active() or self._threshold_has_rule(row):
                 with self.lock:
-                    self.auto_hold_cleanup[normalize_path(exe)] = generation
-                if not hasattr(self, 'native_jobs'):
+                    remaining = self._remaining_auto_requests_locked(key, row.get('_request_id')) if current_generation else []
+                    if not remaining:
+                        self.auto_hold_cleanup.setdefault(normalize_path(exe), generation)
+                if not remaining and not hasattr(self, 'native_jobs'):
                     self._release_auto_hold_locked(normalize_path(exe), generation)
-                with self.lock:
-                    if generation == self.auto_prompt_generation:
-                        self.auto_prompt_keys.discard(key)
-                        getattr(self, 'auto_prompt_connections', {}).pop(key, None)
+                if current_generation:
+                    self._finish_auto_request(key, generation, row.get('_request_id'))
                 return
             with self.lock:
                 self.auto_prompt_active = True
                 self.auto_prompt_key = key
+                self.auto_prompt_identity = (generation, key, row.get('_request_id'))
         finally:
             self.firewall_lock.release()
         self.show_auto_prompt(generation, key, proc_name, exe, pid, remote_ip, reason, detail)
@@ -325,16 +541,22 @@ class AutoBlockMixin:
             return (self.log_alerts_only and self.auto_block_enabled and not self.is_paused
                     and not self.closed and not getattr(self, 'settings_load_error', None))
 
-    def _auto_decision_worker(self, generation, key, exe, proc_name, choice, result_queue):
+    def _auto_decision_worker(self, generation, key, exe, proc_name, choice, result_queue, request_id=None):
         """Apply a decision without calling Tk; the prompt owns result delivery."""
         ok = None
         norm = normalize_path(exe)
+        self._refresh_pending_coverage(key)
         with self.lock:
-            if generation == self.auto_prompt_generation and self.auto_prompt_key == key:
+            if request_id is None:
+                request_id = self._auto_request_id_locked(key)
+            def same_request():
+                return (generation == self.auto_prompt_generation and self.auto_prompt_key == key
+                        and self._auto_request_id_locked(key) == request_id)
+            if same_request():
                 getattr(self, 'auto_decision_errors', {}).pop(key, None)
         def own_commit():
             pending = getattr(self, 'auto_decision_saves', {}).get(key)
-            if pending is None or pending['generation'] != generation:
+            if pending is None or pending['generation'] != generation or pending.get('request_id') != request_id:
                 return False
             if pending['kind'] == 'app':
                 return pending['version'] == getattr(self, 'app_policy_versions', {}).get(norm)
@@ -344,14 +566,14 @@ class AutoBlockMixin:
         def committed(version):
             if not hasattr(self, 'auto_decision_saves'):
                 self.auto_decision_saves = {}
-            self.auto_decision_saves[key] = {'generation': generation, 'choice': choice,
+            self.auto_decision_saves[key] = {'generation': generation, 'request_id': request_id, 'choice': choice,
                                            'kind': 'app', 'version': version, 'saved': False}
         def committed_port(policy_key, policy):
             if not hasattr(self, 'auto_decision_saves'):
                 self.auto_decision_saves = {}
             # The actual committed object plus detached contents distinguish a
             # replacement (even an identical one) and an in-place policy edit.
-            self.auto_decision_saves[key] = {'generation': generation, 'choice': choice,
+            self.auto_decision_saves[key] = {'generation': generation, 'request_id': request_id, 'choice': choice,
                                            'kind': 'port', 'policy_key': policy_key,
                                            'policy': policy, 'snapshot': copy.deepcopy(policy), 'saved': False}
         def other_policy(row):
@@ -363,17 +585,15 @@ class AutoBlockMixin:
             app_applies = (status in {'allowed', 'blocked_both'}
                            or status == 'blocked_in' and direction == 'Inbound'
                            or status == 'blocked_out' and direction == 'Outbound')
-            return (any(rule_key != pending['policy_key'] and self._policy_verified('port', rule_key)
-                        for rule_key in self.matching_global_port_rules(row))
-                    or self.is_globally_blocked(row.get('dst_ip', ''), row.get('domain', ''), row.get('direction'))
-                    or self.is_globally_allowed(row.get('dst_ip', ''), row.get('domain', ''), row.get('direction'))
-                    or app_applies)
+            coverage = row.get('_coverage')
+            return (bool(coverage and coverage[0] == self._policy_revision_locked()
+                         and any(rule_key != pending['policy_key'] for rule_key in coverage[2])) or app_applies)
         def current_decision():
             with self.lock:
                 saved = getattr(self, 'auto_prompt_connections', {}).get(key)
                 pending = getattr(self, 'auto_decision_saves', {}).get(key)
                 owned = own_commit()
-                return (generation == self.auto_prompt_generation and self.auto_prompt_key == key
+                return (same_request()
                         and self._auto_block_active()
                         and (owned and not (saved and saved[0] == generation and other_policy(saved[1]))
                              or pending is None and not (saved and saved[0] == generation and self._threshold_has_rule(saved[1]))))
@@ -403,20 +623,24 @@ class AutoBlockMixin:
             if not pending['saved']:
                 self._persist_rule_changes()
                 pending['saved'] = True
+            self._refresh_pending_coverage(key)
             with self.lock:
-                if (self.closed or generation != self.auto_prompt_generation or self.auto_prompt_key != key):
+                if self.closed or not same_request():
                     return None
                 if not current_decision():
                     raise RuntimeError('The connection decision or protection state changed while saving. Retry the same choice to resolve the prompt safely.')
             if pending['kind'] == 'port':
                 verify_owned_connection()
-                return self._release_auto_hold_locked(norm, generation, resolve_prompt=True)
-            return True
+            with self.lock:
+                remaining = self._remaining_auto_requests_locked(key)
+                owned_hold = norm in getattr(self, 'auto_hold_owners', {}) or norm in getattr(self, 'auto_hold_cleanup', {})
+                if remaining and self.auto_hold_cleanup.get(norm) == generation and self.auto_hold_owners.get(norm) == generation:
+                    self.auto_hold_cleanup.pop(norm, None)
+            return True if remaining or not owned_hold else self._release_auto_hold_locked(norm, generation, resolve_prompt=True)
         try:
             with self.firewall_lock:
                 with self.lock:
-                    current = (not self.closed and generation == self.auto_prompt_generation
-                               and self.auto_prompt_key == key and self._auto_block_active())
+                    current = not self.closed and same_request() and self._auto_block_active()
                     saved = copy.deepcopy(getattr(self, 'auto_prompt_connections', {}).get(key))
                     pending = getattr(self, 'auto_decision_saves', {}).get(key)
                     owned = own_commit()
@@ -424,8 +648,10 @@ class AutoBlockMixin:
                     if owned and saved and saved[0] == generation:
                         superseded = other_policy(saved[1])
                 if current and (superseded or not owned and saved and saved[0] == generation and self._threshold_has_rule(saved[1])):
-                    if self._release_auto_hold_locked(normalize_path(exe), generation, resolve_prompt=True):
-                        self._cancel_app_prompt(key, generation)
+                    with self.lock:
+                        remaining = self._remaining_auto_requests_locked(key, request_id)
+                    if remaining or self._release_auto_hold_locked(normalize_path(exe), generation, resolve_prompt=True):
+                        self._finish_auto_request(key, generation, request_id)
                     else:
                         ok = False
                     current = False
@@ -446,10 +672,13 @@ class AutoBlockMixin:
                                                    refresh=False, quiet=True, update_ui=False, decision_guard=current_decision)
                     else:
                         raise ValueError('Unknown Auto-Block decision.')
+                    if ok and choice in {'allow', 'in', 'both'} and own_commit():
+                        self.auto_decision_saves[key]['saved'] = True
+                        ok = finish_commit()
         except Exception as exc:
             ok = False
             with self.lock:
-                if generation == self.auto_prompt_generation and self.auto_prompt_key == key:
+                if same_request():
                     if not hasattr(self, 'auto_decision_errors'):
                         self.auto_decision_errors = {}
                     self.auto_decision_errors[key] = str(exc)
@@ -488,80 +717,55 @@ class AutoBlockMixin:
         with self.lock:
             if not self._auto_prompt_details_current_locked(state) or not host or host == state['host']:
                 return
-            try:
-                widget = state['host_widget']
-                widget.configure(state=tk.NORMAL)
-                widget.delete('1.0', tk.END)
-                widget.insert('1.0', host)
-                widget.configure(state=tk.DISABLED)
-                state['row'] = row
-                state['host'] = host
-            except tk.TclError:
-                self.auto_prompt_details = None
+        try:
+            widget = state['host_widget']
+            widget.configure(state=tk.NORMAL)
+            widget.delete('1.0', tk.END)
+            widget.insert('1.0', host)
+            widget.configure(state=tk.DISABLED)
+            state['row'] = row
+            state['host'] = host
+        except tk.TclError:
+            self.auto_prompt_details = None
 
     def show_auto_prompt(self, generation, key, proc_name, exe, pid, remote_ip, reason, detail):
         dialog = tk.Toplevel(self.root)
+        self._diagnostic_event('Auto-Block prompt opened', dialog)
         with self.lock:
             self.auto_prompt_dialog = dialog
             self.auto_prompt_key = key
             saved = getattr(self, 'auto_prompt_connections', {}).get(key)
             source = saved[1] if saved and saved[0] == generation else None
             endpoint = copy.deepcopy(source) if source is not None else {'exe': exe, 'pid': pid, 'dst_ip': remote_ip}
+            request_id = endpoint.get('_request_id')
         dialog.title('Auto-Block Protection')
         dialog.resizable(False, False)
         dialog.withdraw()
         self._theme_dialog(dialog)
         message = f"{proc_name} reached an Auto-Block threshold.\nTrigger: {reason.title()}{(f' ({detail})' if detail else '')}\n\nTemporary protection is already blocking this executable while you decide."
-        body = tk.Frame(dialog, bg=self.colors['frame'])
-        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(16, 10))
-        tk.Label(body, text=message, justify=tk.LEFT, anchor=tk.W, wraplength=470, bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10)).pack(fill=tk.X)
-        raw_port = endpoint.get('dport')
-        try:
-            if isinstance(raw_port, bool) or not str(raw_port).isdigit() or not 1 <= int(raw_port) <= 65535:
-                raise ValueError('Invalid remote port')
-            port = str(int(raw_port))
-        except (TypeError, ValueError):
-            port = 'Unknown'
-        protocol = str(endpoint.get('protocol', '')).upper()
-        protocol = protocol if protocol in {'TCP', 'UDP'} else 'Unknown'
-        tk.Label(body, text=f"Remote IP: {endpoint.get('dst_ip') or 'Unknown'}\nRemote port: {port}\nProtocol: {protocol}\nDomain/host:",
-                 justify=tk.LEFT, anchor=tk.W, wraplength=470, bg=self.colors['frame'], fg=self.colors['fg'],
-                 font=('Segoe UI', 10)).pack(fill=tk.X, pady=(10, 0))
-        host_area = tk.Frame(body, bg=self.colors['frame'])
-        host_area.pack(fill=tk.X)
-        scrollbar = tk.Scrollbar(host_area, orient=tk.VERTICAL)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        # Reserve a wrapped, scrollable area so late/long names never move the
-        # buttons or resize/recenter the dialog while the user is deciding.
-        host_widget = tk.Text(host_area, height=3, width=1, wrap=tk.CHAR, bd=0, highlightthickness=0,
-                              bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10),
-                              takefocus=False, yscrollcommand=scrollbar.set)
-        host_widget.insert('1.0', 'Not available')
-        host_widget.configure(state=tk.DISABLED)
-        host_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        scrollbar.configure(command=host_widget.yview)
+        body, host_widget = self._connection_rule_body(dialog, message, endpoint)
         state = {'generation': generation, 'key': key, 'dialog': dialog, 'source': source,
                  'identity': self._auto_prompt_endpoint_identity(endpoint), 'row': endpoint,
                  'host_widget': host_widget, 'host': '', 'answered': False}
         with self.lock:
             self.auto_prompt_details = state
+        self.auto_prompt_identity = (generation, key, request_id)
         topmost_after = None
+        poll_after = None
         def destroyed(event):
             if event.widget is dialog:
-                if topmost_after is not None:
-                    try:
-                        dialog.after_cancel(topmost_after)
-                    except tk.TclError:
-                        pass
+                self._diagnostic_event('Auto-Block prompt destroyed', dialog)
+                for callback in (topmost_after, poll_after):
+                    if callback is not None:
+                        try:
+                            dialog.after_cancel(callback)
+                        except tk.TclError:
+                            pass
                 with self.lock:
                     if getattr(self, 'auto_prompt_details', None) is state:
                         self.auto_prompt_details = None
         dialog.bind('<Destroy>', destroyed, add='+')
         self._refresh_auto_prompt_host(discover=True)
-        buttons = tk.Frame(dialog, bg=self.colors['frame'])
-        buttons.pack(fill=tk.X, padx=16, pady=(0, 14))
-        buttons.grid_columnconfigure((0, 1, 2), weight=1)
-
         finished = False
         decision_buttons = []
         result_queue = queue.Queue(maxsize=1)
@@ -570,20 +774,22 @@ class AutoBlockMixin:
         applying.pack(fill=tk.X)
 
         def poll_decision():
-            nonlocal finished
-            if self.closed:
+            nonlocal finished, poll_after
+            poll_after = None
+            if self.closed or not dialog.winfo_exists():
                 return
             try:
                 ok = result_queue.get_nowait()
             except queue.Empty:
-                self.root.after(50, poll_decision)
+                poll_after = dialog.after(50, poll_decision)
                 return
             with self.lock:
                 current = (generation == self.auto_prompt_generation
-                           and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key)
+                           and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key
+                           and self._auto_request_id_locked(key) == request_id)
             if ok:
                 if current:
-                    self._cancel_app_prompt(key, generation)
+                    self._finish_auto_request(key, generation, request_id)
             elif current and ok is False:
                 finished = False
                 for button in decision_buttons:
@@ -601,12 +807,13 @@ class AutoBlockMixin:
             self.rules_changed()
 
         def finish(choice):
-            nonlocal finished
+            nonlocal finished, poll_after
             if finished:
                 return
             with self.lock:
                 current = (generation == self.auto_prompt_generation and not self.closed
-                           and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key)
+                           and self.auto_prompt_dialog is dialog and self.auto_prompt_key == key
+                           and self._auto_request_id_locked(key) == request_id)
                 if current:
                     state['answered'] = True  # Stay frozen even when a failed choice becomes retryable.
             if not current:
@@ -620,40 +827,21 @@ class AutoBlockMixin:
             try:
                 if hasattr(self, 'native_jobs'):
                     if not self._queue_native_job('Auto-Block decision', lambda: self._auto_decision_worker(
-                            generation, key, exe, proc_name, choice, result_queue)):
+                            generation, key, exe, proc_name, choice, result_queue, request_id=request_id)):
                         result_queue.put(False)
                 else:
                     threading.Thread(target=self._auto_decision_worker,
                                      args=(generation, key, exe, proc_name, choice, result_queue),
+                                     kwargs={'request_id': request_id},
                                      daemon=True, name='PyFirewall-Decision').start()
             except Exception as exc:
                 self.queue_alert('High', exe, pid, remote_ip, f'Could not start firewall decision: {exc}')
                 result_queue.put(False)
-            self.root.after(50, poll_decision)
-        action_specs = (('Block In & Out', 'both', '#c62828', 'Block the executable for both incoming and outgoing traffic.'), ('Block Incoming', 'in', '#ff9800', 'Block incoming traffic while leaving outgoing traffic allowed.'), ('Allow All', 'allow', '#4CAF50', 'Remove the temporary block and allow the executable.'))
-        for column, (label, choice, bg, tip) in enumerate(action_specs):
-            button = tk.Button(buttons, text=label, command=lambda value=choice: finish(value), bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
-            decision_buttons.append(button)
-            self._bind_button_hover(button)
-            button.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
-            add_tooltip(button, tip)
-        connection_buttons = tk.Frame(buttons, bg=self.colors['frame'])
-        connection_buttons.grid(row=1, column=0, columnspan=3, sticky='ew')
-        connection_buttons.grid_columnconfigure((0, 1), weight=1)
-        for column, (label, choice, bg) in enumerate((('Block Connection', 'block_connection', '#c62828'),
-                                                    ('Allow Connection', 'allow_connection', '#4CAF50'))):
-            button = tk.Button(connection_buttons, text=label, command=lambda value=choice: finish(value),
-                               bg=bg, fg='white', activebackground=bg, activeforeground='white', relief='flat',
-                               font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
-            decision_buttons.append(button)
-            self._bind_button_hover(button)
-            button.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
-            add_tooltip(button, 'Apply only to this executable, exact remote IP, remote port and protocol, in both directions. The local port is unrestricted.')
-        cancel = tk.Button(buttons, text='Cancel (Block)', command=lambda: finish('both'), bg=self.colors.get('button', '#757575'), fg='#ffffff', activebackground=self.colors.get('head', '#2d2d30'), activeforeground='#ffffff', relief='flat', font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
-        decision_buttons.append(cancel)
-        self._bind_button_hover(cancel)
-        cancel.grid(row=2, column=0, columnspan=3, sticky='ew', padx=3, pady=(0, 0))
-        add_tooltip(cancel, 'Dismiss the prompt and keep the executable blocked.')
+            poll_after = dialog.after(50, poll_decision)
+        decision_buttons = self._connection_rule_actions(
+            dialog, finish, lambda: finish('both'), cancel_label='Cancel (Block)',
+            cancel_tip='Dismiss the prompt and keep the executable blocked.',
+            allow_tip='Remove the temporary block and allow the executable. Matching global blocks still take precedence.')
         dialog.protocol('WM_DELETE_WINDOW', lambda: finish('both'))
         dialog.update_idletasks()
         self._center_dialog(dialog)

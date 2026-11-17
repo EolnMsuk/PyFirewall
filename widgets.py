@@ -1,6 +1,7 @@
 """Shared themed widgets, button feedback, table layout and selection behavior."""
 
 import ctypes
+import time
 import tkinter as tk
 from ctypes import wintypes
 from tkinter import font as tkfont, messagebox, simpledialog, ttk
@@ -22,26 +23,33 @@ class EntryUndo:
         self.restoring = False
         self.tags = ('PyFirewallUndoBefore_' + str(entry), 'PyFirewallUndoAfter_' + str(entry))
         self.bindings = []
-        tags = list(entry.bindtags())
-        index = tags.index(entry.winfo_class()) + 1
-        tags.insert(index, self.tags[1])
-        entry.bindtags((self.tags[0], *tags))
-        self.sequences = ('<KeyPress>', '<<Paste>>', '<<Cut>>', '<<Clear>>', '<<PasteSelection>>')
-        for sequence in self.sequences:
-            self.bindings.append(entry.bind_class(self.tags[0], sequence, self._begin_key if sequence == '<KeyPress>' else self._begin))
-            self.bindings.append(entry.bind_class(self.tags[1], sequence, self._finish))
-        for sequence in ('<Control-z>', '<Control-Z>', '<<Undo>>'):
-            self.bindings.append(entry.bind_class(self.tags[0], sequence, self.undo))
-        variable = str(entry.cget('textvariable'))
         self.variable = None
-        if not variable:
-            self.variable = tk.StringVar(master=entry, value=entry.get())
-            entry.configure(textvariable=self.variable)
-            variable = str(self.variable)
-        self.variable_name = variable
-        self.trace_command = entry.register(self._written)
-        entry.tk.call('trace', 'add', 'variable', variable, 'write', self.trace_command)
-        entry.bind('<Destroy>', self._destroy, add='+')
+        self.variable_name = ''
+        self.trace_command = None
+        self.sequences = ('<KeyPress>', '<<Paste>>', '<<Cut>>', '<<Clear>>', '<<PasteSelection>>')
+        try:
+            tags = list(entry.bindtags())
+            index = tags.index(entry.winfo_class()) + 1
+            tags.insert(index, self.tags[1])
+            entry.bindtags((self.tags[0], *tags))
+            for sequence in self.sequences:
+                self.bindings.append(entry.bind_class(self.tags[0], sequence, self._begin_key if sequence == '<KeyPress>' else self._begin))
+                self.bindings.append(entry.bind_class(self.tags[1], sequence, self._finish))
+            for sequence in ('<Control-z>', '<Control-Z>', '<<Undo>>'):
+                self.bindings.append(entry.bind_class(self.tags[0], sequence, self.undo))
+            variable = str(entry.cget('textvariable'))
+            self.variable = None
+            if not variable:
+                self.variable = tk.StringVar(master=entry, value=entry.get())
+                entry.configure(textvariable=self.variable)
+                variable = str(self.variable)
+            self.variable_name = variable
+            self.trace_command = entry.register(self._written)
+            entry.tk.call('trace', 'add', 'variable', variable, 'write', self.trace_command)
+            entry.bind('<Destroy>', self._destroy, add='+')
+        except Exception:
+            self._destroy()
+            raise
 
     def _editable(self):
         return str(self.entry.cget('state')) not in {'disabled', 'readonly'}
@@ -98,17 +106,39 @@ class EntryUndo:
                 self.restoring = False
         return 'break'
 
-    def _destroy(self, event):
-        if event.widget != self.entry:
+    def _destroy(self, event=None):
+        entry = self.entry
+        if entry is None or event is not None and event.widget != entry:
             return
-        for tag in self.tags:
-            for sequence in (*self.sequences, '<Control-z>', '<Control-Z>', '<<Undo>>'):
-                self.entry.unbind_class(tag, sequence)
+        try:
+            for tag in self.tags:
+                for sequence in (*self.sequences, '<Control-z>', '<Control-Z>', '<<Undo>>'):
+                    entry.unbind_class(tag, sequence)
+            entry.bindtags(tuple(tag for tag in entry.bindtags() if tag not in self.tags))
+        except tk.TclError:
+            pass  # The Tcl widget can already be gone during parent teardown.
         for binding in self.bindings:
-            self.entry._root().deletecommand(binding)
-        self.entry.tk.call('trace', 'remove', 'variable', self.variable_name, 'write', self.trace_command)
-        self.entry.deletecommand(self.trace_command)
+            try:
+                entry._root().deletecommand(binding)
+            except tk.TclError:
+                pass
+        try:
+            entry.tk.call('trace', 'remove', 'variable', self.variable_name, 'write', self.trace_command)
+        except tk.TclError:
+            pass
+        if self.trace_command is not None:
+            try:
+                entry.deletecommand(self.trace_command)
+            except tk.TclError:
+                pass
+        self.bindings.clear()
         self.reset()
+        # Only internally created variables belong to this controller. Release
+        # their final Python reference now, on Tk, and break the entry cycle.
+        self.variable = None
+        if getattr(entry, '_text_undo', None) is self:
+            del entry._text_undo
+        self.entry = None
 
 
 def enable_entry_undo(entry):
@@ -182,11 +212,21 @@ class ThemedContextMenu:
         self.window.bind('<End>', lambda _: self._select(len(self.items) - 1))
         self.window.bind('<Return>', self._invoke)
         self.window.bind('<space>', self._invoke)
+        self.window.bind('<Destroy>', self._destroyed, add='+')
+        self.closed = False
+        self.canvas = None
 
-    def add_command(self, label, command, foreground=None, activeforeground='#ffffff', background=None, activebackground=None):
+    def add_command(self, label, command, foreground=None, activeforeground='#ffffff', background=None, activebackground=None, checked=None):
         color = foreground or self.colors['fg']
         widget = tk.Label(self.body, text=label, anchor='w', bg=background or self.colors['sub'],
-                          fg=color, font=('Segoe UI', 9), padx=12, pady=5, bd=0)
+                          fg=color, font=('Segoe UI', 9), padx=34 if checked is not None else 12, pady=5, bd=0)
+        widget._menu_checked = checked
+        widget._menu_indicator = None
+        if checked is not None:
+            indicator = tk.Label(widget, text='✓' if checked else '', font=('Segoe UI', 9),
+                                 bg=widget.cget('bg'), fg=color, bd=0, width=2)
+            indicator.place(x=6, rely=0.5, anchor='w')
+            widget._menu_indicator = indicator
         widget._menu_background = background or self.colors['sub']
         widget._menu_activebackground = activebackground or self.colors['select']
         widget.pack(fill=tk.X)
@@ -194,6 +234,12 @@ class ThemedContextMenu:
         self.items.append((widget, command, color, activeforeground))
         widget.bind('<Enter>', lambda _: self._select(index))
         widget.bind('<ButtonRelease-1>', lambda _: self._invoke(index=index))
+        if widget._menu_indicator is not None:
+            widget._menu_indicator.bind('<Enter>', lambda _: self._select(index))
+            widget._menu_indicator.bind('<ButtonRelease-1>', lambda _: self._invoke(index=index))
+
+    def add_checkbutton(self, label, command, checked):
+        self.add_command(label, command, checked=bool(checked))
 
     def add_separator(self):
         tk.Frame(self.body, height=1, bg=self.colors['head'], bd=0,
@@ -205,9 +251,20 @@ class ThemedContextMenu:
         if self.active >= 0:
             widget, _, color, _ = self.items[self.active]
             widget.configure(bg=widget._menu_background, fg=color)
+            if widget._menu_indicator is not None:
+                widget._menu_indicator.configure(bg=widget._menu_background, fg=color)
         self.active = index % len(self.items)
         widget, _, _, color = self.items[self.active]
         widget.configure(bg=widget._menu_activebackground, fg=color)
+        if widget._menu_indicator is not None:
+            widget._menu_indicator.configure(bg=widget._menu_activebackground, fg=color)
+        if self.canvas is not None:
+            top, bottom = widget.winfo_y(), widget.winfo_y() + widget.winfo_height()
+            visible_top = self.canvas.canvasy(0)
+            height = self.canvas.winfo_height()
+            if top < visible_top or bottom > visible_top + height:
+                self.canvas.yview_moveto((top if top < visible_top else bottom - height) /
+                                        max(1, self.body.winfo_reqheight()))
         return 'break'
 
     def _move(self, step):
@@ -218,11 +275,12 @@ class ThemedContextMenu:
         index = self.active if index is None else index
         if 0 <= index < len(self.items):
             command = self.items[index][1]
+            invoke, origin = self.invoke_command, self.origin
             self._close()
-            if self.invoke_command is None:
+            if invoke is None:
                 command()
             else:
-                self.invoke_command(command, self.origin)
+                invoke(command, origin)
         return 'break'
 
     def _outside_click(self, event):
@@ -232,8 +290,14 @@ class ThemedContextMenu:
             return self._close()
 
     def _close(self, event=None):
+        if self.closed:
+            return 'break'
+        self.closed = True
         for sequence, binding in self.root_bindings:
-            self.root.unbind(sequence, binding)
+            try:
+                self.root.unbind(sequence, binding)
+            except tk.TclError:
+                pass
         self.root_bindings.clear()
         if self.window.winfo_exists():
             self.window.destroy()
@@ -242,7 +306,17 @@ class ThemedContextMenu:
                     self.previous_focus.focus_set()
                 except tk.TclError:
                     pass
+        for widget, *_ in self.items:
+            widget._menu_indicator = None
+        self.items.clear()
+        self.previous_focus = None
+        self.invoke_command = None
+        self.root = self.body = self.canvas = None
         return 'break'
+
+    def _destroyed(self, event):
+        if event.widget is self.window:
+            self._close(event)
 
     def post(self, x, y):
         self.origin = (x, y)
@@ -250,9 +324,23 @@ class ThemedContextMenu:
         self.window.update_idletasks()
         width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
         left, top, right, bottom = screen_work_area(self.window, x, y)
+        if height > bottom - top:
+            # Reparenting is unnecessary: a canvas window may embed a sibling.
+            self.body.pack_forget()
+            self.canvas = tk.Canvas(self.window, bg=self.colors['sub'], bd=0,
+                                    highlightthickness=0, width=width - 2,
+                                    height=max(1, bottom - top - 2), yscrollincrement=24)
+            scrollbar = ttk.Scrollbar(self.window, orient=tk.VERTICAL, command=self.canvas.yview)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=1)
+            self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, pady=1)
+            self.canvas.create_window(0, 0, window=self.body, anchor='nw', width=width - 2, height=height - 2)
+            self.canvas.configure(scrollregion=(0, 0, width - 2, height - 2), yscrollcommand=scrollbar.set)
+            self.window.bind('<MouseWheel>', lambda e: self.canvas.yview_scroll(-int(e.delta / 120), 'units'))
+            self.window.update_idletasks()
+            width, height = self.window.winfo_reqwidth(), bottom - top
         x = max(left, min(x, right - width))
         y = max(top, min(y, bottom - height))
-        self.window.geometry(f'+{x}+{y}')
+        self.window.geometry(f'{width}x{height}+{x}+{y}')
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
@@ -293,6 +381,8 @@ class ToolTip:
         if event.widget is self.widget:
             self._leave()
             self.owner._owned_tooltips.discard(self)
+            self.widget._tooltip = None
+            self.widget = self.owner = self.text = None
 
     def _sync_stacking(self, event=None):
         if event is not None and event.widget is not self.tip:
@@ -367,11 +457,88 @@ def add_tooltip(widget, text, delay=400):
 def sync_tooltip_stacking(owner):
     for tooltip in tuple(getattr(owner, '_owned_tooltips', ())):
         tooltip._sync_stacking()
-BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for domains/IPs, remote ports and TCP/UDP, optionally limited to executables.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
+BUTTON_TIPS = {'Block Selected': 'Choose how to block the selected application.', 'Allow Selected': 'Allow all traffic for the selected application.', 'Export CSV': 'Export the visible connection rows to a CSV file.', 'Clear List': 'Clear the Live Monitor connection list.', 'Refresh Rules': 'Refresh the Managed Rules list from Windows Firewall.', 'Add App Rule': 'Create an inbound or outbound application rule.', 'Add Global Rule': 'Create a global rule for domains/IPs, ports and TCP/UDP, optionally limited to executables.', 'Remove Selected': 'Remove the selected managed firewall rule(s).', 'Remove Selected Rule': 'Remove the selected managed firewall rule(s).', 'Export Rules': 'Export managed rules to a JSON backup.', 'Import Rules': 'Import and apply managed rules from a JSON file.', 'Windows Firewall': 'Open Windows Defender Firewall.', 'Clear Alerts': 'Clear all entries from the Alerts list.', 'Apply Settings': 'Save and apply the monitoring thresholds and options.', 'Reset to Defaults': 'Reset saved settings and remove PyFirewall-managed rules.'}
 
 
 class WidgetsMixin:
     """Methods composed into FirewallMonitorApp; state is owned by that application."""
+
+    def _connection_rule_body(self, dialog, message, endpoint):
+        """Shared presentation only; each caller owns its decision lifecycle."""
+        body = tk.Frame(dialog, bg=self.colors['frame'])
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(16, 10))
+        options = dict(justify=tk.LEFT, anchor=tk.W, wraplength=470,
+                       bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10))
+        tk.Label(body, text=message, **options).pack(fill=tk.X)
+        raw_port = endpoint.get('dport')
+        try:
+            port = (str(int(raw_port)) if not isinstance(raw_port, bool) and str(raw_port).isdigit()
+                    and 1 <= int(raw_port) <= 65535 else 'Unknown')
+        except (TypeError, ValueError):
+            port = 'Unknown'
+        protocol = str(endpoint.get('protocol', '')).upper()
+        protocol = protocol if protocol in {'TCP', 'UDP'} else 'Unknown'
+        tk.Label(body, text=f"Remote IP: {endpoint.get('dst_ip') or 'Unknown'}\nRemote port: {port}\nProtocol: {protocol}\nDomain/host:",
+                 **options).pack(fill=tk.X, pady=(10, 0))
+        host_area = tk.Frame(body, bg=self.colors['frame'])
+        host_area.pack(fill=tk.X)
+        scrollbar = tk.Scrollbar(host_area, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # A bounded area keeps long or late hostnames from displacing actions.
+        host = tk.Text(host_area, height=3, width=1, wrap=tk.CHAR, bd=0, highlightthickness=0,
+                       bg=self.colors['frame'], fg=self.colors['fg'], font=('Segoe UI', 10),
+                       takefocus=False, yscrollcommand=scrollbar.set)
+        host._connection_host_display = True
+        host.insert('1.0', 'Not available')
+        host.configure(state=tk.DISABLED)
+        host.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        scrollbar.configure(command=host.yview)
+        return body, host
+
+    def _connection_rule_actions(self, dialog, choose, cancel, *, current=None,
+                                 cancel_label='Cancel', cancel_tip='Dismiss without changing any rule.',
+                                 allow_tip='Allow the application. Matching global blocks still take precedence.'):
+        buttons = tk.Frame(dialog, bg=self.colors['frame'])
+        buttons.pack(fill=tk.X, padx=16, pady=(0, 14))
+        buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        decisions = []
+
+        def button(parent, label, command, color, tip):
+            widget = tk.Button(parent, text=label, command=command, bg=color, fg='white',
+                               activebackground=color, activeforeground='white', relief='flat',
+                               font=('Segoe UI', 9, 'bold'), padx=10, pady=5)
+            self._bind_button_hover(widget)
+            add_tooltip(widget, tip)
+            decisions.append(widget)
+            return widget
+
+        specs = (('Block In & Out', 'both', '#c62828', 'Block incoming and outgoing application traffic.'),
+                 ('Block Incoming', 'in', '#ff9800', 'Block incoming application traffic.'),
+                 ('Allow All', 'allow', '#4CAF50', allow_tip))
+        for column, (label, value, color, tip) in enumerate(specs):
+            parent = buttons
+            if value == current:
+                parent = tk.Frame(buttons, bg=self.colors['fg'])
+                parent._button_border_frame = True
+                parent.grid(row=0, column=column, sticky='nsew', padx=3, pady=(0, 6))
+            widget = button(parent, label, lambda v=value: choose(v), color, tip)
+            if parent is buttons:
+                widget.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
+            else:
+                widget.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+                add_tooltip(parent, 'Current application rule')
+        connections = tk.Frame(buttons, bg=self.colors['frame'])
+        connections.grid(row=1, column=0, columnspan=3, sticky='ew')
+        connections.grid_columnconfigure((0, 1), weight=1)
+        for column, (label, value, color) in enumerate((('Block Connection', 'block_connection', '#c62828'),
+                                                       ('Allow Connection', 'allow_connection', '#4CAF50'))):
+            widget = button(connections, label, lambda v=value: choose(v), color,
+                            ("Allow" if value == 'allow_connection' else "Block") +
+                            " this app's traffic matching the displayed IP, port, and protocol.")
+            widget.grid(row=0, column=column, sticky='ew', padx=3, pady=(0, 6))
+        widget = button(buttons, cancel_label, cancel, self.colors.get('button', '#757575'), cancel_tip)
+        widget.grid(row=2, column=0, columnspan=3, sticky='ew', padx=3)
+        return decisions
 
     def _bind_entry_menu(self, entry):
         """Keep the clicked entry's edit range while the themed popup owns focus."""
@@ -472,6 +639,12 @@ class WidgetsMixin:
         style.configure('TEntry', fieldbackground=self.colors['entry'], foreground=self.colors['fg'],
                         insertcolor='#ffffff' if dark else self.colors['fg'])
         style.map('TEntry', fieldbackground=[('disabled', self.colors['head'])], foreground=[('disabled', self.colors['muted'])])
+        style.configure('Search.TFrame', background=self.colors['entry'])
+        style.configure('Search.TEntry', borderwidth=0, relief='flat')
+        style.configure('SearchClear.TButton', background=self.colors['entry'], foreground=self.colors['fg'],
+                        padding=(2, 0), borderwidth=0, relief='flat')
+        style.map('SearchClear.TButton', background=[('active', self.colors['head'])],
+                  foreground=[('disabled', self.colors['muted'])])
         style.configure('Settings.TLabel', foreground=self.colors['text'])
         style.configure('Settings.TEntry', foreground=self.colors['text'])
         style.map('Settings.TEntry', foreground=[('disabled', self.colors['muted'] if dark else self.colors['text'])])
@@ -501,6 +674,8 @@ class WidgetsMixin:
                         widget.configure(bg=self.colors['fg'] if getattr(widget, '_button_border_frame', False) else self.colors['frame'])
                     elif isinstance(widget, tk.Label):
                         widget.configure(bg=self.colors['frame'], fg=self.colors[getattr(widget, '_theme_foreground_key', 'text' if settings else 'fg')])
+                    elif isinstance(widget, tk.Text) and getattr(widget, '_connection_host_display', False):
+                        widget.configure(bg=self.colors['frame'], fg=self.colors['fg'])
                     elif settings and isinstance(widget, ttk.Checkbutton):
                         widget.configure(style='Settings.TCheckbutton')
                     elif settings and isinstance(widget, ttk.Label):
@@ -599,6 +774,11 @@ class WidgetsMixin:
         button.bind('<Enter>', enter, add='+')
         button.bind('<Leave>', leave, add='+')
         button._pyfirewall_set_normal_state = set_normal_state
+        def dispose(event):
+            if event.widget is button:
+                button._pyfirewall_set_normal_state = None
+                button._pyfirewall_border = None
+        button.bind('<Destroy>', dispose, add='+')
         self._set_button_colors(button, border, button.cget('bg'), button.cget('fg'),
                                 button.cget('state'), activebackground=button.cget('activebackground'))
         return button
@@ -703,6 +883,9 @@ class WidgetsMixin:
         tree.grid(row=0, column=0, sticky='nsew')
         tree._layout_pending = None
         tree._fill_column = None
+        tree._fit_viewport = None
+        tree._autosize_pending = None
+        tree._autosize_job = None
         tree._horizontal_scrollbar = horizontal
         tree._vertical_scrollbar = scrollbar
         def scroll(bar, first, last):
@@ -715,9 +898,13 @@ class WidgetsMixin:
                        yscrollcommand=lambda first, last: scroll(scrollbar, first, last))
         tree.bind('<Configure>', lambda _: self._schedule_tree_layout(tree), add='+')
         def cancel_layout(event):
-            if event.widget == tree and tree._layout_pending is not None:
-                tree.after_cancel(tree._layout_pending)
-                tree._layout_pending = None
+            if event.widget == tree:
+                for name in ('_layout_pending', '_autosize_pending'):
+                    pending = getattr(tree, name)
+                    if pending is not None:
+                        tree.after_cancel(pending)
+                        setattr(tree, name, None)
+                tree._autosize_job = None
         tree.bind('<Destroy>', cancel_layout, add='+')
         tree.bind('<Control-a>', self.select_all_rows)
         tree.bind('<Control-A>', self.select_all_rows)
@@ -732,6 +919,10 @@ class WidgetsMixin:
 
     def _fill_tree_column(self, tree):
         tree._layout_pending = None
+        if tree._fit_viewport is not None:
+            if tree._fit_viewport == (tree.master.winfo_width(), tree.master.winfo_height()):
+                return
+            tree._fit_viewport = None
         columns = tuple(tree['displaycolumns'])
         if not columns or tree.winfo_width() <= 1:
             return
@@ -795,8 +986,16 @@ class WidgetsMixin:
         column = self._tree_column_from_x(tree, event.x)
         if column:
             menu = self._context_menu()
+            menu.add_command(label='Size Columns to Fit', command=lambda: self._size_tree_columns(tree))
             menu.add_command(label='Hide Column', command=lambda: self._hide_column(tree, column))
-            menu.add_command(label='Select Columns', command=lambda: self._select_columns(tree))
+            menu.add_separator()
+            visible = set(tree['displaycolumns'])
+            for item in self._normalized_column_order(tree._column_order_key, tree['columns']):
+                caption = tree.heading(item, 'text')
+                if tree._column_order_key == 'monitor' and item == 'Local Port':
+                    caption = 'Local Ports'
+                menu.add_checkbutton(label=caption, checked=item in visible,
+                                     command=lambda c=item: self._toggle_column(tree, c))
             menu.post(event.x_root, event.y_root)
         return True
 
@@ -805,39 +1004,85 @@ class WidgetsMixin:
         order = self._normalized_column_order(key, tree['columns'])
         selected = [c for c in order if c in visible]
         if not selected:
-            messagebox.showinfo('Select Columns', 'Keep at least one column visible.', parent=self.root)
+            messagebox.showinfo('Columns', 'Keep at least one column visible.', parent=self.root)
             return False
         with self.lock:
             self.hidden_columns[key] = [c for c in order if c not in selected]
+        self._cancel_tree_autosize(tree)
         tree['displaycolumns'] = tuple(selected)
+        tree._fit_viewport = None
         self._save_settings_with_feedback()
         return True
 
     def _hide_column(self, tree, column):
         self._set_visible_columns(tree, [c for c in tree['displaycolumns'] if c != column])
 
-    def _select_columns(self, tree):
-        dialog = tk.Toplevel(self.root)
-        dialog.title('Select Columns')
-        dialog.withdraw()
-        dialog.transient(self.root)
-        self._theme_dialog(dialog)
-        body = ttk.Frame(dialog, padding=16)
-        body.pack(fill=tk.BOTH, expand=True)
-        variables = {}
-        for column in self._normalized_column_order(tree._column_order_key, tree['columns']):
-            variable = tk.BooleanVar(value=column in tree['displaycolumns'])
-            variables[column] = variable
-            ttk.Checkbutton(body, text=tree.heading(column, 'text'), variable=variable).pack(anchor=tk.W, pady=2)
-        def apply():
-            if self._set_visible_columns(tree, [c for c, v in variables.items() if v.get()]):
-                dialog.destroy()
-        ttk.Button(body, text='Apply', command=apply).pack(side=tk.LEFT, pady=(12, 0))
-        ttk.Button(body, text='Cancel', command=dialog.destroy).pack(side=tk.RIGHT, pady=(12, 0))
-        dialog.bind('<Escape>', lambda _: dialog.destroy())
-        self._center_dialog(dialog)
-        dialog.deiconify()
-        self.root.wait_window(dialog)
+    def _toggle_column(self, tree, column):
+        visible = list(tree['displaycolumns'])
+        self._set_visible_columns(tree, [c for c in visible if c != column] if column in visible else visible + [column])
+
+    def _size_tree_columns(self, tree, columns=None):
+        """Measure each row once on Tk; bound large histories to short UI turns."""
+        self._cancel_tree_autosize(tree)
+        columns = tuple(columns if columns is not None else tree['columns'])
+        style = ttk.Style(tree)
+        name = tree.cget('style') or 'Treeview'
+        heading_font = tkfont.Font(root=tree, font=style.lookup(name + '.Heading', 'font') or 'TkHeadingFont')
+        row_font = tkfont.Font(root=tree, font=style.lookup(name, 'font') or 'TkDefaultFont')
+        widths = {c: max(int(tree.column(c, 'minwidth')),
+                         max((heading_font.measure(line) for line in str(tree.heading(c, 'text')).splitlines()), default=0) + 32)
+                  for c in columns}
+        indices = {c: tuple(tree['columns']).index(c) for c in columns}
+        job = dict(widths=widths, indices=indices, pending=list(reversed(tree.get_children(''))),
+                   cache={}, row_font=row_font)
+        tree._autosize_job = job
+        self._measure_tree_columns(tree, job)
+
+    @staticmethod
+    def _cancel_tree_autosize(tree):
+        pending = getattr(tree, '_autosize_pending', None)
+        if pending is not None:
+            tree.after_cancel(pending)
+            tree._autosize_pending = None
+        tree._autosize_job = None
+
+    def _measure_tree_columns(self, tree, job):
+        # A separate method avoids a recursive callback cycle owning Tk fonts.
+        tree._autosize_pending = None
+        if tree._autosize_job is not job:
+            return
+        widths, pending, cache = job['widths'], job['pending'], job['cache']
+        started, count = time.monotonic(), 0
+        while pending:
+            iid = pending.pop()
+            if not tree.exists(iid):
+                continue  # A normal render can replace rows between UI turns.
+            values = tree.item(iid, 'values')
+            pending.extend(reversed(tree.get_children(iid)))
+            for c, index in job['indices'].items():
+                value = str(values[index]) if index < len(values) else ''
+                if value not in cache:
+                    if len(cache) >= 8192:
+                        cache.clear()
+                    cache[value] = max((job['row_font'].measure(line) for line in value.splitlines()), default=0) + 20
+                widths[c] = max(widths[c], cache[value])
+            count += 1
+            if count >= 128 or time.monotonic() - started >= 0.008:
+                if pending:
+                    tree._autosize_pending = tree.after(1, lambda: self._measure_tree_columns(tree, job))
+                    return
+        # Discard the ordinary fill allowance, even on the last visible column.
+        previous = tree._fill_column
+        if previous and tree.column(previous, 'width') == tree._fill_width:
+            tree.column(previous, width=tree._fill_base_width)
+        tree._fill_column = None
+        tree._fit_viewport = (tree.master.winfo_width(), tree.master.winfo_height())
+        for c, width in widths.items():
+            tree.column(c, width=width, stretch=False)
+        tree._autosize_job = None
+        with self.lock:
+            self.column_widths.setdefault(tree._column_order_key, {}).update(widths)
+        self._save_settings_with_feedback()
 
     def _autosize_header(self, event, tree):
         region = tree.identify_region(event.x, event.y)
@@ -847,24 +1092,18 @@ class WidgetsMixin:
         if region == 'separator':
             column = self._tree_column_from_x(tree, event.x)
             if column:
-                style = ttk.Style(tree)
-                heading_font = tkfont.Font(root=tree, font=style.lookup('Treeview.Heading', 'font') or 'TkHeadingFont')
-                row_font = tkfont.Font(root=tree, font=style.lookup('Treeview', 'font') or 'TkDefaultFont')
-                widths = [heading_font.measure(str(tree.heading(column, 'text'))) + 32]
-                def measure(parent=''):
-                    for iid in tree.get_children(parent):
-                        value = str(tree.set(iid, column))
-                        widths.append(max((row_font.measure(line) for line in value.splitlines()), default=0) + 20)
-                        measure(iid)
-                measure()
-                tree.column(column, width=max(widths), stretch=False)
+                self._size_tree_columns(tree, (column,))
         return True
 
     def _tree_header_press(self, event):
         tree = event.widget
         if not isinstance(tree, ttk.Treeview):
             return
-        if tree.identify_region(event.x, event.y) != 'heading':
+        region = tree.identify_region(event.x, event.y)
+        if region in {'heading', 'separator'}:
+            self._cancel_tree_autosize(tree)
+            tree._fit_viewport = None
+        if region != 'heading':
             return
         column = self._tree_column_from_x(tree, event.x)
         if not column:
@@ -909,6 +1148,7 @@ class WidgetsMixin:
             insert_at = target_index + 1 if target_index > source_index else target_index
             order.insert(insert_at, source)
             tree['displaycolumns'] = tuple(order)
+            tree._fit_viewport = None
             with self.lock:
                 hidden = self.hidden_columns.get(tree._column_order_key, [])
                 visible_order = iter(order)

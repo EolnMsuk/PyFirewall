@@ -181,23 +181,37 @@ class MonitoringMixin:
             if members:
                 connections[iid] = self._aggregate_connection_rows(members, iid)
         self.connection_display_groups = connections
-        retained = {event[0] for event in getattr(self, 'alerts', ())}
-        alerts = {}
-        for iid, row in getattr(self, 'alert_display_groups', {}).items():
-            events = [event for event in row.get('_events', ()) if event[0] in retained]
-            if not events:
-                continue
-            members = [getattr(self, 'alert_connections', {})[event[0]] for event in events
-                       if event[0] in getattr(self, 'alert_connections', {})]
-            updated = self._aggregate_connection_rows(members) if members else dict(row)
-            updated['_events'] = events
-            updated['_grouped'] = len(events) > 1
-            alerts[iid] = updated
-        self.alert_display_groups = alerts
+        retained = {f'alert_{event[0]}' for event in getattr(self, 'alerts', ())}
+        self.alert_display_groups = {iid: row for iid, row in getattr(self, 'alert_display_groups', {}).items()
+                                     if iid in retained}
+
+    @staticmethod
+    def _usable_hostname(value):
+        name = str(value or '').split(' (', 1)[0].strip()
+        return bool(name.casefold() not in {'', 'unknown', 'unresolved', 'none', 'n/a', '—', '-'}
+                    and is_global_target(name) and not is_ip(name))
+
+    def _live_host_donors_locked(self):
+        donors = {}
+        for row in sorted(getattr(self, 'active_connections', {}).values(),
+                          key=lambda item: item.get('_capture_id', item.get('number', 0))):
+            host = self._retained_host(row) or row.get('domain', '')
+            if self._usable_hostname(host):
+                donors.setdefault(normalize_target(row.get('dst_ip')), (host, row.get('domain', '')))
+        return donors
+
+    def _adopt_live_host(self, row, donors):
+        donor = donors.get(normalize_target(row.get('dst_ip')))
+        if donor and not self._retained_host(row) and not self._usable_hostname(row.get('domain')):
+            host, domain = donor
+            row['display_host'] = host
+            row['domain'] = domain if self._usable_hostname(domain) else host.split(' (', 1)[0]
+            row['_display_endpoint'] = self._host_endpoint(row)
 
     def _retained_host(self, row):
         identity = row.get('_display_endpoint')
-        return row.get('display_host', '') if identity is None or identity == self._host_endpoint(row) else ''
+        host = row.get('display_host', '') if identity is None or identity == self._host_endpoint(row) else ''
+        return host if self._usable_hostname(host) else ''
 
     def remote_host(self, row):
         retained = self._retained_host(row)
@@ -206,6 +220,8 @@ class MonitoringMixin:
         ip = row.get('dst_ip', '')
         same_endpoint = row.get('_display_endpoint') in (None, self._host_endpoint(row))
         reverse = (row.get('domain', '') or '') if same_endpoint else ''
+        if not self._usable_hostname(reverse):
+            reverse = ''
         friendly = ''
         if hasattr(self, 'dns_lock'):
             with self.dns_lock:
@@ -214,6 +230,8 @@ class MonitoringMixin:
                     friendly = entry[0]
                 if time.monotonic() - getattr(self, 'dns_cache_times', {}).get(ip, 0) < DNS_CACHE_TTL:
                     reverse = getattr(self, 'dns_cache', {}).get(ip) or reverse
+        reverse = reverse if self._usable_hostname(reverse) else ''
+        friendly = friendly if self._usable_hostname(friendly) else ''
         if friendly and friendly != reverse:
             return f'{friendly} ({reverse})' if reverse else friendly
         return reverse or friendly
@@ -248,13 +266,16 @@ class MonitoringMixin:
     def _refresh_retained_hosts(self, ips=None, live=True, alerts=True, discover=False):
         # Snapshot application records first; never acquire dns_lock under lock.
         with self.lock:
+            donors = self._live_host_donors_locked() if live else {}
             connections = [(key, row, dict(row)) for key, row in getattr(self, 'active_connections', {}).items()
                            if live and (ips is None or row.get('dst_ip') in ips)]
             history = list(getattr(self, 'alerts', ())) if alerts else []
             saved = {key: dict(row) for key, row in getattr(self, 'alert_connections', {}).items()} if alerts else {}
         updates = []
         for key, original, row in connections:
-            if self._retain_remote_host(row, discover):
+            if not self._retain_remote_host(row, discover):
+                self._adopt_live_host(row, donors)
+            if self._retained_host(row):
                 updates.append((key, original, row))
         alert_updates = {}
         for alert in history:
@@ -276,6 +297,8 @@ class MonitoringMixin:
                 if current is original and self._host_endpoint(current) == self._host_endpoint(row) and not self._retained_host(current):
                     current['display_host'] = row['display_host']
                     current['_display_endpoint'] = row['_display_endpoint']
+                    if not self._usable_hostname(current.get('domain')) and self._usable_hostname(row.get('domain')):
+                        current['domain'] = row['domain']
                     live_changed = True
             if alert_updates:
                 refreshed = []
@@ -375,7 +398,11 @@ class MonitoringMixin:
 
     # Traffic accounting and packet handling
 
-    def _prune_traffic_state_locked(self):
+    def _prune_traffic_state_locked(self, networks=None):
+        if networks is None and not self.lock._is_owned():
+            snapshot = self._matching_snapshot()
+            networks = {item['target']: self._target_networks(item['target'], item['addresses'])
+                        for _, rule, *_ in snapshot[1] for item in rule['targets']}
         self.last_traffic_prune = time.monotonic()
         self._prune_rates_locked(self.last_traffic_prune)
         self.global_port_traffic = {key: stats for key, stats in self.global_port_traffic.items()
@@ -386,8 +413,7 @@ class MonitoringMixin:
             # evicts old endpoints. Refreshing the rule list must not reset them.
             targets = {entry['target']: entry for rule in getattr(self, 'global_ports', {}).values()
                        for entry in rule.get('targets', ())}
-            networks = {target: self._target_networks(target, data.get('addresses', ()))
-                        for target, data in targets.items()}
+            networks = networks or getattr(self, '_traffic_target_networks', {})
             self.pruned_target_traffic = {target: stats for target, stats in self.pruned_target_traffic.items()
                                           if target in targets}
             for key, _ in sorted(self.ip_traffic_last_seen.items(), key=lambda item: item[1])[:excess]:
@@ -495,92 +521,125 @@ class MonitoringMixin:
                         'dst_ip': remote_ip, 'dport': remote_port}
             with self.lock:
                 previous = self.active_connections.get(key)
+                donors = self._live_host_donors_locked()
                 if previous and self._host_endpoint(previous) == self._host_endpoint(endpoint):
                     endpoint.update({field: previous[field] for field in ('domain', 'display_host', '_display_endpoint')
                                      if field in previous})
             self._retain_remote_host(endpoint, discover=True)
+            self._adopt_live_host(endpoint, donors)
             domain = endpoint.get('domain', '')
             signal = self.port_watch_signal(local_port, remote_port)
             norm_exe = normalize_path(exe) or proc_name.casefold()
             norm_ip = normalize_target(remote_ip)
             now = time.monotonic()
-            with self.lock:
-                if self.is_paused or not self.sniffing or self.closed or accepted_token != self._detection_token_locked():
-                    return
-                log_alerts = self.log_alerts_only
-                rate_threshold = self.rate_threshold
-                rate_window = self.rate_window
-                upload_threshold = self.upload_threshold_mb
-                self.captured_packets += 1
-                self.captured_bytes += packet_size
-                if direction == 'Outgoing':
-                    self.total_upload += packet_size
-                else:
-                    self.total_download += packet_size
-                pstats = self.proc_traffic.setdefault(norm_exe, {'download': 0, 'upload': 0})
-                istats = self.ip_traffic.setdefault(norm_ip, {'download': 0, 'upload': 0})
-                side = 'upload' if direction == 'Outgoing' else 'download'
-                pstats[side] += packet_size
-                istats[side] += packet_size
-                # Match this packet's direction, not the connection's first-seen
-                # direction. Overlapping global/app rules each retain the bytes.
-                endpoint.update(domain=domain, direction=direction, key=key, name=proc_name, signal=signal)
-                endpoint['_detection_token'] = accepted_token
-                matching = self.matching_global_port_rules(endpoint)
-                contribution = (getattr(self, 'global_policy_epoch', 0), tuple(sorted(matching)))
-                for rule_key in matching:
-                    stats = self.global_port_traffic.setdefault(rule_key, {'download': 0, 'upload': 0})
-                    stats[side] += packet_size
-                    bucket = stats.setdefault('_contributions', {}).setdefault(contribution, {'download': 0, 'upload': 0})
-                    bucket[side] += packet_size
-                existing = self.active_connections.get(key)
-                is_new = existing is None or self._host_endpoint(existing) != self._host_endpoint(endpoint)
-                if is_new:
-                    self._capture_serial = getattr(self, '_capture_serial', 0) + 1
-                    row = {'key': key, 'number': self.next_connection_number, 'name': proc_name, 'pid': pid, 'direction': direction, 'protocol': proto, 'lport': local_port, 'dst_ip': remote_ip, 'domain': domain, 'dport': remote_port, 'signal': signal, 'exe': exe, 'first_seen': now, 'last_seen': now, 'download': 0, 'upload': 0}
-                    row['_capture_id'] = self._capture_serial
-                    signature = self._connection_group_signature(row)
-                    last = getattr(self, '_last_connection_group', None)
-                    row['_run_id'] = last[1] if last and signature == last[0] else f'connection_{self._capture_serial}'
-                    self._last_connection_group = (signature, row['_run_id'])
-                    row['_flow_totals'] = {'download': 0, 'upload': 0}
-                    self.active_connections[key] = row
-                    self.next_connection_number += 1
-                    self._prune_connection_and_alert_history_locked()
-                else:
-                    row = self.active_connections[key]
-                    row['last_seen'] = now
-                    if not row.get('domain') and domain:
-                        row['domain'] = domain
-                if endpoint.get('display_host') and not self._retained_host(row):
-                    row['display_host'] = endpoint['display_host']
-                    row['_display_endpoint'] = self._host_endpoint(row)
-                # Both packet directions share the same connection key, while
-                # process totals above continue to include all its connections.
-                row[side] = row.get(side, 0) + packet_size
-                row.setdefault('_flow_totals', {})[side] = row[side]
-                endpoint.update({field: row[field] for field in ('_capture_id', '_run_id', '_flow_totals', 'number', 'first_seen')})
-                # Alert grouping uses the flow's first-seen direction, while the
-                # packet direction above remains authoritative for decisions.
-                endpoint['_first_direction'] = row['direction']
-                upload_key = None
-                upload_total = 0
-                if direction == 'Outgoing' and remote_ip not in {'127.0.0.1', '::1'}:
-                    upload_key = (norm_exe, norm_ip)
-                    upload_total = self.proc_ip_upload.get(upload_key, 0) + packet_size
-                    self.proc_ip_upload[upload_key] = upload_total
-                    self.proc_ip_upload_last_seen[upload_key] = now
-                self.ip_traffic_last_seen[norm_ip] = now
+            endpoint.update(domain=domain, direction=direction, key=key, name=proc_name, signal=signal)
+            endpoint['_detection_token'] = accepted_token
+            # At most one recomputation. A second edit race discards this packet
+            # before any counters/request state publish, never partially counts it.
+            for attempt in range(2):
+                snapshot = self._matching_snapshot()
+                matching = self.matching_global_port_rules(endpoint, snapshot)
+                endpoint['_coverage'] = self._connection_coverage(endpoint, snapshot)
+                prune_networks = None
                 if now - self.last_traffic_prune >= TRAFFIC_PRUNE_INTERVAL:
-                    self._prune_traffic_state_locked()
-                rate_hit = False
-                if is_new and log_alerts:
-                    rate_key = (norm_exe, norm_ip)
-                    rate_hit = self._rate_hit_locked(rate_key, now, rate_threshold, rate_window)
+                    prune_networks = {item['target']: self._target_networks(item['target'], item['addresses'])
+                                      for _, rule, *_ in snapshot[1] for item in rule['targets']}
+                with self.lock:
+                    if self.is_paused or not self.sniffing or self.closed or accepted_token != self._detection_token_locked():
+                        return
+                    log_alerts = self.log_alerts_only
+                    rate_threshold = self.rate_threshold
+                    rate_window = self.rate_window
+                    upload_threshold = self.upload_threshold_mb
+                    if snapshot[0] != self._policy_revision_locked():
+                        continue
+                    self.captured_packets += 1
+                    self.captured_bytes += packet_size
+                    if direction == 'Outgoing':
+                        self.total_upload += packet_size
+                    else:
+                        self.total_download += packet_size
+                    pstats = self.proc_traffic.setdefault(norm_exe, {'download': 0, 'upload': 0})
+                    istats = self.ip_traffic.setdefault(norm_ip, {'download': 0, 'upload': 0})
+                    side = 'upload' if direction == 'Outgoing' else 'download'
+                    pstats[side] += packet_size
+                    istats[side] += packet_size
+                    # Match this packet's direction, not the connection's first-seen
+                    # direction. Overlapping global/app rules each retain the bytes.
+                    contribution = (getattr(self, 'global_policy_epoch', 0), tuple(sorted(matching)))
+                    for rule_key in matching:
+                        stats = self.global_port_traffic.setdefault(rule_key, {'download': 0, 'upload': 0})
+                        stats[side] += packet_size
+                        bucket = stats.setdefault('_contributions', {}).setdefault(contribution, {'download': 0, 'upload': 0})
+                        bucket[side] += packet_size
+                    transfer = getattr(self, '_traffic_transfer', None)
+                    if transfer:
+                        for result, owners in transfer['owners'].items():
+                            if owners.intersection(matching):
+                                stats = transfer['deltas'][result]
+                                stats[side] += packet_size
+                                bucket = stats['_contributions'].setdefault(contribution, {'download': 0, 'upload': 0})
+                                bucket[side] += packet_size
+                    existing = self.active_connections.get(key)
+                    is_new = existing is None or self._host_endpoint(existing) != self._host_endpoint(endpoint)
+                    if is_new:
+                        self._capture_serial = getattr(self, '_capture_serial', 0) + 1
+                        row = {'key': key, 'number': self.next_connection_number, 'name': proc_name, 'pid': pid, 'direction': direction, 'protocol': proto, 'lport': local_port, 'dst_ip': remote_ip, 'domain': domain, 'dport': remote_port, 'signal': signal, 'exe': exe, 'first_seen': now, 'last_seen': now, 'download': 0, 'upload': 0}
+                        row['_capture_id'] = self._capture_serial
+                        row['created_at'] = time.time()
+                        signature = self._connection_group_signature(row)
+                        last = getattr(self, '_last_connection_group', None)
+                        same_run = signature is not None and last and signature == last[0]
+                        row['_run_id'] = last[1] if same_run else f'connection_{self._capture_serial}'
+                        row['run_created_at'] = last[2] if same_run else row['created_at']
+                        self._last_connection_group = (signature, row['_run_id'], row['run_created_at'])
+                        row['_flow_totals'] = {'download': 0, 'upload': 0}
+                        self.active_connections[key] = row
+                        self.next_connection_number += 1
+                        self._prune_connection_and_alert_history_locked()
+                    else:
+                        row = self.active_connections[key]
+                        row['last_seen'] = now
+                        if not row.get('domain') and domain:
+                            row['domain'] = domain
+                    if endpoint.get('display_host') and not self._retained_host(row):
+                        row['display_host'] = endpoint['display_host']
+                        row['_display_endpoint'] = self._host_endpoint(row)
+                    # Both packet directions share the same connection key, while
+                    # process totals above continue to include all its connections.
+                    row[side] = row.get(side, 0) + packet_size
+                    row.setdefault('_flow_totals', {})[side] = row[side]
+                    endpoint.update({field: row[field] for field in ('_capture_id', '_run_id', '_flow_totals', 'number', 'first_seen', 'created_at', 'run_created_at')})
+                    # Keep the flow's first direction separate from this packet's direction.
+                    endpoint['_first_direction'] = row['direction']
+                    dropped_before = getattr(self, 'dropped_auto_requests', 0)
+                    if is_new or norm_exe in self.auto_prompt_keys:
+                        self._observe_auto_request_locked(endpoint, now)
+                    auto_overflow = getattr(self, 'dropped_auto_requests', 0) > dropped_before
+                    upload_key = None
+                    upload_total = 0
+                    if direction == 'Outgoing' and remote_ip not in {'127.0.0.1', '::1'}:
+                        upload_key = (norm_exe, norm_ip)
+                        upload_total = self.proc_ip_upload.get(upload_key, 0) + packet_size
+                        self.proc_ip_upload[upload_key] = upload_total
+                        self.proc_ip_upload_last_seen[upload_key] = now
+                    self.ip_traffic_last_seen[norm_ip] = now
+                    if now - self.last_traffic_prune >= TRAFFIC_PRUNE_INTERVAL:
+                        self._prune_traffic_state_locked(prune_networks)
+                    rate_hit = False
+                    if is_new and log_alerts:
+                        rate_key = (norm_exe, norm_ip)
+                        rate_hit = self._rate_hit_locked(rate_key, now, rate_threshold, rate_window)
+                break
+            else:
+                return
             if signal and is_new:
                 remote_endpoint = f'[{remote_ip}]:{remote_port}' if ':' in remote_ip else f'{remote_ip}:{remote_port}'
                 self.queue_alert('Watch', proc_name, pid, remote_endpoint, f'{direction} connection on {proto}; {signal}.',
                                  connection=endpoint)
+            if auto_overflow:
+                self.queue_alert('High', proc_name, pid, remote_ip,
+                                 'Auto-Block request capacity reached. Resolve pending requests; this request was not admitted.', connection=endpoint)
             if upload_key and log_alerts and (upload_total >= upload_threshold * 1024 * 1024):
                 with self.lock:
                     if accepted_token != self._detection_token_locked():
@@ -724,20 +783,23 @@ class MonitoringMixin:
     # Per-target traffic totals
 
     def target_traffic(self, target, addresses=()):
+        target = normalize_target(target)
         with self.lock:
-            return self._target_traffic_locked(target, addresses)
+            policies = list(getattr(self, 'global_ports', {}).values())
+            traffic = {key: dict(stats) for key, stats in self.ip_traffic.items()}
+            previous = dict(getattr(self, 'pruned_target_traffic', {}).get(target, {}))
+        return self._target_traffic_snapshot(target, addresses, policies, traffic, previous)
 
-    def _target_traffic_locked(self, target, addresses=()):
+    def _target_traffic_snapshot(self, target, addresses, policies, traffic, previous):
         target = normalize_target(target)
         # Use the rule's resolved endpoints; never block the UI on DNS or infer
         # membership from a PTR name that may not match the firewall filter.
-        saved_addresses = [address for rule in getattr(self, 'global_ports', {}).values()
+        saved_addresses = [address for rule in policies
                            for entry in rule.get('targets', ()) if entry['target'] == target
                            for address in entry.get('addresses', ())]
         networks = self._target_networks(target, (*addresses, *saved_addresses))
-        previous = getattr(self, 'pruned_target_traffic', {}).get(target, {})
         down, up = previous.get('download', 0), previous.get('upload', 0)
-        for ip, stats in self.ip_traffic.items():
+        for ip, stats in traffic.items():
             if self._traffic_ip_matches(ip, networks):
                 down += stats.get('download', 0)
                 up += stats.get('upload', 0)
@@ -746,7 +808,8 @@ class MonitoringMixin:
     @staticmethod
     def _target_networks(target, addresses=()):
         networks = set()
-        for address in (*target.split(','), *addresses):
+        numeric = [part for part in target.split(',') if is_ip(part)]
+        for address in (*numeric, *addresses):
             try:
                 networks.update(address_networks(normalize_target(address)))
             except ValueError:

@@ -1,6 +1,7 @@
 """Address/path normalization, display formatting and error diagnostics."""
 
 import ipaddress
+import json
 import os
 import re
 import threading
@@ -10,6 +11,8 @@ import traceback
 from constants import INTERNAL_ERROR_LOG_FILE
 
 INTERNAL_ERROR_LOG_LOCK = threading.Lock()
+ERROR_STATE_PROVIDER = None
+DIAGNOSTIC_LOG_LIMIT = 1024 * 1024
 
 
 def error_details(exc):
@@ -23,15 +26,65 @@ def error_details(exc):
     return '\n'.join(details)
 
 
-def log_internal_error(context, exc):
+def rotate_diagnostic_log(path):
+    """One previous generation; never use on a file held open by faulthandler."""
+    if os.path.exists(path) and os.path.getsize(path) >= DIAGNOSTIC_LOG_LIMIT:
+        os.replace(path, path + '.1')
+
+
+def log_internal_error(context, exc, traceback_obj=None, *, outcome=None):
+    acquired = False
     try:
-        with INTERNAL_ERROR_LOG_LOCK:
-            with open(INTERNAL_ERROR_LOG_FILE, 'a', encoding='utf-8') as f:
-                f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {type(exc).__name__}: {error_details(exc)}\n")
-                traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
-                f.write('\n')
+        # An error handler must not itself strand Tk behind another logger.
+        acquired = INTERNAL_ERROR_LOG_LOCK.acquire(timeout=0.05)
+        if not acquired:
+            return False
+        rotate_diagnostic_log(INTERNAL_ERROR_LOG_FILE)
+        state = ERROR_STATE_PROVIDER() if ERROR_STATE_PROVIDER is not None else ''
+        if outcome is not None:
+            state += '\nRule outcome: ' + json.dumps(outcome, ensure_ascii=True)[:16384]
+        trace = ''.join(traceback.format_exception(type(exc), exc,
+                        traceback_obj if traceback_obj is not None else exc.__traceback__, limit=40))
+        with open(INTERNAL_ERROR_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write((f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {type(exc).__name__}: {error_details(exc)}\n"
+                     + state + '\n' + trace)[:65536] + '\n\n')
+        return True
     except Exception:
-        pass
+        return False
+    finally:
+        if acquired:
+            INTERNAL_ERROR_LOG_LOCK.release()
+
+
+def log_rule_lookup(outcome):
+    """One bounded data record per attempt, in the existing rotated local log."""
+    acquired = False
+    try:
+        acquired = INTERNAL_ERROR_LOG_LOCK.acquire(timeout=0.05)
+        if not acquired:
+            return False
+        rotate_diagnostic_log(INTERNAL_ERROR_LOG_FILE)
+        payload = dict(outcome)
+        failures = list(payload.get('lookup_failures', ()))
+        payload['lookup_failures'] = failures[:32]
+        omitted = len(failures) - len(payload['lookup_failures'])
+        while True:
+            if omitted:
+                payload['omitted_targets'] = omitted
+            encoded = json.dumps(payload, ensure_ascii=True)
+            if len(encoded) <= 8192 or not payload['lookup_failures']:
+                break
+            payload['lookup_failures'].pop()
+            omitted += 1
+        with open(INTERNAL_ERROR_LOG_FILE, 'a', encoding='utf-8') as output:
+            output.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] global_rule_lookup: "
+                         + encoded + '\n')
+        return True
+    except Exception:
+        return False
+    finally:
+        if acquired:
+            INTERNAL_ERROR_LOG_LOCK.release()
 
 
 def normalize_path(path):
@@ -83,34 +136,66 @@ def normalize_target(target):
     value = str(target or '').strip()
     if ',' in value:
         return ', '.join(dict.fromkeys(normalize_target(part) for part in value.split(',')))
-    value = value.strip('[]').casefold().rstrip('.')
+    value = value.casefold().rstrip('.')
+    if value.startswith('[') and value.endswith(']') and value.count('[') == 1:
+        value = value[1:-1]
+    elif value.startswith('[') and ']/' in value:
+        value = value.replace(']/', '/', 1)[1:]
     try:
         start, end = ip_range(value)
         return f'{start}-{end}'
     except ValueError:
         pass
     try:
-        return str(ipaddress.ip_network(value, strict=False)) if '/' in value else str(ipaddress.ip_address(value))
+        network, = address_networks(value)
+        return str(network) if '/' in value else str(network.network_address)
     except ValueError:
         return value
 
 
+def _ip_component(value):
+    """Reject DNS/display text and oversized literals before the numeric parser."""
+    value = value.strip()
+    if value.startswith('[') and value.endswith(']'):
+        value = value[1:-1]
+    if (not value or len(value) > 45 or not re.fullmatch(r'[0-9a-fA-F:.]+', value)
+            or not (':' in value or '.' in value)):
+        raise ValueError('Expected a numeric IP address (at most 45 characters).')
+    if ':' not in value and not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}', value):
+        raise ValueError('Expected a numeric IPv4 address.')
+    return value
+
+
 def ip_range(value):
     """Parse an inclusive native firewall range without expanding its addresses."""
-    parts = str(value).split('-')
+    if not isinstance(value, str):
+        raise ValueError('Expected an IP range.')
+    parts = value.split('-')
     if len(parts) != 2:
         raise ValueError('Expected an IP range.')
-    start, end = (ipaddress.ip_address(part.strip().strip('[]')) for part in parts)
+    start, end = (ipaddress.ip_address(_ip_component(part)) for part in parts)
     if start.version != end.version or int(start) > int(end):
         raise ValueError('IP ranges must use one address family and ascending endpoints.')
     return start, end
 
 
 def address_networks(value):
-    try:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('Expected a numeric address filter.')
+    value = value.strip()
+    if '-' in value:
         return tuple(ipaddress.summarize_address_range(*ip_range(value)))
-    except ValueError:
-        return (ipaddress.ip_network(value, strict=False),)
+    parts = value.split('/')
+    if len(parts) > 2:
+        raise ValueError('Invalid IP prefix.')
+    address = _ip_component(parts[0])
+    if len(parts) == 2:
+        prefix = parts[1]
+        if not (re.fullmatch(r'[0-9]{1,3}', prefix) or
+                ':' not in address and re.fullmatch(r'[0-9.]{7,15}', prefix)):
+            raise ValueError('Invalid IP prefix.')
+        address += '/' + prefix
+    return (ipaddress.ip_network(address, strict=False),)
 
 
 def normalize_address(value):
@@ -145,7 +230,7 @@ def is_global_target(target):
         return True
     except ValueError:
         pass
-    if '-' in value and (':' in value or re.match(r'^\d+(?:\.\d+){3}\s*-', value)):
+    if ':' in value or '/' in value or re.fullmatch(r'[0-9.]+', value) or ('-' in value and re.match(r'^\d+(?:\.\d+){3}\s*-', value)):
         # Do not mistake malformed/reversed numeric ranges for DNS hostnames.
         return False
     try:

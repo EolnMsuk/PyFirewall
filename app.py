@@ -6,7 +6,7 @@ import socket
 import threading
 import time
 import tkinter as tk
-from collections import deque
+from collections import OrderedDict, deque
 from ctypes import wintypes
 from tkinter import font as tkfont, messagebox, ttk
 
@@ -37,17 +37,19 @@ class FirewallMonitorApp(
     AutoBlockMixin, ViewsMixin, UpdatesMixin,
 ):
     """Owns shared application state; feature mixins use the same locks and queues."""
-    MONITOR_COLUMNS = ('#', 'Process Name', 'Status', 'Direction', 'Remote IP', 'Remote Host', 'Protocol', 'Remote Port', 'Local Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'PID', 'Exe Path')
-    RULE_COLUMNS = ('Status', 'Application & Global Rules', 'Direction', 'Remote Port', 'Protocol', 'Download (MB)', 'Upload (MB)', 'Program Path')
+    MONITOR_COLUMNS = ('#', 'Time', 'Process Name', 'Status', 'Direction', 'Remote IP', 'Remote Host', 'Protocol', 'Remote Port', 'Local Port', 'Download (MB)', 'Upload (MB)', 'Signal', 'PID', 'Exe Path')
+    RULE_COLUMNS = ('#', 'Status', 'Application & Global Rules', 'Direction', 'Port', 'Protocol', 'Download (MB)', 'Upload (MB)', 'Program Path')
     ALERT_COLUMNS = ('Time', 'Severity', 'Process', 'PID', 'Remote IP', 'Remote Host', 'Reason', 'Local Port', 'Download (MB)', 'Upload (MB)')
     DEFAULT_COLUMN_ORDERS = {'monitor': MONITOR_COLUMNS, 'rules': RULE_COLUMNS, 'alerts': ALERT_COLUMNS}
 
 
     # Shared state and initialization
 
-    def __init__(self, root, activation_port=None):
+    def __init__(self, root, activation_port=None, diagnostics=None):
         self.root = root
+        self.diagnostics = diagnostics
         self.ui_thread_id = threading.get_ident()
+        root.bind('<Destroy>', self._dispose_ui_state, add='+')
         root.title('Python Personal Firewall & Network Monitor')
         root.geometry('1800x900')
         root.minsize(1500, 750)
@@ -109,6 +111,12 @@ class FirewallMonitorApp(
         self.allowed_apps = set()
         self.blocked_paths = {}
         self.global_ports = {}
+        self.global_policy_epoch = self.policy_revision = self.observation_revision = 0
+        self.global_policy_versions = {}
+        self.pending_global_sources = {}
+        self.global_operations = {}
+        self.rule_order = []
+        self.observed_rule_order = []
         self.rule_enforcement = {}
         self.verified_blocked_paths = {}
         self.rule_rows = []
@@ -120,17 +128,22 @@ class FirewallMonitorApp(
         self.alerts = deque(maxlen=DEFAULT_MAX_CONNECTIONS_ALERTS)
         self.alert_connections = {}
         self.alert_display_groups = {}
-        self._last_alert_group = None
         self.next_alert_id = 1
         self.auto_prompt_keys = set()
         self.auto_prompt_active = False
         self.auto_prompt_dialog = None
         self.auto_prompt_details = None
+        self.auto_prompt_identity = None
         self.auto_prompt_key = None
         self.auto_prompt_generation = 0
         self.auto_hold_owners = {}
+        self.auto_hold_ready = {}
         self.auto_hold_cleanup = {}
         self.auto_prompt_connections = {}
+        self.auto_pending_requests = {}
+        self.auto_detection_requests = OrderedDict()
+        self.auto_request_serial = 0
+        self.dropped_auto_requests = 0
         self.firewall_profile_modified = False
         self.settings_save_error = None
         self.settings_load_error = None
@@ -166,20 +179,20 @@ class FirewallMonitorApp(
         self.dark_mode = DEFAULT_DARK_MODE
         self.check_updates_on_startup = DEFAULT_CHECK_UPDATES_ON_STARTUP
         self.firewall_initialized = False
-        self.rate_threshold_var = tk.StringVar(value=str(self.rate_threshold))
-        self.rate_window_var = tk.StringVar(value=str(DEFAULT_RATE_WINDOW))
-        self.upload_threshold_var = tk.StringVar(value=str(DEFAULT_UPLOAD_THRESHOLD_MB))
-        self.max_connections_alerts_var = tk.StringVar(value=str(DEFAULT_MAX_CONNECTIONS_ALERTS))
-        self.log_alerts_var = tk.BooleanVar(value=DEFAULT_LOG_ALERTS_ONLY)
-        self.auto_block_var = tk.BooleanVar(value=True)
-        self.keep_notification_foreground_var = tk.BooleanVar(value=True)
-        self.dark_mode_var = tk.BooleanVar(value=DEFAULT_DARK_MODE)
-        self.check_updates_on_startup_var = tk.BooleanVar(value=DEFAULT_CHECK_UPDATES_ON_STARTUP)
-        self.search_var = tk.StringVar()
-        self.rule_search_var = tk.StringVar()
-        self.alert_search_var = tk.StringVar()
+        self.rate_threshold_var = tk.StringVar(master=root, value=str(self.rate_threshold))
+        self.rate_window_var = tk.StringVar(master=root, value=str(DEFAULT_RATE_WINDOW))
+        self.upload_threshold_var = tk.StringVar(master=root, value=str(DEFAULT_UPLOAD_THRESHOLD_MB))
+        self.max_connections_alerts_var = tk.StringVar(master=root, value=str(DEFAULT_MAX_CONNECTIONS_ALERTS))
+        self.log_alerts_var = tk.BooleanVar(master=root, value=DEFAULT_LOG_ALERTS_ONLY)
+        self.auto_block_var = tk.BooleanVar(master=root, value=True)
+        self.keep_notification_foreground_var = tk.BooleanVar(master=root, value=True)
+        self.dark_mode_var = tk.BooleanVar(master=root, value=DEFAULT_DARK_MODE)
+        self.check_updates_on_startup_var = tk.BooleanVar(master=root, value=DEFAULT_CHECK_UPDATES_ON_STARTUP)
+        self.search_var = tk.StringVar(master=root)
+        self.rule_search_var = tk.StringVar(master=root)
+        self.alert_search_var = tk.StringVar(master=root)
         self.monitor_sort = ['#', True]
-        self.rule_sort = [None, False]
+        self.rule_sort = ['#', False]
         self.alert_sort = ['Time', True]
         self.load_settings()
         self.setup_gui()
@@ -194,6 +207,18 @@ class FirewallMonitorApp(
         self._start_instance_activation_listener()
         self.root.after(50, self._start_background_initialization)
         self.root.after(100, self.update_loop)
+        if self.diagnostics is not None:
+            self.diagnostics.start_ui(self)
+
+    def _diagnostic_event(self, name, widget=None):
+        diagnostics = getattr(self, 'diagnostics', None)
+        if diagnostics is not None:
+            diagnostics.event(name, widget)
+
+    def _diagnostic_phase(self, name):
+        diagnostics = getattr(self, 'diagnostics', None)
+        if diagnostics is not None:
+            diagnostics.phase(name)
 
     def _start_instance_activation_listener(self):
         """Receive a second launch request without calling Tk off the UI thread."""
@@ -466,6 +491,7 @@ class FirewallMonitorApp(
             pass
 
     def _on_rules_delete(self, _event=None):
+        self._diagnostic_event('Delete: Managed Rules', getattr(self, 'rules_tree', None))
         if not hasattr(self, 'rules_tree') or not self.rules_tree.selection():
             return 'break'
         try:
@@ -482,28 +508,49 @@ class FirewallMonitorApp(
             focused = self.root.focus_get()
         except tk.TclError:
             focused = None
+        self._diagnostic_event('Delete: dispatch', focused)
         if focused is self.rules_tree:
             return self._on_rules_delete(_event)
 
     # Tab construction
 
     def _monitor_widths(self):
-        return {'#': (55, tk.CENTER, False), 'Status': (190, tk.CENTER, False), 'PID': (70, tk.CENTER, False), 'Protocol': (70, tk.CENTER, False), 'Local Port': (85, tk.CENTER, False), 'Remote Port': (85, tk.CENTER, False), 'Direction': (85, tk.CENTER, False), 'Process Name': (150, tk.W, True), 'Remote IP': (125, tk.CENTER, True), 'Remote Host': (190, tk.W, True), 'Download (MB)': (110, tk.CENTER, False), 'Upload (MB)': (110, tk.CENTER, False), 'Signal': (70, tk.W, True), 'Exe Path': (300, tk.W, True)}
+        return {'#': (55, tk.CENTER, False), 'Time': (85, tk.CENTER, False), 'Status': (190, tk.CENTER, False), 'PID': (70, tk.CENTER, False), 'Protocol': (70, tk.CENTER, False), 'Local Port': (85, tk.CENTER, False), 'Remote Port': (85, tk.CENTER, False), 'Direction': (85, tk.CENTER, False), 'Process Name': (150, tk.W, True), 'Remote IP': (125, tk.CENTER, True), 'Remote Host': (190, tk.W, True), 'Download (MB)': (110, tk.CENTER, False), 'Upload (MB)': (110, tk.CENTER, False), 'Signal': (70, tk.W, True), 'Exe Path': (300, tk.W, True)}
 
     def _setup_search(self, bar, variable, render):
-        variable.trace_add('write', lambda *_: render())
         # Reserve the same right-hand space before laying out toolbar actions.
         first_action = bar.pack_slaves()[0]
-        entry = ttk.Entry(bar, textvariable=variable, width=25)
+        field = ttk.Frame(bar, style='Search.TFrame', relief=tk.SOLID, borderwidth=1)
+        field.pack(side=tk.RIGHT, padx=5, before=first_action)
+        entry = ttk.Entry(field, textvariable=variable, width=25, style='Search.TEntry')
         self._bind_entry_menu(entry)
-        entry.pack(side=tk.RIGHT, padx=5, before=first_action)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        def clear():
+            if entry.get():
+                entry._text_undo.edit(lambda: entry.delete(0, tk.END))
+            entry.focus_set()
+        button = ttk.Button(field, text='x', width=2, command=clear, style='SearchClear.TButton')
+        button.pack(side=tk.RIGHT, fill=tk.Y)
+        add_tooltip(button, 'Clear search')
+        entry._search_clear = button
+        field._search_entry = entry
+        def changed(*_):
+            button.configure(state=tk.NORMAL if variable.get() else tk.DISABLED)
+            render()
+        button.configure(state=tk.NORMAL if variable.get() else tk.DISABLED)
+        variable.trace_add('write', changed)
+        def dispose(event):
+            if event.widget is field:
+                field._search_entry = None
+                entry._search_clear = None
+        field.bind('<Destroy>', dispose, add='+')
         tk.Label(bar, text='Search:').pack(side=tk.RIGHT, before=first_action)
 
     def setup_monitor_tab(self):
         bar = tk.Frame(self.tab_monitor, pady=8)
         bar.pack(fill=tk.X)
         self._button(bar, 'Add Rule', self.add_monitor_rule, '#2196F3',
-                     tooltip='Create an application or global rule, using the selected connections when available.')
+                     tooltip='Choose App Rule to select executables, or Global Rule to review the selected connections together.')
         self._button(bar, 'Allow Selected', self.allow_process, '#4CAF50')
         self._button(bar, 'Block (in) Selected', lambda: self.block_process(direction='in'), '#ff9800',
                      tooltip='Block incoming connections for the selected processes.')
@@ -526,7 +573,7 @@ class FirewallMonitorApp(
         self._button(bar, 'Windows Firewall', self.open_windows_firewall)
         self._setup_search(bar, self.rule_search_var, self.render_rules)
         status_width = max(155, tkfont.nametofont('TkDefaultFont').measure('Blocked (out) (Global)') + 28)
-        self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'Status': (status_width, tk.CENTER, False), 'Application & Global Rules': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Remote Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
+        self.rules_tree = self._make_tree(self.tab_rules, self.RULE_COLUMNS, {'#': (55, tk.CENTER, False), 'Status': (status_width, tk.CENTER, False), 'Application & Global Rules': (220, tk.W, True), 'Direction': (90, tk.CENTER, False), 'Port': (100, tk.CENTER, False), 'Protocol': (90, tk.CENTER, False), 'Download (MB)': (105, tk.CENTER, False), 'Upload (MB)': (105, tk.CENTER, False), 'Program Path': (450, tk.W, True)}, 'rules')
         self.rules_tree.bind('<Double-1>', lambda e: self.rule_details_from_event(e))
         self.rules_tree.bind('<Delete>', self._on_rules_delete, add='+')
         self.rules_tree.bind('<KP_Delete>', self._on_rules_delete, add='+')
@@ -630,6 +677,9 @@ class FirewallMonitorApp(
             if item[0] == 'startup_complete':
                 ok, error = (item[1], item[2])
                 self.startup_running = False
+                diagnostics = getattr(self, 'diagnostics', None)
+                if diagnostics is not None:
+                    diagnostics.activate()
                 if self.closed:
                     continue
                 if ok:
@@ -657,17 +707,16 @@ class FirewallMonitorApp(
                     messagebox.showerror('Settings Not Saved',
                                          'Changes are active for this run but could not be saved for the next launch.\n'
                                          + item[1] + '\nRetry Apply Settings or the rule decision to save again.', parent=self.root)
-            elif item[0] == 'close_dialog':
-                try:
-                    item[1].destroy()
-                except tk.TclError:
-                    pass
+            elif item[0] == 'close_auto_dialog':
+                self._close_auto_dialog(item[1])
+            elif item[0] == 'global_operation_complete':
+                self._consume_global_operation(item[1])
             elif item[0] == 'rules_error':
                 generation, error = (item[1], item[2])
                 if generation == self.rules_generation and not self.closed:
                     self.rules_loading = False
                     self.rules_tree.delete(*self.rules_tree.get_children())
-                    self.rules_tree.insert('', tk.END, values=('Error', 'Firewall rule refresh failed', '', '', '', error), tags=('blocked',))
+                    self.rules_tree.insert('', tk.END, values=('', 'Error', 'Firewall rule refresh failed', '', '', '', '', '', error), tags=('blocked',))
         if dns_ips and not self.closed:
             live_changed, alerts_changed = self._refresh_retained_hosts(dns_ips)
             self._refresh_auto_prompt_host(dns_ips)
@@ -730,11 +779,13 @@ class FirewallMonitorApp(
         if self.closed:
             return
         try:
+            self._diagnostic_phase('tray queue')
             while True:
                 try:
                     command = self.tray_command_queue.get_nowait()
                 except queue.Empty:
                     break
+                self._diagnostic_event('tray:' + str(command))
                 if command == 'show':
                     self.show_from_tray()
                 elif command == 'tray_unavailable':
@@ -748,18 +799,27 @@ class FirewallMonitorApp(
                 elif command == 'close':
                     self.on_closing()
                     return
+            self._diagnostic_phase('UI queue')
             self.drain_ui_queue()
+            self._diagnostic_phase('Alerts queue')
             self.drain_alerts()
+            self._diagnostic_phase('Auto-Block queue')
             self.drain_prompt_queue()
             if self.startup_complete and (not self.is_paused):
+                self._diagnostic_phase('render Monitor')
                 self.render_monitor()
+                self._diagnostic_phase('rule traffic')
                 self.render_rule_traffic()
+                self._diagnostic_phase('render Rules')
                 self.render_rules()
+                self._diagnostic_phase('render Alerts')
                 self.render_alerts()
+            self._diagnostic_phase('status')
             self.update_status()
         except Exception as exc:
             log_internal_error('update_loop', exc)
         finally:
+            self._diagnostic_phase('idle')
             if not self.closed:
                 self.root.after(500, self.update_loop)
 
@@ -776,6 +836,7 @@ class FirewallMonitorApp(
     # Tray visibility and shutdown
 
     def minimize_to_tray(self):
+        self._diagnostic_event('minimize to tray')
         if self.closed or self.tray_hidden:
             return
         try:
@@ -794,6 +855,7 @@ class FirewallMonitorApp(
             pass
 
     def show_from_tray(self):
+        self._diagnostic_event('show from tray')
         if self.closed:
             return
         try:
@@ -848,19 +910,38 @@ class FirewallMonitorApp(
     def on_closing(self):
         if self.closed:
             return
-        self._capture_layout()
+        diagnostics = getattr(self, 'diagnostics', None)
+        if diagnostics is not None:
+            diagnostics.shutdown()
+        ui_available = self.root is not None
+        if ui_available:
+            self._capture_layout()
         with self.lock:
             self.closed = True
             self.sniffing = False
         self._invalidate_auto_prompts(close_dialog=True)
+        editor = getattr(self, 'rule_editor_dialog', None)
+        if editor is not None:
+            editor.destroy()
+        with self.lock:
+            getattr(self, 'pending_global_sources', {}).clear()
+            getattr(self, 'global_operations', {}).clear()
+            self.retry_global_fields = self.retry_global_draft = None
+            self.retry_connection_reviews = []
         self._stop_instance_activation_listener()
+        if not ui_available:
+            self.dns_stop_event.set()
+            if self.tray is not None:
+                self.tray.stop()
         if hasattr(self, 'native_jobs'):
             self.native_shutdown_requested = True
-            self.status_state.config(text='Closing: restoring firewall...', fg='#ff9800')
-            self.shutdown_poll_id = self.root.after(50, self._poll_shutdown)
+            if ui_available:
+                self.status_state.config(text='Closing: restoring firewall...', fg='#ff9800')
+                self.shutdown_poll_id = self.root.after(50, self._poll_shutdown)
         else:
             self._shutdown_worker()
-            self.drain_ui_queue()
+            if ui_available:
+                self.drain_ui_queue()
 
     def _poll_shutdown(self):
         pending = getattr(self, 'shutdown_poll_id', None)
@@ -904,6 +985,31 @@ class FirewallMonitorApp(
                 self.tray.wait(0.5)
         finally:
             try:
+                self._dispose_ui_state()
                 self.root.destroy()
             except tk.TclError:
                 pass
+
+    def _dispose_ui_state(self, event=None):
+        """Release UI-owned references on Tk, including exceptional root teardown."""
+        root = self.root
+        if event is not None and event.widget is not root:
+            return
+        for name, value in tuple(vars(self).items()):
+            if isinstance(value, tk.Variable):
+                # trace_add callbacks can themselves own this variable and
+                # destroyed widgets. Remove only commands owned by the variable;
+                # EntryUndo owns/removes its separately registered trace.
+                try:
+                    for mode, command in value.trace_info():
+                        if command in (value._tclCommands or ()):
+                            value.trace_remove(mode, command)
+                except tk.TclError:
+                    pass
+            if name != 'root' and isinstance(value, (tk.Variable, tk.Image, tk.Misc)):
+                setattr(self, name, None)
+        value = None
+        self.auto_prompt_details = None
+        getattr(self, 'header_drag', {}).clear()
+        if event is not None:
+            self.root = None

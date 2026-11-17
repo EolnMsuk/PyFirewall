@@ -1,12 +1,6 @@
 # PyFirewall overview
 
-PyFirewall is a Windows desktop application that shows which programs are using the network and lets you control their inbound and outbound traffic through Windows Defender Firewall. It runs with administrator privileges.
-
-Scapy captures packets through Npcap on the first usable non-loopback adapter. PyFirewall uses psutil to match TCP and UDP traffic to local processes. For each connection it can identify, the Live Monitor shows the program, remote host, ports, and upload and download totals.
-
-You can block a program by its executable path or create allow and block rules that match addresses, domains, ports, protocols, and traffic direction. When observed traffic reaches a connection-rate or upload threshold, Auto-Block can temporarily block the program while you choose a rule. Choosing **Allow** for an application removes its PyFirewall application blocks and exempts it from further Auto-Block prompts.
-
-At startup, PyFirewall saves the Windows firewall profile settings, enables all profiles, and sets their default inbound and outbound actions to **Allow**. Closing the main window leaves PyFirewall running in the system tray. Choose **Close** from the tray menu to exit and restore the saved profile settings.
+PyFirewall is a Windows desktop application that shows which programs are using the network and lets you control their inbound and outbound traffic through Windows Defender Firewall. It runs with administrator privileges. Scapy captures packets through Npcap on the first usable non-loopback adapter. PyFirewall uses psutil to match TCP and UDP traffic to local processes. For each connection it can identify, the Live Monitor shows the program, remote host, ports, and upload and download totals.
 
 ## Required files
 
@@ -29,6 +23,7 @@ PyFirewall/
 ├── updates.py                 # Checks GitHub for new releases and displays update prompts.
 ├── constants.py               # Defines shared defaults, limits, and resource paths.
 ├── helpers.py                 # Normalizes executable paths, addresses, and ports for rule matching.
+├── diagnostics.py             # Records exceptions, cached UI state, heartbeat stalls, and fatal faults.
 ├── PyFirewall.ico             # Supplies the icon for the window, tray, and desktop shortcut.
 └── Uninstall-PyFirewall.cmd   # Removes selected rules, settings, and components added by setup.
 ```

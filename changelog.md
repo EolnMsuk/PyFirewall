@@ -1,3 +1,28 @@
+### ⚠️ Important Upgrade Notice
+
+* **Clean Install Required (from 4.3):** Old rules, settings, and layouts will not migrate. You must fully uninstall 4.3, delete your old `firewall_config.json`, and recreate your rules. *(Note: Keep `pyfirewall_install.json` and recovery files until uninstall completes.)*
+* **Backup Compatibility:** Older rule backups (v8 and v9) are no longer supported and will be rejected.
+
+# 4.7
+
+* **Connection-Specific Actions:** You can now choose **Block Connection** or **Allow Connection** directly from the Live Monitor and Alerts dialogs to create targeted rules for a single IP/port, rather than blocking or allowing the entire program.
+* **Either-Endpoint Port Matching:** Global rule port lists now match **either** the Local or Remote port (previously Remote only).
+* **Bulk Selection & Rule Creation:**
+* Select multiple `.exe` files at once when creating App or Global rules.
+* Selecting multiple programs in a Global Rule now creates separate, independently editable rules for each program.
+* Selecting multiple connections in Live Monitor and clicking **Add Rule > Global Rule** now opens a single combined editor instead of separate windows for each connection.
+* **Smarter Auto-Block:** Pending connection prompts are now tracked individually per IP and port. Allowing or blocking one connection will no longer prematurely dismiss prompts or drop temporary protection for other pending connections from the same app.
+* **New Columns:** Added a **Time** column to Live Monitor (showing when a connection started) and a **#** column to Managed Rules (ordered oldest-first).
+* **Individual Alerts:** Repeated warnings in the Alerts tab are no longer grouped together; each event now gets its own row.
+* **Better Table Controls:**
+* Right-click any table header to hide/show columns or **Size Columns to Fit** (replaces the old Select Columns dialog).
+* Added an inline **X** button to quickly clear search bars.
+* Renamed "Remote Port" to **Port** in Managed Rules to reflect either-endpoint matching.
+* **Retained Hostnames:** Live Monitor now remembers and reuses learned hostnames for matching IPs even after your local DNS cache expires.
+* **Safer Rule Edits & Rollbacks:** Failed rule edits or DNS lookup errors now automatically restore your previous firewall filters, retain your draft so you can fix typos, and let you retry saving to disk without re-running firewall changes.
+* **Performance & Stability:** Faster rule matching, smoother UI resizing on large tables, and cleaner shutdown handling so background firewall tasks finish safely.
+* **Diagnostics & Support:** Added automated crash, error, and UI-freeze logs (`firewall_monitor_diagnostics.log` and `faults.log`) to help with troubleshooting. Updated the donation Venmo handle to `EolnMsuk`.
+
 # 4.3
 
 * **Text Menus:** Added right-click Cut. Cut and Copy appear only when text is selected.
