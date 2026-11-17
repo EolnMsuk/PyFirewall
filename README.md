@@ -1,6 +1,6 @@
 # PyFirewall ⛨
 
-PyFirewall is a python based Windows desktop application for monitoring / filtering network connections. **It monitors and configures both incoming and outgoing connections** using process / IP / domain / port / protocol specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
+A python based Windows desktop application for monitoring / filtering network connections. **It monitors and configures both incoming and outgoing connections** using process / IP / domain / port / protocol specific rules. It uses Tkinter for the interface, Scapy for packet capture, psutil for process and network information, and supports application and global IP/domain rules.
 
 ---
 
